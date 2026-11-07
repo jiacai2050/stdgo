@@ -112,12 +112,14 @@ pub fn main(init: std.process.Init) !void {
         cancel_ctx.context().done(),
         lucky_num,
     });
-}
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa);
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    // 9. HTTP Client & Request
+    var req = try stdgo.net.http.newRequest(gpa, .GET, "https://example.com/api", null);
+    defer req.deinit();
+    try req.setBasicAuth("gopher", "secret123");
+    std.debug.print("\n9. HTTP Request: {s} {s}, Auth: {s}\n", .{
+        @tagName(req.method),
+        req.url,
+        req.header.get("Authorization") orelse "",
+    });
 }

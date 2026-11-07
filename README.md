@@ -28,6 +28,7 @@ It specifically addresses domains where the current Zig official standard librar
 | **`context`** | `context` | Lifecycle cancellation tree: `background()`, `todo()`, `withCancel()`, `withDeadline()`, `withValue()`. |
 | **`math.rand`** | `math/rand` | Deterministic pseudo-random number generator (SplitMix64): `uint64`, `intn`, `float64`, and `shuffle`. |
 | **`net.url`** | `net/url` | RFC 3986 URL parsing; `QueryEscape` and `QueryUnescape` (`+` and `%XX` handling); `Values` multi-value query map with deterministic encoding. |
+| **`net.http`** | `net/http` | *First-principles HTTP/HTTPS client without `std.http`*. Ergonomic Go-aligned `Client`, `get`, `post`, `head`, `put`, `delete`, `patch`; Keep-Alive idle connection pool (`ConnPool`), `CookieJar`, automatic redirect tracking, and streaming response body reader. |
 | **`path.filepath`** | `path/filepath` | *Missing in Zig std*. Shell file pattern matching (`Match`) supporting `*`, `?`, `[a-z]`, `[^0-9]`, `\\` escapes, and cross-platform path separators. |
 | **`archive.zip`** | `archive/zip` | *Missing in Zig std*. ZIP archive reader and writer; tail EOCD discovery, Central Directory table indexing, local header generation, and CRC-32 verification. |
 | **`archive.tar`** | `archive/tar` | Complete POSIX USTAR TAR archive reader and writer with strict 512-byte block alignment, octal header serialization, and trailer EOF handling. |
@@ -115,7 +116,16 @@ pub fn main() !void {
         std.debug.print("Scheme: {s}, Host: {s}, Path: {s}\n", .{ u.scheme, u.host, u.path });
     }
 
-    // 5. Concurrency coordination (sync.WaitGroup)
+    // 5. Ergonomic HTTP/HTTPS Client (net.http)
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var resp = try stdgo.net.http.get(allocator, threaded.io(), "https://edgebin.liujiacai.net/get");
+    defer resp.close();
+    const body = try resp.readAllAlloc(64 * 1024);
+    defer allocator.free(body);
+    std.debug.print("HTTP Status: {d}, Body bytes: {d}\n", .{ resp.status_code, body.len });
+
+    // 6. Concurrency coordination (sync.WaitGroup)
     var wg = stdgo.sync.WaitGroup.init();
     const Worker = struct {
         fn run(group: *stdgo.sync.WaitGroup) void {
