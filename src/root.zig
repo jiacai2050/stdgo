@@ -19,6 +19,8 @@ pub const container = @import("container.zig");
 pub const slices = @import("slices.zig");
 pub const hash = @import("hash.zig");
 pub const crypto = @import("crypto.zig");
+pub const context = @import("context.zig");
+pub const math = @import("math.zig");
 
 test "stdgo integration: bytes.Buffer + io.copy + bytes.Reader" {
     const testing = std.testing;
@@ -208,6 +210,81 @@ test "stdgo integration: strings.Builder + time.parseDuration + slices.sort" {
     try testing.expectEqualSlices(i64, &[_]i64{ 100, 500, 150000 }, &dur_array);
 }
 
+test "stdgo integration: base64 + hex encoding" {
+    const testing = std.testing;
+
+    const data = "Go standard library features in Zig 0.17!";
+    const b64 = try encoding.base64.std_encoding.encodeToString(testing.allocator, data);
+    defer testing.allocator.free(b64);
+
+    const hex_encoded = try encoding.hex.encodeToString(testing.allocator, b64);
+    defer testing.allocator.free(hex_encoded);
+
+    const hex_decoded = try encoding.hex.decodeString(testing.allocator, hex_encoded);
+    defer testing.allocator.free(hex_decoded);
+
+    const original = try encoding.base64.std_encoding.decodeString(testing.allocator, hex_decoded);
+    defer testing.allocator.free(original);
+
+    try testing.expectEqualStrings(data, original);
+}
+
+test "stdgo integration: context cancellation + value chain" {
+    const testing = std.testing;
+
+    const root_ctx = context.background();
+    const req_id: []const u8 = "req-9876";
+
+    var val_node = try context.withValue(testing.allocator, root_ctx, "req_id", &req_id);
+    defer testing.allocator.destroy(val_node);
+
+    var cancel_node = try context.withCancel(testing.allocator, val_node.context());
+    defer testing.allocator.destroy(cancel_node);
+
+    const ctx = cancel_node.context();
+    try testing.expect(!ctx.done());
+
+    const found: ?*const anyopaque = ctx.value("req_id");
+    const val_ptr: *const []const u8 = @ptrCast(@alignCast(found.?));
+    try testing.expectEqualStrings("req-9876", val_ptr.*);
+
+    cancel_node.cancel();
+    try testing.expect(ctx.done());
+    try testing.expectEqual(context.Error.Canceled, ctx.err().?);
+}
+
+test "stdgo integration: sync.Pool + math.rand" {
+    const testing = std.testing;
+
+    const BufferHelper = struct {
+        fn create(allocator: std.mem.Allocator) std.mem.Allocator.Error!*bytes.Buffer {
+            const buf = try allocator.create(bytes.Buffer);
+            buf.* = bytes.Buffer.init(allocator);
+            return buf;
+        }
+
+        fn destroy(allocator: std.mem.Allocator, buf: *bytes.Buffer) void {
+            buf.deinit();
+            allocator.destroy(buf);
+        }
+    };
+
+    var pool = sync.Pool(bytes.Buffer).init(testing.allocator, BufferHelper.create);
+    defer pool.deinit(BufferHelper.destroy);
+
+    var r = math.rand.Rand.init(999);
+
+    const b = (try pool.get()).?;
+    _ = try b.write("random number: ");
+    var num_buf: [32]u8 = undefined;
+    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{r.intn(1000)}) catch unreachable;
+    _ = try b.write(num_str);
+
+    try testing.expect(b.len() > 15);
+    b.reset();
+    try pool.put(b);
+}
+
 test {
     std.testing.refAllDecls(@This());
     _ = io;
@@ -228,4 +305,6 @@ test {
     _ = slices;
     _ = hash;
     _ = crypto;
+    _ = context;
+    _ = math;
 }

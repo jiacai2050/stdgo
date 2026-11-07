@@ -84,7 +84,34 @@ pub fn main(init: std.process.Init) !void {
     t1.join();
     t2.join();
     t3.join();
-    std.debug.print("   All workers finished successfully!\n", .{});
+    std.debug.print("   All workers finished successfully!\n\n", .{});
+
+    // 7. Base64 & Hex
+    const raw_token = "zig-stdgo-v1";
+    const b64 = try stdgo.encoding.base64.std_encoding.encodeToString(gpa, raw_token);
+    defer gpa.free(b64);
+    std.debug.print("7. Base64 of '{s}': {s}\n", .{ raw_token, b64 });
+
+    const hexdump = try stdgo.encoding.hex.dump(gpa, raw_token);
+    defer gpa.free(hexdump);
+    std.debug.print("   Hex Dump:\n{s}\n", .{hexdump});
+
+    // 8. Context, Sync Pool & Math Rand
+    var r = stdgo.math.rand.Rand.init(2026);
+    const lucky_num = r.intn(100);
+
+    const bg = stdgo.context.background();
+    var val_ctx = try stdgo.context.withValue(gpa, bg, "user", "gopher");
+    defer gpa.destroy(val_ctx);
+
+    var cancel_ctx = try stdgo.context.withCancel(gpa, val_ctx.context());
+    defer gpa.destroy(cancel_ctx);
+
+    cancel_ctx.cancel();
+    std.debug.print("8. Context canceled: {any}, Lucky Number: {d}\n", .{
+        cancel_ctx.context().done(),
+        lucky_num,
+    });
 }
 
 test "simple test" {

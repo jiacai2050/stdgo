@@ -23,6 +23,10 @@ It specifically addresses domains where the current Zig official standard librar
 | **`bufio`** | `bufio` | Buffered `Reader` and `Writer` with large-payload bypass optimization; customizable token `Scanner` with built-in `scanLines` and `scanWords`. |
 | **`encoding.binary`** | `encoding/binary` | `LittleEndian`, `BigEndian`, `NativeEndian` fixed-size encoders; Protocol Buffers Leb128 `Uvarint` and ZigZag `Varint` variable-length integer encoding. |
 | **`encoding.csv`** | `encoding/csv` | *Missing in Zig std*. Strict RFC 4180 CSV reader and writer; handles escaped quotes (`""`), multi-line fields, custom delimiters, and comment filtering. |
+| **`encoding.base64`** | `encoding/base64` | RFC 4648 Base64: standard, URL-safe, raw without padding; streaming & string encoding/decoding. |
+| **`encoding.hex`** | `encoding/hex` | Hexadecimal encoding, decoding, and canonical Go-style 16-byte `hex.Dump` table formatting. |
+| **`context`** | `context` | Lifecycle cancellation tree: `background()`, `todo()`, `withCancel()`, `withDeadline()`, `withValue()`. |
+| **`math.rand`** | `math/rand` | Deterministic pseudo-random number generator (SplitMix64): `uint64`, `intn`, `float64`, and `shuffle`. |
 | **`net.url`** | `net/url` | RFC 3986 URL parsing; `QueryEscape` and `QueryUnescape` (`+` and `%XX` handling); `Values` multi-value query map with deterministic encoding. |
 | **`path.filepath`** | `path/filepath` | *Missing in Zig std*. Shell file pattern matching (`Match`) supporting `*`, `?`, `[a-z]`, `[^0-9]`, `\\` escapes, and cross-platform path separators. |
 | **`archive.zip`** | `archive/zip` | *Missing in Zig std*. ZIP archive reader and writer; tail EOCD discovery, Central Directory table indexing, local header generation, and CRC-32 verification. |
@@ -31,8 +35,8 @@ It specifically addresses domains where the current Zig official standard librar
 | **`regexp`** | `regexp` | *Deliberately omitted in Zig std*. Linear-time regular expression engine based on Thompson NFA / Pike VM bytecode execution. Guarantees $O(N \times L)$ execution time with zero exponential backtracking. |
 | **`flag`** | `flag` | *Missing in Zig std*. Command-line flag parsing with `FlagSet`; pointer-binding for `bool`, `int`, `string`, `float`; supports `-flag`, `--flag`, `-flag=val`, `-flag val`; automatic `--help` generation. |
 | **`text.tabwriter`** | `text/tabwriter` | *Missing in Zig std*. Column alignment filter using the Elastic Tabstops algorithm; calculates optimal column widths; supports custom padding, `Debug` vertical separators, and right alignment. |
-| **`sync`** | `sync` | High-level concurrency coordination: lock-free atomic `WaitGroup` (`add`, `done`, `wait`), 3-state atomic state machine `Once` (thread-safe, dead-lock free single execution), and lightweight `Mutex`. |
-| **`time`** | `time` | Duration string parser `parseDuration` supporting composite units (e.g., `"2h45m"`, `"500ms"`, `"-1.5s"`, `"1h30m10s"`), `Duration.string()`, and `Time` wall-clock operations. |
+| **`sync`** | `sync` | High-level concurrency coordination: lock-free atomic `WaitGroup`, 3-state atomic `Once`, lightweight `Mutex`, and generic object `Pool(T)`. |
+| **`time`** | `time` | Duration string parser `parseDuration` supporting composite units (e.g., `"2h45m"`), `Duration.string()`, `Time`, and explicit `sleep(io, d)`. |
 | **`container`** | `container` | Generic bidirectional circular list `Ring(T)` (ideal for sliding windows and round-robin scheduling); generic binary heap `Heap(T, lessFn)`. |
 | **`slices`** | `slices` | Go 1.21+ generic slice algorithms: `sort`, `binarySearch`, `reverse`, `compact`, `clone`, `equal`, `contains`, `index`. |
 | **`crypto` / `hash`** | `crypto` / `hash` | Stream hashing via `hash.Hash` (implements `io.Writer`, enabling `io.copy(hasher.writer(), reader, &buf)`); includes `crypto.md5` and `crypto.sha256`. |
