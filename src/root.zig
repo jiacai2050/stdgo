@@ -285,6 +285,84 @@ test "stdgo integration: sync.Pool + math.rand" {
     try pool.put(b);
 }
 
+test "stdgo integration: net.http Request and Header" {
+    const testing = std.testing;
+
+    var req = try net.http.newRequest(testing.allocator, .POST, "http://127.0.0.1:8080/api/login", "{\"user\":\"admin\"}");
+    defer req.deinit();
+
+    try req.setHeader("Content-Type", "application/json");
+    try req.setHeader("Authorization", "Bearer token123");
+
+    try testing.expectEqualStrings("application/json", req.header.get("content-type").?);
+    try testing.expectEqualStrings("Bearer token123", req.header.get("authorization").?);
+    try testing.expectEqualStrings("16", req.header.get("content-length").?);
+    try testing.expectEqual(net.http.StatusOK, .ok);
+}
+
+fn mockHttpServerThread(std_io: std.Io, server: *std.Io.net.Server) void {
+    var stream = server.accept(std_io) catch return;
+    defer stream.close(std_io);
+
+    var buf: [1024]u8 = undefined;
+    var data = [1][]u8{&buf};
+    const op = std.Io.Operation{
+        .net_read = .{
+            .socket_handle = stream.socket.handle,
+            .data = &data,
+        },
+    };
+    _ = std_io.operate(op) catch return;
+
+    const resp =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Length: 13\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n" ++
+        "Hello, stdgo!";
+
+    var resp_slice = [1][]const u8{resp};
+    const write_op = std.Io.Operation{
+        .net_write = .{
+            .socket_handle = stream.socket.handle,
+            .data = &resp_slice,
+        },
+    };
+    _ = std_io.operate(write_op) catch return;
+}
+
+test "stdgo integration: net.http real TCP loopback round-trip" {
+    const testing = std.testing;
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const std_io = threaded.io();
+
+    const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind_addr.listen(std_io, .{ .reuse_address = true });
+    defer server.deinit(std_io);
+
+    const actual_port = server.socket.address.ip4.port;
+
+    var thread = try std.Thread.spawn(.{}, mockHttpServerThread, .{ std_io, &server });
+    defer thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{actual_port});
+
+    var resp = try net.http.get(testing.allocator, std_io, url);
+    defer resp.close();
+
+    try testing.expectEqual(net.http.StatusOK, resp.status);
+    try testing.expectEqual(@as(u16, 200), resp.status_code);
+    try testing.expectEqualStrings("text/plain", resp.header.get("content-type").?);
+
+    const body = try resp.readAllAlloc(1024);
+    defer testing.allocator.free(body);
+
+    try testing.expectEqualStrings("Hello, stdgo!", body);
+}
+
 test {
     std.testing.refAllDecls(@This());
     _ = io;
