@@ -2,6 +2,9 @@
 const std = @import("std");
 const Method = @import("method.zig").Method;
 const Header = @import("header.zig").Header;
+const io = @import("../../io.zig");
+const context = @import("../../context.zig");
+const Context = context.Context;
 
 pub const ParsedTarget = struct {
     scheme: []const u8,
@@ -15,17 +18,25 @@ pub fn parseUrlTarget(raw_url: []const u8) !ParsedTarget {
     var rest = raw_url;
     var is_tls = false;
     var port: u16 = 80;
+    var scheme: []const u8 = "http";
 
     if (std.mem.startsWith(u8, rest, "http://")) {
         rest = rest[7..];
         is_tls = false;
         port = 80;
+        scheme = "http";
     } else if (std.mem.startsWith(u8, rest, "https://")) {
         rest = rest[8..];
         is_tls = true;
         port = 443;
-    } else {
+        scheme = "https";
+    } else if (std.mem.indexOf(u8, rest, "://") != null) {
         return error.UnsupportedScheme;
+    } else {
+        // Default to http:// when scheme is omitted (like curl)
+        is_tls = false;
+        port = 80;
+        scheme = "http";
     }
 
     const delim_idx = std.mem.indexOfAny(u8, rest, "/?");
@@ -57,12 +68,40 @@ pub fn parseUrlTarget(raw_url: []const u8) !ParsedTarget {
     };
 }
 
+pub const SliceReaderState = struct {
+    data: []const u8,
+    cursor: usize = 0,
+
+    pub fn read(ctx_ptr: *anyopaque, buf: []u8) anyerror!usize {
+        const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        if (self.cursor >= self.data.len) return 0;
+        const avail = self.data.len - self.cursor;
+        const n = @min(avail, buf.len);
+        @memcpy(buf[0..n], self.data[self.cursor .. self.cursor + n]);
+        self.cursor += n;
+        return n;
+    }
+
+    pub fn reader(self: *@This()) io.Reader {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .read = read },
+        };
+    }
+};
+
 pub const Request = struct {
     allocator: std.mem.Allocator,
     method: Method = .GET,
     url: []const u8,
     header: Header,
     body: ?[]const u8 = null,
+    body_reader: ?io.Reader = null,
+    content_length: ?u64 = null,
+    get_body: ?*const fn (ctx_ptr: *anyopaque) anyerror!io.Reader = null,
+    get_body_ctx: ?*anyopaque = null,
+    slice_reader_state: SliceReaderState = .{ .data = "" },
+    ctx: ?Context = null,
     cl_str: ?[]u8 = null,
     extra_strings: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -73,6 +112,12 @@ pub const Request = struct {
             .url = url,
             .header = Header.init(allocator),
             .body = null,
+            .body_reader = null,
+            .content_length = null,
+            .get_body = null,
+            .get_body_ctx = null,
+            .slice_reader_state = .{ .data = "" },
+            .ctx = null,
             .cl_str = null,
             .extra_strings = .empty,
         };
@@ -90,12 +135,28 @@ pub const Request = struct {
         self.header.deinit();
     }
 
+    pub fn withContext(self: *Request, ctx: Context) void {
+        self.ctx = ctx;
+    }
+
     pub fn setHeader(self: *Request, name: []const u8, value: []const u8) !void {
         try self.header.set(name, value);
     }
 
     pub fn setBody(self: *Request, body: []const u8) !void {
         self.body = body;
+        self.content_length = body.len;
+        self.slice_reader_state = .{ .data = body, .cursor = 0 };
+        self.body_reader = self.slice_reader_state.reader();
+        self.get_body_ctx = &self.slice_reader_state;
+        self.get_body = struct {
+            fn rewind(ctx_ptr: *anyopaque) anyerror!io.Reader {
+                const s: *SliceReaderState = @ptrCast(@alignCast(ctx_ptr));
+                s.cursor = 0;
+                return s.reader();
+            }
+        }.rewind;
+
         if (self.cl_str) |s| {
             self.allocator.free(s);
             self.cl_str = null;
@@ -103,6 +164,24 @@ pub const Request = struct {
         const s = try std.fmt.allocPrint(self.allocator, "{d}", .{body.len});
         self.cl_str = s;
         try self.header.set("Content-Length", s);
+    }
+
+    pub fn setBodyReader(self: *Request, r: io.Reader, cl: ?u64) !void {
+        self.body = null;
+        self.body_reader = r;
+        self.content_length = cl;
+
+        if (cl) |len| {
+            if (self.cl_str) |s| {
+                self.allocator.free(s);
+                self.cl_str = null;
+            }
+            const s = try std.fmt.allocPrint(self.allocator, "{d}", .{len});
+            self.cl_str = s;
+            try self.header.set("Content-Length", s);
+        } else {
+            try self.header.set("Transfer-Encoding", "chunked");
+        }
     }
 
     pub fn setBasicAuth(self: *Request, username: []const u8, password: []const u8) !void {
@@ -139,6 +218,21 @@ pub fn newRequest(allocator: std.mem.Allocator, method: Method, url: []const u8,
     errdefer req.deinit();
     if (body) |b| {
         try req.setBody(b);
+    }
+    return req;
+}
+
+pub fn newRequestWithReader(
+    allocator: std.mem.Allocator,
+    method: Method,
+    url: []const u8,
+    body_r: ?io.Reader,
+    content_len: ?u64,
+) !Request {
+    var req = Request.init(allocator, method, url);
+    errdefer req.deinit();
+    if (body_r) |r| {
+        try req.setBodyReader(r, content_len);
     }
     return req;
 }

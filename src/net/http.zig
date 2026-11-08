@@ -27,9 +27,14 @@ pub const parseSetCookie = cookie.parseSetCookie;
 pub const jar = @import("http/jar.zig");
 pub const CookieJar = jar.CookieJar;
 
+pub const proxy = @import("http/proxy.zig");
+pub const proxyFromEnvironment = proxy.proxyFromEnvironment;
+pub const isNoProxy = proxy.isNoProxy;
+
 pub const request = @import("http/request.zig");
 pub const Request = request.Request;
 pub const newRequest = request.newRequest;
+pub const newRequestWithReader = request.newRequestWithReader;
 pub const parseUrlTarget = request.parseUrlTarget;
 
 pub const response = @import("http/response.zig");

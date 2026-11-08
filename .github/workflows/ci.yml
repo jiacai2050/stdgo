@@ -39,5 +39,5 @@ jobs:
       - name: Run all tests
         run: zig build test --summary all
 
-      - name: Run main application demo
-        run: zig build run
+      - name: Run all examples
+        run: zig build run-examples

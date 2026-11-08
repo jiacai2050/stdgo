@@ -21,6 +21,8 @@ pub const hash = @import("hash.zig");
 pub const crypto = @import("crypto.zig");
 pub const context = @import("context.zig");
 pub const math = @import("math.zig");
+pub const mime = @import("mime.zig");
+pub const log = @import("log.zig");
 
 test "stdgo integration: bytes.Buffer + io.copy + bytes.Reader" {
     const testing = std.testing;
@@ -385,4 +387,6 @@ test {
     _ = crypto;
     _ = context;
     _ = math;
+    _ = mime;
+    _ = log;
 }

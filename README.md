@@ -28,7 +28,7 @@ It specifically addresses domains where the current Zig official standard librar
 | **`context`** | `context` | Lifecycle cancellation tree: `background()`, `todo()`, `withCancel()`, `withDeadline()`, `withValue()`. |
 | **`math.rand`** | `math/rand` | Deterministic pseudo-random number generator (SplitMix64): `uint64`, `intn`, `float64`, and `shuffle`. |
 | **`net.url`** | `net/url` | RFC 3986 URL parsing; `QueryEscape` and `QueryUnescape` (`+` and `%XX` handling); `Values` multi-value query map with deterministic encoding. |
-| **`net.http`** | `net/http` | *First-principles HTTP/HTTPS client without `std.http`*. Ergonomic Go-aligned `Client`, `get`, `post`, `head`, `put`, `delete`, `patch`; Keep-Alive idle connection pool (`ConnPool`), `CookieJar`, automatic redirect tracking, and streaming response body reader. |
+| **`net.http`** | `net/http` | *First-principles HTTP/HTTPS client without `std.http`*. Ergonomic Go-aligned `Client`, `get`, `post`, `head`, `put`, `delete`, `patch`; HTTP proxy, HTTPS CONNECT tunneling, environment proxy detection (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) & Basic Auth; Keep-Alive idle connection pool (`ConnPool`), `CookieJar`, automatic redirect tracking with `CheckRedirect` and cross-origin header sanitization, streaming request uploads (`io.Reader` & Chunked Transfer-Encoding), transparent response Gzip decompression, end-to-end `Client.Timeout`, and `context.Context` cancellation. |
 | **`path.filepath`** | `path/filepath` | *Missing in Zig std*. Shell file pattern matching (`Match`) supporting `*`, `?`, `[a-z]`, `[^0-9]`, `\\` escapes, and cross-platform path separators. |
 | **`archive.zip`** | `archive/zip` | *Missing in Zig std*. ZIP archive reader and writer; tail EOCD discovery, Central Directory table indexing, local header generation, and CRC-32 verification. |
 | **`archive.tar`** | `archive/tar` | Complete POSIX USTAR TAR archive reader and writer with strict 512-byte block alignment, octal header serialization, and trailer EOF handling. |
@@ -36,11 +36,13 @@ It specifically addresses domains where the current Zig official standard librar
 | **`regexp`** | `regexp` | *Deliberately omitted in Zig std*. Linear-time regular expression engine based on Thompson NFA / Pike VM bytecode execution. Guarantees $O(N \times L)$ execution time with zero exponential backtracking. |
 | **`flag`** | `flag` | *Missing in Zig std*. Command-line flag parsing with `FlagSet`; pointer-binding for `bool`, `int`, `string`, `float`; supports `-flag`, `--flag`, `-flag=val`, `-flag val`; automatic `--help` generation. |
 | **`text.tabwriter`** | `text/tabwriter` | *Missing in Zig std*. Column alignment filter using the Elastic Tabstops algorithm; calculates optimal column widths; supports custom padding, `Debug` vertical separators, and right alignment. |
-| **`sync`** | `sync` | High-level concurrency coordination: lock-free atomic `WaitGroup`, 3-state atomic `Once`, lightweight `Mutex`, and generic object `Pool(T)`. |
+| **`sync`** | `sync` | High-level concurrency coordination: lock-free atomic `WaitGroup`, 3-state atomic `Once`, lightweight `Mutex`, generic object `Pool(T)`, and Go-aligned `errgroup.Group` (`withContext`, task error propagation, concurrency limit). |
+| **`mime.multipart`** | `mime/multipart` | *Missing in Zig std*. RFC 2046 Multipart form data `Writer` (file upload fields) and streaming `Reader` (token boundary scanning and `Part` extraction). |
+| **`log.slog`** | `log/slog` | Structured logging with Go 1.21 semantics: severity `Level`, key-value `Attr`, `Handler` VTable (`TextHandler`, `JSONHandler`), and contextual `Logger`. |
 | **`time`** | `time` | Duration string parser `parseDuration` supporting composite units (e.g., `"2h45m"`), `Duration.string()`, `Time`, and explicit `sleep(io, d)`. |
 | **`container`** | `container` | Generic bidirectional circular list `Ring(T)` (ideal for sliding windows and round-robin scheduling); generic binary heap `Heap(T, lessFn)`. |
 | **`slices`** | `slices` | Go 1.21+ generic slice algorithms: `sort`, `binarySearch`, `reverse`, `compact`, `clone`, `equal`, `contains`, `index`. |
-| **`crypto` / `hash`** | `crypto` / `hash` | Stream hashing via `hash.Hash` (implements `io.Writer`, enabling `io.copy(hasher.writer(), reader, &buf)`); includes `crypto.md5` and `crypto.sha256`. |
+| **`crypto` / `hash`** | `crypto` / `hash` | Stream hashing via `hash.Hash` (implements `io.Writer`, enabling `io.copy(hasher.writer(), reader, &buf)`); includes `crypto.md5`, `crypto.sha256`, and RFC 2104 `crypto.hmac`. |
 
 ---
 
@@ -152,7 +154,17 @@ This project targets **Zig 0.17.0** with strict memory leak detection and assert
 # Run all unit and integration tests (including ported Go official test suites)
 zig build test --summary all
 
-# Run the CLI demonstration executable
+# Run all modular examples
+zig build run-examples
+
+# Run a specific modular example (e.g. http, slog, errgroup, multipart, etc.)
+zig build run-http
+zig build run-slog
+zig build run-archive
+zig build run-context
+zig build run-encoding
+
+# Run the overview demonstration executable
 zig build run
 
 # Generate interactive web API documentation (emitted to zig-out/docs)
