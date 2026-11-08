@@ -13,6 +13,10 @@ const proxy_mod = @import("proxy.zig");
 pub const TransportOptions = struct {
     proxy_url: ?[]const u8 = null,
     proxy_from_env: bool = true,
+    /// Explicit environment map (e.g. from init.environ_map in main).
+    environ_map: ?*const std.process.Environ.Map = null,
+    /// Custom environment lookup function. If set, takes precedence over environ_map.
+    env_lookup: ?*const fn (key: []const u8) ?[]const u8 = null,
     timeout_ns: ?u64 = null,
     max_idle_conns_per_host: usize = 2,
     insecure_skip_verify: bool = false,
@@ -46,6 +50,7 @@ pub const Transport = struct {
     }
 
     fn connectStream(io: std.Io, host: []const u8, port: u16, timeout: std.Io.Timeout) !std.Io.net.Stream {
+        _ = timeout;
         if (std.Io.net.IpAddress.parse(host, port)) |ip| {
             // Zig 0.17's netConnectIpPosix panics if timeout != .none
             return ip.connect(io, .{ .mode = .stream, .timeout = .none });
@@ -69,14 +74,15 @@ pub const Transport = struct {
 
         while (lookup_queue.getOne(io)) |dns_result| switch (dns_result) {
             .address => |address| {
-                if (address.connect(io, .{ .mode = .stream, .timeout = timeout })) |stream| {
+                // Zig 0.17's netConnectIpPosix panics if timeout != .none, so use .none
+                if (address.connect(io, .{ .mode = .stream, .timeout = .none })) |stream| {
                     return stream;
                 } else |_| continue;
             },
             .canonical_name => continue,
         } else |_| {}
 
-        return host_name.connect(io, port, .{ .mode = .stream, .timeout = timeout });
+        return host_name.connect(io, port, .{ .mode = .stream, .timeout = .none });
     }
 
     fn makeIoTimeout(timeout_ns: ?u64) std.Io.Timeout {
@@ -143,9 +149,21 @@ pub const Transport = struct {
 
         var effective_proxy_url: ?[]const u8 = self.options.proxy_url;
         if (effective_proxy_url == null and self.options.proxy_from_env) {
-            if (try proxy_mod.proxyFromEnvironment(self.allocator, target.scheme, target.host)) |p| {
-                resolved_proxy_to_free = p;
-                effective_proxy_url = p;
+            if (self.options.env_lookup) |lookup| {
+                if (try proxy_mod.proxyFromEnvWithLookup(self.allocator, target.scheme, target.host, lookup)) |p| {
+                    resolved_proxy_to_free = p;
+                    effective_proxy_url = p;
+                }
+            } else if (self.options.environ_map) |env_map| {
+                if (try proxy_mod.proxyFromEnvWithMap(self.allocator, target.scheme, target.host, env_map)) |p| {
+                    resolved_proxy_to_free = p;
+                    effective_proxy_url = p;
+                }
+            } else {
+                if (try proxy_mod.proxyFromEnvironment(self.allocator, target.scheme, target.host)) |p| {
+                    resolved_proxy_to_free = p;
+                    effective_proxy_url = p;
+                }
             }
         }
         const use_proxy = effective_proxy_url != null;

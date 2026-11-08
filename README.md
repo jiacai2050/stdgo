@@ -5,65 +5,21 @@
 [![Zig Version](https://img.shields.io/badge/zig-0.17.0-blue.svg)](https://ziglang.org/download/0.17.0/release-notes.html)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**stdgo** is a standard library extension for **Zig (0.17.0)**, designed to bring the **battle-tested ergonomics, stream abstractions, and high-utility packages of the Go Standard Library** into the Zig ecosystem.
+Bring Go standard library ergonomics, unified streaming abstractions (`io.Reader` / `io.Writer`), and high-utility packages to **Zig 0.17** — with zero hidden global state, explicit dependency injection, and no C dependencies.
 
-It specifically addresses domains where the current Zig official standard library is **missing, incomplete, or cumbersome** (such as RFC 4180 CSV parsing, ZIP/TAR archive extraction and packaging, linear-time regular expressions via Pike VM, CLI flag parsing, elastic tabstop column alignment, high-level concurrency primitives, and duration string parsing). All packages are verified against official Go test suites.
-
-📖 **API Documentation**: [https://jiacai2050.github.io/stdgo/](https://jiacai2050.github.io/stdgo/)
-
----
-
-## Features & Package Overview
-
-| Package (`stdgo.*`) | Go Equivalent | Key Capabilities & Highlights |
-| :--- | :--- | :--- |
-| **`io`** | `io` | Type-erased VTable streams: `Reader`, `Writer`, `Closer`, `Seeker`, `LimitReader`, `TeeReader`, `copy`, `readFull`, `readAtLeast`. |
-| **`bytes`** | `bytes` | Mutable `Buffer` with sliding-window read recycling (TigerStyle leak-safe), slice `Reader` (implements `Reader` & `Seeker`), and byte slice utility functions. |
-| **`strings`** | `strings` | High-performance `Builder`, string `Reader`, and text routines: `Split`, `Join`, `Fields`, `Trim`, `TrimSpace`, `TrimPrefix`, `TrimSuffix`, `ReplaceAll`, `Repeat`. |
-| **`bufio`** | `bufio` | Buffered `Reader` and `Writer` with large-payload bypass optimization; customizable token `Scanner` with built-in `scanLines` and `scanWords`. |
-| **`encoding.binary`** | `encoding/binary` | `LittleEndian`, `BigEndian`, `NativeEndian` fixed-size encoders; Protocol Buffers Leb128 `Uvarint` and ZigZag `Varint` variable-length integer encoding. |
-| **`encoding.csv`** | `encoding/csv` | *Missing in Zig std*. Strict RFC 4180 CSV reader and writer; handles escaped quotes (`""`), multi-line fields, custom delimiters, and comment filtering. |
-| **`encoding.base64`** | `encoding/base64` | RFC 4648 Base64: standard, URL-safe, raw without padding; streaming & string encoding/decoding. |
-| **`encoding.hex`** | `encoding/hex` | Hexadecimal encoding, decoding, and canonical Go-style 16-byte `hex.Dump` table formatting. |
-| **`context`** | `context` | Lifecycle cancellation tree: `background()`, `todo()`, `withCancel()`, `withDeadline()`, `withValue()`. |
-| **`math.rand`** | `math/rand` | Deterministic pseudo-random number generator (SplitMix64): `uint64`, `intn`, `float64`, and `shuffle`. |
-| **`net.url`** | `net/url` | RFC 3986 URL parsing; `QueryEscape` and `QueryUnescape` (`+` and `%XX` handling); `Values` multi-value query map with deterministic encoding. |
-| **`net.http`** | `net/http` | *First-principles HTTP/HTTPS client without `std.http`*. Ergonomic Go-aligned `Client`, `get`, `post`, `head`, `put`, `delete`, `patch`; HTTP proxy, HTTPS CONNECT tunneling, environment proxy detection (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) & Basic Auth; Keep-Alive idle connection pool (`ConnPool`), `CookieJar`, automatic redirect tracking with `CheckRedirect` and cross-origin header sanitization, streaming request uploads (`io.Reader` & Chunked Transfer-Encoding), transparent response Gzip decompression, end-to-end `Client.Timeout`, and `context.Context` cancellation. |
-| **`path.filepath`** | `path/filepath` | *Missing in Zig std*. Shell file pattern matching (`Match`) supporting `*`, `?`, `[a-z]`, `[^0-9]`, `\\` escapes, and cross-platform path separators. |
-| **`archive.zip`** | `archive/zip` | *Missing in Zig std*. ZIP archive reader and writer; tail EOCD discovery, Central Directory table indexing, local header generation, and CRC-32 verification. |
-| **`archive.tar`** | `archive/tar` | Complete POSIX USTAR TAR archive reader and writer with strict 512-byte block alignment, octal header serialization, and trailer EOF handling. |
-| **`compress.gzip`** | `compress/gzip` | RFC 1952 Gzip format reader and writer; 10-byte header, filename metadata, CRC-32 checksum and uncompressed `ISIZE` verification. Seamlessly pipes into `tar` for `.tar.gz`. |
-| **`regexp`** | `regexp` | *Deliberately omitted in Zig std*. Linear-time regular expression engine based on Thompson NFA / Pike VM bytecode execution. Guarantees $O(N \times L)$ execution time with zero exponential backtracking. |
-| **`flag`** | `flag` | *Missing in Zig std*. Command-line flag parsing with `FlagSet`; pointer-binding for `bool`, `int`, `string`, `float`; supports `-flag`, `--flag`, `-flag=val`, `-flag val`; automatic `--help` generation. |
-| **`text.tabwriter`** | `text/tabwriter` | *Missing in Zig std*. Column alignment filter using the Elastic Tabstops algorithm; calculates optimal column widths; supports custom padding, `Debug` vertical separators, and right alignment. |
-| **`sync`** | `sync` | High-level concurrency coordination: lock-free atomic `WaitGroup`, 3-state atomic `Once`, lightweight `Mutex`, generic object `Pool(T)`, and Go-aligned `errgroup.Group` (`withContext`, task error propagation, concurrency limit). |
-| **`mime.multipart`** | `mime/multipart` | *Missing in Zig std*. RFC 2046 Multipart form data `Writer` (file upload fields) and streaming `Reader` (token boundary scanning and `Part` extraction). |
-| **`log.slog`** | `log/slog` | Structured logging with Go 1.21 semantics: severity `Level`, key-value `Attr`, `Handler` VTable (`TextHandler`, `JSONHandler`), and contextual `Logger`. |
-| **`time`** | `time` | Duration string parser `parseDuration` supporting composite units (e.g., `"2h45m"`), `Duration.string()`, `Time`, and explicit `sleep(io, d)`. |
-| **`container`** | `container` | Generic bidirectional circular list `Ring(T)` (ideal for sliding windows and round-robin scheduling); generic binary heap `Heap(T, lessFn)`. |
-| **`slices`** | `slices` | Go 1.21+ generic slice algorithms: `sort`, `binarySearch`, `reverse`, `compact`, `clone`, `equal`, `contains`, `index`. |
-| **`crypto` / `hash`** | `crypto` / `hash` | Stream hashing via `hash.Hash` (implements `io.Writer`, enabling `io.copy(hasher.writer(), reader, &buf)`); includes `crypto.md5`, `crypto.sha256`, and RFC 2104 `crypto.hmac`. |
+- 📖 **API Documentation**: [https://jiacai2050.github.io/stdgo/](https://jiacai2050.github.io/stdgo/)
+- 🗺️ **Roadmap & Status**: [roadmap.md](roadmap.md)
 
 ---
 
 ## Quick Start
 
-### 1. Add to `build.zig.zon`
+### 1. Add Dependency
 
-Add `stdgo` as a dependency in your `build.zig.zon`:
+Add `stdgo` to your project using `zig fetch`:
 
-```zig
-.{
-    .name = .my_project,
-    .version = "0.1.0",
-    .dependencies = .{
-        .stdgo = .{
-            .url = "git+https://github.com/jiacai2050/stdgo.git#main",
-            // Run `zig build` to compute the hash automatically
-        },
-    },
-    .paths = .{""},
-}
+```bash
+zig fetch --save git+https://github.com/jiacai2050/stdgo.git
 ```
 
 In your `build.zig`:
@@ -84,13 +40,12 @@ exe.root_module.addImport("stdgo", stdgo.module("stdgo"));
 const std = @import("std");
 const stdgo = @import("stdgo");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.arena.allocator();
+    const io = init.io;
 
     // 1. Command-line flag parsing (flag)
-    var fs = stdgo.flag.FlagSet.init(allocator, "server");
+    var fs = stdgo.flag.FlagSet.init(gpa, "server");
     defer fs.deinit();
 
     var port: i64 = 8080;
@@ -106,7 +61,7 @@ pub fn main() !void {
     std.debug.print("Timeout in seconds: {d}s\n", .{@as(i64, @intFromFloat(timeout.seconds()))});
 
     // 3. Linear-time regular expression search (regexp)
-    var re = try stdgo.regexp.compile(allocator, "https?://[^\\s]+");
+    var re = try stdgo.regexp.compile(gpa, "https?://[^\\s]+");
     defer re.deinit();
 
     const sample_text = "Repository: https://github.com/jiacai2050/stdgo";
@@ -118,14 +73,17 @@ pub fn main() !void {
         std.debug.print("Scheme: {s}, Host: {s}, Path: {s}\n", .{ u.scheme, u.host, u.path });
     }
 
-    // 5. Ergonomic HTTP/HTTPS Client (net.http)
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    var resp = try stdgo.net.http.get(allocator, threaded.io(), "https://edgebin.liujiacai.net/get");
-    defer resp.close();
-    const body = try resp.readAllAlloc(64 * 1024);
-    defer allocator.free(body);
-    std.debug.print("HTTP Status: {d}, Body bytes: {d}\n", .{ resp.status_code, body.len });
+    // 5. Structured logging (log.slog)
+    var log_buf = stdgo.bytes.Buffer.init(gpa);
+    defer log_buf.deinit();
+
+    var text_handler = stdgo.log.slog.TextHandler.init(log_buf.writer(), .Info);
+    var logger = stdgo.log.slog.Logger.init(text_handler.handler());
+    try logger.info("server initialized", &.{
+        stdgo.log.slog.Attr.int("port", port),
+        stdgo.log.slog.Attr.string("host", host),
+    });
+    std.debug.print("Log output: {s}", .{log_buf.string()});
 
     // 6. Concurrency coordination (sync.WaitGroup)
     var wg = stdgo.sync.WaitGroup.init();
@@ -146,6 +104,44 @@ pub fn main() !void {
 
 ---
 
+## Modular Examples
+
+Every single module in `stdgo` is accompanied by a dedicated, runnable example in the `examples/` directory:
+
+| Example Step | Source File | Description |
+| :--- | :--- | :--- |
+| `zig build run` | [`examples/overview.zig`](examples/overview.zig) | Comprehensive cross-module tour |
+| `zig build run-http` | [`examples/http_client.zig`](examples/http_client.zig) | HTTP Client with timeout, chunked upload, gzip & context cancellation |
+| `zig build run-slog` | [`examples/slog.zig`](examples/slog.zig) | Structured logging with `TextHandler`, `JSONHandler`, and attributes |
+| `zig build run-errgroup` | [`examples/errgroup.zig`](examples/errgroup.zig) | Concurrent task group with error propagation, cancellation, & rate limiting |
+| `zig build run-multipart` | [`examples/multipart.zig`](examples/multipart.zig) | RFC 2046 multipart form-data writer and streaming reader |
+| `zig build run-hmac` | [`examples/hmac.zig`](examples/hmac.zig) | HMAC-SHA256, HMAC-MD5 signing and constant-time verification |
+| `zig build run-archive` | [`examples/archive.zig`](examples/archive.zig) | In-memory TAR and ZIP archive creation and inspection |
+| `zig build run-bufio-io` | [`examples/bufio_io.zig`](examples/bufio_io.zig) | Token scanner (lines, words), `io.copy`, `LimitReader`, `TeeReader` |
+| `zig build run-bytes-strings` | [`examples/bytes_strings.zig`](examples/bytes_strings.zig) | `bytes.Buffer`, `strings.Builder`, trimming, splitting, and join |
+| `zig build run-compress` | [`examples/compress.zig`](examples/compress.zig) | Gzip archive header serialization, streaming compression & CRC-32 |
+| `zig build run-container` | [`examples/container.zig`](examples/container.zig) | Min-heap priority queue (`Heap`) and circular ring buffer (`Ring`) |
+| `zig build run-context` | [`examples/context.zig`](examples/context.zig) | Context trees, `withValue` metadata, `withCancel`, `withDeadline` |
+| `zig build run-crypto` | [`examples/crypto.zig`](examples/crypto.zig) | One-shot and streaming SHA-256 and MD5 cryptographic digests |
+| `zig build run-encoding` | [`examples/encoding.zig`](examples/encoding.zig) | RFC 4180 CSV reader/writer, Protobuf Varint, Base64, and Hex dump |
+| `zig build run-flag` | [`examples/flag.zig`](examples/flag.zig) | Command-line flag parsing (`FlagSet`), argument bindings, and defaults |
+| `zig build run-hash-math` | [`examples/hash_math.zig`](examples/hash_math.zig) | SplitMix64 PRNG (`math.rand`) and VTable `hash.Hash` streaming |
+| `zig build run-path` | [`examples/path.zig`](examples/path.zig) | Glob pattern matching (`*`, `?`, `[a-z]`) and OS path separators |
+| `zig build run-regexp` | [`examples/regexp.zig`](examples/regexp.zig) | Linear-time regex search, URL extraction, and pattern replacement |
+| `zig build run-slices` | [`examples/slices.zig`](examples/slices.zig) | Generic slice algorithms: `sort`, `binarySearch`, `reverse`, `compact` |
+| `zig build run-sync` | [`examples/sync.zig`](examples/sync.zig) | Concurrency primitives: `WaitGroup`, `Once`, `Mutex`, and `Pool(T)` |
+| `zig build run-tabwriter` | [`examples/tabwriter.zig`](examples/tabwriter.zig) | Elastic Tabstops column alignment for terminal tables |
+| `zig build run-time` | [`examples/time.zig`](examples/time.zig) | Duration parsing (`parseDuration`), timestamp arithmetic, cooperative sleep |
+| `zig build run-url` | [`examples/url.zig`](examples/url.zig) | RFC 3986 URL parsing, query parameter mutation (`Values`), escaping |
+
+To execute **all examples at once**:
+
+```bash
+zig build run-examples
+```
+
+---
+
 ## Building & Testing
 
 This project targets **Zig 0.17.0** with strict memory leak detection and assertions enabled:
@@ -157,12 +153,10 @@ zig build test --summary all
 # Run all modular examples
 zig build run-examples
 
-# Run a specific modular example (e.g. http, slog, errgroup, multipart, etc.)
+# Run a specific modular example
 zig build run-http
 zig build run-slog
-zig build run-archive
-zig build run-context
-zig build run-encoding
+zig build run-errgroup
 
 # Run the overview demonstration executable
 zig build run
@@ -170,6 +164,12 @@ zig build run
 # Generate interactive web API documentation (emitted to zig-out/docs)
 zig build docs
 ```
+
+---
+
+## Roadmap & Status
+
+See [roadmap.md](roadmap.md) for the detailed implementation status, domain-by-domain coverage metrics (~60% high-utility Go standard library covered), non-goals (standalone HTTP server is implemented in [lighting](https://github.com/jiacai2050/lighting/)), and prioritized milestones.
 
 ---
 

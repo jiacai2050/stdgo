@@ -1,17 +1,20 @@
 //! HTTP/HTTPS Proxy detection, environment parsing, and proxy authentication.
 const std = @import("std");
+const builtin = @import("builtin");
 const base64 = @import("../../encoding/base64.zig");
 const Allocator = std.mem.Allocator;
+const native_os = builtin.os.tag;
 
-/// Safely get an environment variable using libc getenv if available.
+/// Safely get an environment variable without C library dependence.
+/// In unit test mode, queries std.testing.environ.
+/// In production, returns null unless an explicit lookup function or Environ.Map is provided.
 pub fn getEnv(key: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (key.len >= buf.len) return null;
-    @memcpy(buf[0..key.len], key);
-    buf[key.len] = 0;
-
-    const val_ptr = std.c.getenv(buf[0..key.len :0]) orelse return null;
-    return std.mem.span(val_ptr);
+    if (builtin.is_test) {
+        if (native_os != .windows) {
+            return std.process.Environ.getPosix(std.testing.environ, key);
+        }
+    }
+    return null;
 }
 
 /// Checks whether `host` (which may include a port like `example.com:8080`) matches NO_PROXY rules.
@@ -56,6 +59,39 @@ pub fn isNoProxy(no_proxy: []const u8, host_with_port: []const u8) bool {
 /// Resolves proxy from system environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY).
 pub fn proxyFromEnvironment(allocator: Allocator, scheme: []const u8, host: []const u8) !?[]const u8 {
     return proxyFromEnvWithLookup(allocator, scheme, host, getEnv);
+}
+
+/// Resolves proxy using an explicitly provided std.process.Environ.Map.
+pub fn proxyFromEnvWithMap(
+    allocator: Allocator,
+    scheme: []const u8,
+    host: []const u8,
+    map: *const std.process.Environ.Map,
+) !?[]const u8 {
+    const no_proxy = map.get("NO_PROXY") orelse map.get("no_proxy");
+    if (no_proxy) |np| {
+        if (isNoProxy(np, host)) return null;
+    }
+
+    var proxy_val: ?[]const u8 = null;
+    const is_https = std.ascii.eqlIgnoreCase(scheme, "https");
+
+    if (is_https) {
+        proxy_val = map.get("HTTPS_PROXY") orelse map.get("https_proxy") orelse
+            map.get("ALL_PROXY") orelse map.get("all_proxy") orelse
+            map.get("HTTP_PROXY") orelse map.get("http_proxy");
+    } else {
+        proxy_val = map.get("HTTP_PROXY") orelse map.get("http_proxy") orelse
+            map.get("ALL_PROXY") orelse map.get("all_proxy");
+    }
+
+    if (proxy_val) |p| {
+        const trimmed = std.mem.trim(u8, p, " \t\r\n");
+        if (trimmed.len > 0) {
+            return try allocator.dupe(u8, trimmed);
+        }
+    }
+    return null;
 }
 
 /// Testable proxy resolver accepting a custom environment lookup function.

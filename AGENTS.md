@@ -16,11 +16,15 @@ This document outlines the project scope, architectural conventions, and develop
 
 1. **Unified Streaming Abstraction**:
    - Stream processing must be built around the `stdgo.io.Reader` and `stdgo.io.Writer` VTable interfaces to avoid buffering entire payloads into memory or coupling to raw byte slices.
-2. **I/O Timeouts & Networking**:
+2. **Explicit Dependency Injection (No Implicit Global State or C Functions)**:
+   - While porting Go APIs and striving for Go ergonomic conventions, **never introduce hidden global state, implicit memory allocations, or C runtime functions (`std.c.*`, `getenv`, etc.)**.
+   - Zig does not have a hidden runtime, GC, or global implicit context. All resources—specifically `std.mem.Allocator` and `std.Io`—**must be explicitly passed from the outside** into constructors (`init`), structs, and functions that allocate memory or perform I/O.
+   - For environment variables, configuration, or credentials, pass them explicitly via options structs (`*const std.process.Environ.Map`, `std.process.Environ`, or lookup function pointers) rather than assuming global access.
+3. **I/O Timeouts & Networking**:
    - Never use low-level POSIX `setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)`. Timeouts must always be driven by Zig 0.17's native `std.Io.Timeout` abstractions (`options.timeout` on `IpAddress.connect` / `HostName.connect`).
-3. **Memory Safety & Ownership**:
+4. **Memory Safety & Ownership**:
    - Follow TigerStyle memory safety practices: dynamically allocated resources (e.g. `Request.extra_strings`) must have clearly tracked lifetimes and be explicitly cleaned up on `deinit` without leaving dangling pointers.
-4. **Project Structure**:
+5. **Project Structure**:
    - `src/`: Pure library modules only.
    - `examples/`: Runnable example programs (e.g., `examples/overview.zig`).
 

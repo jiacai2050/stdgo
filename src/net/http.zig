@@ -29,6 +29,8 @@ pub const CookieJar = jar.CookieJar;
 
 pub const proxy = @import("http/proxy.zig");
 pub const proxyFromEnvironment = proxy.proxyFromEnvironment;
+pub const proxyFromEnvWithMap = proxy.proxyFromEnvWithMap;
+pub const proxyFromEnvWithLookup = proxy.proxyFromEnvWithLookup;
 pub const isNoProxy = proxy.isNoProxy;
 
 pub const request = @import("http/request.zig");

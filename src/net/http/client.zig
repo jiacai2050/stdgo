@@ -14,6 +14,8 @@ const Method = @import("method.zig").Method;
 pub const ClientOptions = struct {
     proxy_url: ?[]const u8 = null,
     proxy_from_env: bool = true,
+    environ_map: ?*const std.process.Environ.Map = null,
+    env_lookup: ?*const fn (key: []const u8) ?[]const u8 = null,
     transport: ?TransportOptions = null,
     max_redirects: u8 = 10,
     jar: ?*CookieJar = null,
@@ -34,6 +36,12 @@ pub const Client = struct {
             trans_opts.proxy_url = p;
         }
         trans_opts.proxy_from_env = options.proxy_from_env;
+        if (trans_opts.environ_map == null and options.environ_map != null) {
+            trans_opts.environ_map = options.environ_map;
+        }
+        if (trans_opts.env_lookup == null and options.env_lookup != null) {
+            trans_opts.env_lookup = options.env_lookup;
+        }
         if (trans_opts.timeout_ns == null and options.timeout_ns != null) {
             trans_opts.timeout_ns = options.timeout_ns;
         }
@@ -316,7 +324,10 @@ test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var c = Client.init(testing.allocator, io, .{ .transport = .{ .max_idle_conns_per_host = 2 } });
+    var c = Client.init(testing.allocator, io, .{
+        .timeout_ns = 3 * std.time.ns_per_s,
+        .transport = .{ .max_idle_conns_per_host = 2 },
+    });
     defer c.deinit();
 
     // 1. GET /ip
