@@ -1,17 +1,31 @@
 pub const io = @import("io/io.zig");
+pub const bridge = @import("io/bridge.zig");
 
 pub const Reader = io.Reader;
 pub const Writer = io.Writer;
 pub const Closer = io.Closer;
 pub const Seeker = io.Seeker;
 pub const SeekWhence = io.SeekWhence;
+pub const ReaderFrom = io.ReaderFrom;
+pub const WriterTo = io.WriterTo;
 pub const Error = io.Error;
 
 pub const readAtLeast = io.readAtLeast;
 pub const readFull = io.readFull;
 pub const copy = io.copy;
+pub const copyBuffer = io.copyBuffer;
 pub const LimitReader = io.LimitReader;
 pub const TeeReader = io.TeeReader;
+
+// Bridge exports
+pub const FromZigReader = bridge.FromZigReader;
+pub const FromZigWriter = bridge.FromZigWriter;
+pub const ToZigReader = bridge.ToZigReader;
+pub const ToZigWriter = bridge.ToZigWriter;
+pub const fromZigReader = bridge.fromZigReader;
+pub const fromZigWriter = bridge.fromZigWriter;
+pub const toZigReader = bridge.toZigReader;
+pub const toZigWriter = bridge.toZigWriter;
 
 const std = @import("std");
 

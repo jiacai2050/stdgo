@@ -151,6 +151,7 @@ pub const Buffer = struct {
             .ptr = self,
             .vtable = &.{
                 .read = readImpl,
+                .writeTo = writeToImpl,
             },
         };
     }
@@ -160,8 +161,38 @@ pub const Buffer = struct {
             .ptr = self,
             .vtable = &.{
                 .write = writeImpl,
+                .readFrom = readFromImpl,
             },
         };
+    }
+
+    /// readFrom reads data from r until EOF and appends it to the buffer, growing
+    /// the buffer as needed. The return value is the number of bytes read.
+    pub fn readFrom(self: *Buffer, r: io.Reader) anyerror!u64 {
+        var total: u64 = 0;
+        while (true) {
+            const min_read = 512;
+            try self.grow(min_read);
+            const free_slice = self.storage[self.length..];
+            const n = r.read(free_slice) catch |err| {
+                if (err == io.Error.EndOfStream) break;
+                return err;
+            };
+            if (n == 0) break;
+            self.length += n;
+            total += n;
+        }
+        return total;
+    }
+
+    /// writeTo writes data to w until the buffer is drained or an error occurs.
+    /// The return value is the number of bytes written.
+    pub fn writeTo(self: *Buffer, w: io.Writer) anyerror!u64 {
+        const remaining = self.length - self.off;
+        if (remaining == 0) return 0;
+        try w.writeAll(self.storage[self.off..self.length]);
+        self.reset();
+        return @intCast(remaining);
     }
 
     fn readImpl(ctx: *anyopaque, buf: []u8) anyerror!usize {
@@ -172,6 +203,16 @@ pub const Buffer = struct {
     fn writeImpl(ctx: *anyopaque, p: []const u8) anyerror!usize {
         const self: *Buffer = @ptrCast(@alignCast(ctx));
         return self.write(p);
+    }
+
+    fn readFromImpl(ctx: *anyopaque, r: io.Reader) anyerror!u64 {
+        const self: *Buffer = @ptrCast(@alignCast(ctx));
+        return self.readFrom(r);
+    }
+
+    fn writeToImpl(ctx: *anyopaque, w: io.Writer) anyerror!u64 {
+        const self: *Buffer = @ptrCast(@alignCast(ctx));
+        return self.writeTo(w);
     }
 };
 
@@ -201,5 +242,29 @@ test "bytes.Buffer basic write and read" {
     try testing.expectEqual(@as(u8, 'W'), c2);
 
     b.reset();
+    try testing.expectEqual(@as(usize, 0), b.len());
+}
+
+test "bytes.Buffer readFrom and writeTo" {
+    const testing = std.testing;
+    const bytes = @import("../bytes.zig");
+
+    var src = bytes.Reader.init("Direct stream payload");
+    var b = Buffer.init(testing.allocator);
+    defer b.deinit();
+
+    // 1. Test readFrom into Buffer via io.copy
+    var dummy_buf: [1]u8 = undefined;
+    const n1 = try io.copy(b.writer(), src.reader(), &dummy_buf);
+    try testing.expectEqual(@as(u64, 21), n1);
+    try testing.expectEqualStrings("Direct stream payload", b.string());
+
+    // 2. Test writeTo from Buffer via io.copy
+    var dst_b = Buffer.init(testing.allocator);
+    defer dst_b.deinit();
+
+    const n2 = try io.copy(dst_b.writer(), b.reader(), &dummy_buf);
+    try testing.expectEqual(@as(u64, 21), n2);
+    try testing.expectEqualStrings("Direct stream payload", dst_b.string());
     try testing.expectEqual(@as(usize, 0), b.len());
 }

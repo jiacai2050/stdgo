@@ -86,11 +86,24 @@ pub const Reader = struct {
         return @intCast(abs_offset);
     }
 
+    pub fn writeTo(self: *Reader, w: io.Writer) anyerror!u64 {
+        self.prev_r = -1;
+        if (self.i >= @as(i64, @intCast(self.s.len))) {
+            return 0;
+        }
+        const start: usize = @intCast(self.i);
+        const slice = self.s[start..];
+        try w.writeAll(slice);
+        self.i = @intCast(self.s.len);
+        return @intCast(slice.len);
+    }
+
     pub fn reader(self: *Reader) io.Reader {
         return .{
             .ptr = self,
             .vtable = &.{
                 .read = readImpl,
+                .writeTo = writeToImpl,
             },
         };
     }
@@ -107,6 +120,11 @@ pub const Reader = struct {
     fn readImpl(ctx: *anyopaque, buf: []u8) anyerror!usize {
         const self: *Reader = @ptrCast(@alignCast(ctx));
         return self.read(buf);
+    }
+
+    fn writeToImpl(ctx: *anyopaque, w: io.Writer) anyerror!u64 {
+        const self: *Reader = @ptrCast(@alignCast(ctx));
+        return self.writeTo(w);
     }
 
     fn seekImpl(ctx: *anyopaque, offset: i64, whence: io.SeekWhence) anyerror!u64 {
