@@ -9,7 +9,7 @@ pub const Debug: u32 = 1 << 1;
 
 pub const Writer = struct {
     allocator: Allocator,
-    output: io.Writer,
+    output: *io.Writer,
     minwidth: usize = 0,
     tabwidth: usize = 8,
     padding: usize = 1,
@@ -19,10 +19,11 @@ pub const Writer = struct {
     current_line: std.ArrayList([]const u8),
     current_cell: bytes.Buffer,
     rows: std.ArrayList(std.ArrayList([]const u8)),
+    writer_inst: std.Io.Writer = undefined,
 
     pub fn init(
         allocator: Allocator,
-        output: io.Writer,
+        output: *io.Writer,
         minwidth: usize,
         tabwidth: usize,
         padding: usize,
@@ -40,6 +41,7 @@ pub const Writer = struct {
             .current_line = std.ArrayList([]const u8).empty,
             .current_cell = bytes.Buffer.init(allocator),
             .rows = std.ArrayList(std.ArrayList([]const u8)).empty,
+            .writer_inst = undefined,
         };
     }
 
@@ -141,6 +143,7 @@ pub const Writer = struct {
         }
 
         self.clearRows();
+        try self.output.flush();
     }
 
     fn writePadding(self: *Writer, count: usize) anyerror!void {
@@ -150,18 +153,36 @@ pub const Writer = struct {
         }
     }
 
-    pub fn writer(self: *Writer) io.Writer {
-        return .{
-            .ptr = self,
+    pub fn writer(self: *Writer) *io.Writer {
+        self.writer_inst = .{
+            .buffer = &.{},
             .vtable = &.{
-                .write = writeImpl,
+                .drain = drainImpl,
+                .flush = flushImpl,
             },
         };
+        return &self.writer_inst;
     }
 
-    fn writeImpl(ctx: *anyopaque, p: []const u8) anyerror!usize {
-        const self: *Writer = @ptrCast(@alignCast(ctx));
-        return self.write(p);
+    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Writer = @alignCast(@fieldParentPtr("writer_inst", w));
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            _ = self.write(slice) catch return error.WriteFailed;
+            total += slice.len;
+        }
+        const pattern = data[data.len - 1];
+        var i: usize = 0;
+        while (i < splat) : (i += 1) {
+            _ = self.write(pattern) catch return error.WriteFailed;
+            total += pattern.len;
+        }
+        return total;
+    }
+
+    fn flushImpl(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *Writer = @alignCast(@fieldParentPtr("writer_inst", w));
+        self.flush() catch return error.WriteFailed;
     }
 };
 

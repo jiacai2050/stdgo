@@ -34,8 +34,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("   Generated CSV output:\n---\n{s}---\n", .{csv_buf.string()});
 
     var csv_r_src = bytes.Reader.init(csv_buf.bytes());
-    var csv_r = try encoding.csv.Reader.init(gpa, csv_r_src.reader());
-    defer csv_r.deinit();
+    var csv_r = encoding.csv.Reader.init(csv_r_src.reader());
 
     std.debug.print("   Parsed CSV records:\n", .{});
     var rec_idx: usize = 0;

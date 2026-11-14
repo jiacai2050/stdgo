@@ -7,11 +7,11 @@ const Allocator = std.mem.Allocator;
 
 pub const Writer = struct {
     allocator: Allocator,
-    w: io.Writer,
+    w: *io.Writer,
     offset: u32 = 0,
     files: std.ArrayList(zip_struct.FileHeader),
 
-    pub fn init(allocator: Allocator, w: io.Writer) Writer {
+    pub fn init(allocator: Allocator, w: *io.Writer) Writer {
         return .{
             .allocator = allocator,
             .w = w,
@@ -121,5 +121,6 @@ pub const Writer = struct {
 
         try self.w.writeAll(&eocd);
         self.offset += 22;
+        try self.w.flush();
     }
 };

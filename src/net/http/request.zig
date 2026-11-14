@@ -96,11 +96,11 @@ pub const Request = struct {
     url: []const u8,
     header: Header,
     body: ?[]const u8 = null,
-    body_reader: ?io.Reader = null,
+    body_reader: ?*io.Reader = null,
     content_length: ?u64 = null,
-    get_body: ?*const fn (ctx_ptr: *anyopaque) anyerror!io.Reader = null,
+    get_body: ?*const fn (ctx_ptr: *anyopaque) anyerror!*io.Reader = null,
     get_body_ctx: ?*anyopaque = null,
-    slice_reader_state: SliceReaderState = .{ .data = "" },
+    slice_reader: std.Io.Reader = std.Io.Reader.fixed(""),
     ctx: ?Context = null,
     cl_str: ?[]u8 = null,
     extra_strings: std.ArrayListUnmanaged([]u8) = .empty,
@@ -116,7 +116,7 @@ pub const Request = struct {
             .content_length = null,
             .get_body = null,
             .get_body_ctx = null,
-            .slice_reader_state = .{ .data = "" },
+            .slice_reader = std.Io.Reader.fixed(""),
             .ctx = null,
             .cl_str = null,
             .extra_strings = .empty,
@@ -146,14 +146,14 @@ pub const Request = struct {
     pub fn setBody(self: *Request, body: []const u8) !void {
         self.body = body;
         self.content_length = body.len;
-        self.slice_reader_state = .{ .data = body, .cursor = 0 };
-        self.body_reader = self.slice_reader_state.reader();
-        self.get_body_ctx = &self.slice_reader_state;
+        self.slice_reader = std.Io.Reader.fixed(body);
+        self.body_reader = &self.slice_reader;
+        self.get_body_ctx = self;
         self.get_body = struct {
-            fn rewind(ctx_ptr: *anyopaque) anyerror!io.Reader {
-                const s: *SliceReaderState = @ptrCast(@alignCast(ctx_ptr));
-                s.cursor = 0;
-                return s.reader();
+            fn rewind(ctx_ptr: *anyopaque) anyerror!*io.Reader {
+                const s: *Request = @ptrCast(@alignCast(ctx_ptr));
+                s.slice_reader.seek = 0;
+                return &s.slice_reader;
             }
         }.rewind;
 
@@ -166,7 +166,7 @@ pub const Request = struct {
         try self.header.set("Content-Length", s);
     }
 
-    pub fn setBodyReader(self: *Request, r: io.Reader, cl: ?u64) !void {
+    pub fn setBodyReader(self: *Request, r: *io.Reader, cl: ?u64) !void {
         self.body = null;
         self.body_reader = r;
         self.content_length = cl;
@@ -226,7 +226,7 @@ pub fn newRequestWithReader(
     allocator: std.mem.Allocator,
     method: Method,
     url: []const u8,
-    body_r: ?io.Reader,
+    body_r: ?*io.Reader,
     content_len: ?u64,
 ) !Request {
     var req = Request.init(allocator, method, url);

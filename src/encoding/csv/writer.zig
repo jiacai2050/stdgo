@@ -3,16 +3,21 @@ const io = @import("../../io.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Writer = struct {
-    w: io.Writer,
+    w: *std.Io.Writer,
     comma: u8 = ',',
     use_crlf: bool = false,
 
-    pub fn init(w: io.Writer) Writer {
+    pub fn init(w: *std.Io.Writer) Writer {
         return .{
             .w = w,
             .comma = ',',
             .use_crlf = false,
         };
+    }
+
+    /// Flush flushes any buffered data to the underlying io.Writer.
+    pub fn flush(self: *Writer) !void {
+        try self.w.flush();
     }
 
     /// Write writes a single CSV record along with the newline terminator.
@@ -76,6 +81,7 @@ test "csv.Writer quote escaping and records" {
     try writer.write(&row1);
     try writer.write(&row2);
     try writer.write(&row3);
+    try writer.flush();
 
     const expected =
         "first,last,id\n" ++

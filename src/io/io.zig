@@ -1,6 +1,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+pub const Reader = std.Io.Reader;
+pub const Writer = std.Io.Writer;
+pub const Limit = std.Io.Limit;
+
 pub const Error = error{
     EndOfStream,
     UnexpectedEndOfStream,
@@ -9,58 +13,13 @@ pub const Error = error{
     InvalidWriteResult,
     NoProgress,
     SeekBeforeStart,
+    ReadFailed,
 };
 
 pub const SeekWhence = enum(u8) {
     start = 0,
     current = 1,
     end = 2,
-};
-
-pub const Reader = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        read: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
-        writeTo: ?*const fn (ctx: *anyopaque, w: Writer) anyerror!u64 = null,
-    };
-
-    pub fn read(self: Reader, buf: []u8) anyerror!usize {
-        return self.vtable.read(self.ptr, buf);
-    }
-
-    pub fn readAll(self: Reader, buf: []u8) anyerror!usize {
-        return readAtLeast(self, buf, buf.len);
-    }
-};
-
-pub const Writer = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        write: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!usize,
-        readFrom: ?*const fn (ctx: *anyopaque, r: Reader) anyerror!u64 = null,
-    };
-
-    pub fn write(self: Writer, bytes: []const u8) anyerror!usize {
-        return self.vtable.write(self.ptr, bytes);
-    }
-
-    pub fn writeAll(self: Writer, bytes: []const u8) anyerror!void {
-        var index: usize = 0;
-        while (index < bytes.len) {
-            const n = try self.write(bytes[index..]);
-            if (n == 0) return Error.ShortWrite;
-            index += n;
-        }
-    }
-
-    pub fn writeByte(self: Writer, byte: u8) anyerror!void {
-        const arr = [1]u8{byte};
-        try self.writeAll(&arr);
-    }
 };
 
 pub const Closer = struct {
@@ -89,55 +48,23 @@ pub const Seeker = struct {
     }
 };
 
-/// ReaderFrom is the interface that wraps the readFrom method.
-pub const ReaderFrom = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        readFrom: *const fn (ctx: *anyopaque, r: Reader) anyerror!u64,
-    };
-
-    pub fn readFrom(self: ReaderFrom, r: Reader) anyerror!u64 {
-        return self.vtable.readFrom(self.ptr, r);
-    }
-};
-
-/// WriterTo is the interface that wraps the writeTo method.
-pub const WriterTo = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        writeTo: *const fn (ctx: *anyopaque, w: Writer) anyerror!u64,
-    };
-
-    pub fn writeTo(self: WriterTo, w: Writer) anyerror!u64 {
-        return self.vtable.writeTo(self.ptr, w);
-    }
-};
-
 /// Reads from r into buf until it has read at least min bytes.
-/// It returns the number of bytes read and an error if fewer bytes were read.
-pub fn readAtLeast(r: Reader, buf: []u8, min: usize) anyerror!usize {
+pub fn readAtLeast(r: *Reader, buf: []u8, min: usize) anyerror!usize {
     if (buf.len < min) return Error.ShortBuffer;
     var n: usize = 0;
     while (n < min) {
-        const read_count = r.read(buf[n..]) catch |err| {
-            if (err == Error.EndOfStream) {
-                if (n >= min) {
-                    return n;
-                }
-                if (n > 0) {
-                    return Error.UnexpectedEndOfStream;
-                }
+        const read_count = r.readSliceShort(buf[n..]) catch |err| {
+            if (err == error.EndOfStream) {
+                if (n >= min) return n;
+                if (n > 0) return Error.UnexpectedEndOfStream;
                 return Error.EndOfStream;
             }
             return err;
         };
         if (read_count == 0) {
             if (n >= min) return n;
-            return Error.UnexpectedEndOfStream;
+            if (n > 0) return Error.UnexpectedEndOfStream;
+            return Error.EndOfStream;
         }
         n += read_count;
     }
@@ -145,242 +72,121 @@ pub fn readAtLeast(r: Reader, buf: []u8, min: usize) anyerror!usize {
 }
 
 /// Reads exactly buf.len bytes from r into buf.
-pub fn readFull(r: Reader, buf: []u8) anyerror!usize {
+pub fn readFull(r: *Reader, buf: []u8) anyerror!usize {
     return readAtLeast(r, buf, buf.len);
 }
 
-/// Copies from src to dst until either EOF is reached on src or an error occurs.
-/// It returns the number of bytes copied.
-///
-/// If dst implements ReaderFrom, the copy is staged using its readFrom method.
-/// Otherwise, if src implements WriterTo, the copy is staged using its writeTo method.
-/// Otherwise, it copies in chunks using buffer.
-pub fn copy(dst: Writer, src: Reader, buffer: []u8) anyerror!u64 {
-    if (dst.vtable.readFrom) |rf| {
-        return rf(dst.ptr, src);
-    }
-    if (src.vtable.writeTo) |wt| {
-        return wt(src.ptr, dst);
-    }
-    assert(buffer.len > 0);
-    var written: u64 = 0;
-    while (true) {
-        const nr = src.read(buffer) catch |err| {
-            if (err == Error.EndOfStream) break;
-            return err;
-        };
-        if (nr == 0) break;
-        try dst.writeAll(buffer[0..nr]);
-        written += nr;
-    }
-    return written;
+/// Copies from src to dst until EOF is reached on src.
+pub fn copy(dst: *Writer, src: *Reader) anyerror!u64 {
+    const bytes = try src.stream(dst, .unlimited);
+    return @intCast(bytes);
 }
 
-/// copyBuffer is identical to copy except that it stages through the provided buffer
-/// (or allocates an internal stack buffer if buf is null) rather than requiring a buffer.
-pub fn copyBuffer(dst: Writer, src: Reader, buf: ?[]u8) anyerror!u64 {
-    if (dst.vtable.readFrom) |rf| {
-        return rf(dst.ptr, src);
-    }
-    if (src.vtable.writeTo) |wt| {
-        return wt(src.ptr, dst);
-    }
-    if (buf) |b| {
-        return copy(dst, src, b);
-    }
-    var stack_buf: [32 * 1024]u8 = undefined;
-    return copy(dst, src, &stack_buf);
+/// copyBuffer is identical to copy.
+pub fn copyBuffer(dst: *Writer, src: *Reader, buf: ?[]u8) anyerror!u64 {
+    _ = buf;
+    return copy(dst, src);
+}
+
+/// copyN copies n bytes (or until an error) from src to dst.
+pub fn copyN(dst: *Writer, src: *Reader, n: i64) anyerror!u64 {
+    if (n <= 0) return 0;
+    const count = try src.stream(dst, .limited(@intCast(n)));
+    if (count < @as(usize, @intCast(n))) return Error.UnexpectedEndOfStream;
+    return @intCast(count);
 }
 
 /// LimitReader returns a Reader that reads from r but stops with EndOfStream after n bytes.
 pub const LimitReader = struct {
-    r: Reader,
+    r: *Reader,
     n: i64,
+    reader_inst: std.Io.Reader = undefined,
 
-    pub fn init(r: Reader, n: i64) LimitReader {
+    pub fn init(r: *Reader, n: i64) LimitReader {
         return .{ .r = r, .n = n };
     }
 
-    pub fn reader(self: *LimitReader) Reader {
-        return .{
-            .ptr = self,
+    pub fn reader(self: *LimitReader) *Reader {
+        self.reader_inst = .{
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
             .vtable = &.{
-                .read = readImpl,
+                .stream = streamImpl,
             },
         };
+        return &self.reader_inst;
     }
 
-    fn readImpl(ctx: *anyopaque, buf: []u8) anyerror!usize {
-        const self: *LimitReader = @ptrCast(@alignCast(ctx));
-        if (self.n <= 0) {
-            return Error.EndOfStream;
-        }
-        var to_read = buf;
-        if (@as(i64, @intCast(to_read.len)) > self.n) {
-            to_read = to_read[0..@intCast(self.n)];
-        }
-        const nr = try self.r.read(to_read);
-        self.n -= @intCast(nr);
-        return nr;
+    pub fn readSliceShort(self: *LimitReader, buf: []u8) anyerror!usize {
+        return self.reader().readSliceShort(buf);
+    }
+
+    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *LimitReader = @alignCast(@fieldParentPtr("reader_inst", r));
+        if (self.n <= 0) return error.EndOfStream;
+        const bounded = @min(@backingInt(limit), @as(usize, @intCast(self.n)));
+        if (bounded == 0) return 0;
+        const count = self.r.stream(w, .limited(bounded)) catch |err| return err;
+        self.n -= @intCast(count);
+        if (count == 0) return error.EndOfStream;
+        return count;
     }
 };
 
 /// TeeReader returns a Reader that writes to w what it reads from r.
 pub const TeeReader = struct {
-    r: Reader,
-    w: Writer,
+    r: *Reader,
+    w: *Writer,
+    reader_inst: std.Io.Reader = undefined,
+    buf: [512]u8 = undefined,
 
-    pub fn init(r: Reader, w: Writer) TeeReader {
+    pub fn init(r: *Reader, w: *Writer) TeeReader {
         return .{ .r = r, .w = w };
     }
 
-    pub fn reader(self: *TeeReader) Reader {
-        return .{
-            .ptr = self,
+    pub fn reader(self: *TeeReader) *Reader {
+        self.reader_inst = .{
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
             .vtable = &.{
-                .read = readImpl,
+                .stream = streamImpl,
             },
         };
+        return &self.reader_inst;
     }
 
-    fn readImpl(ctx: *anyopaque, buf: []u8) anyerror!usize {
-        const self: *TeeReader = @ptrCast(@alignCast(ctx));
-        const nr = try self.r.read(buf);
-        if (nr > 0) {
-            try self.w.writeAll(buf[0..nr]);
-        }
-        return nr;
+    pub fn readSliceShort(self: *TeeReader, buf: []u8) anyerror!usize {
+        return self.reader().readSliceShort(buf);
+    }
+
+    fn streamImpl(r: *std.Io.Reader, dst: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *TeeReader = @alignCast(@fieldParentPtr("reader_inst", r));
+        const max_bytes = @backingInt(limit);
+        if (max_bytes == 0) return 0;
+        const want = @min(self.buf.len, max_bytes);
+        const n = self.r.readSliceShort(self.buf[0..want]) catch |err| {
+            if (err == error.EndOfStream) return error.EndOfStream;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        dst.writeAll(self.buf[0..n]) catch return error.WriteFailed;
+        self.w.writeAll(self.buf[0..n]) catch return error.WriteFailed;
+        return n;
     }
 };
 
-test "io.copy fast-path via ReaderFrom and WriterTo" {
+test "io.copy and readFull via native std.Io" {
     const testing = std.testing;
 
-    // Fast-path tracking Writer implementing ReaderFrom
-    const MockReaderFromWriter = struct {
-        called: bool = false,
-        bytes_copied: u64 = 0,
+    const data = "hello world from native std.Io";
+    var src = std.Io.Reader.fixed(data);
 
-        fn readFrom(ctx: *anyopaque, r: Reader) anyerror!u64 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.called = true;
-            var buf: [32]u8 = undefined;
-            var total: u64 = 0;
-            while (true) {
-                const n = r.read(&buf) catch |err| {
-                    if (err == Error.EndOfStream) break;
-                    return err;
-                };
-                if (n == 0) break;
-                total += n;
-            }
-            self.bytes_copied = total;
-            return total;
-        }
+    var dst_alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer testing.allocator.free(dst_alloc.writer.buffer);
 
-        fn writer(self: *@This()) Writer {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .write = struct {
-                        fn w(_: *anyopaque, bytes: []const u8) anyerror!usize {
-                            return bytes.len;
-                        }
-                    }.w,
-                    .readFrom = readFrom,
-                },
-            };
-        }
-    };
-
-    // Fast-path tracking Reader implementing WriterTo
-    const MockWriterToReader = struct {
-        called: bool = false,
-        data: []const u8,
-
-        fn writeTo(ctx: *anyopaque, w: Writer) anyerror!u64 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.called = true;
-            try w.writeAll(self.data);
-            return @intCast(self.data.len);
-        }
-
-        fn reader(self: *@This()) Reader {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .read = struct {
-                        fn r(_: *anyopaque, _: []u8) anyerror!usize {
-                            return Error.EndOfStream;
-                        }
-                    }.r,
-                    .writeTo = writeTo,
-                },
-            };
-        }
-    };
-
-    // Normal Reader
-    const NormalReader = struct {
-        data: []const u8,
-        cursor: usize = 0,
-
-        fn read(ctx: *anyopaque, buf: []u8) anyerror!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (self.cursor >= self.data.len) return Error.EndOfStream;
-            const available = self.data.len - self.cursor;
-            const n = @min(available, buf.len);
-            @memcpy(buf[0..n], self.data[self.cursor .. self.cursor + n]);
-            self.cursor += n;
-            return n;
-        }
-
-        fn reader(self: *@This()) Reader {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .read = read },
-            };
-        }
-    };
-
-    // Normal Writer
-    const NormalWriter = struct {
-        written: usize = 0,
-
-        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.written += bytes.len;
-            return bytes.len;
-        }
-
-        fn writer(self: *@This()) Writer {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .write = write },
-            };
-        }
-    };
-
-    // 1. Test dst has readFrom
-    var rf_writer = MockReaderFromWriter{};
-    var normal_r = NormalReader{ .data = "hello world" };
-    var copy_buf: [16]u8 = undefined;
-    const n1 = try copy(rf_writer.writer(), normal_r.reader(), &copy_buf);
-    try testing.expectEqual(@as(u64, 11), n1);
-    try testing.expect(rf_writer.called);
-
-    // 2. Test src has writeTo
-    var normal_w = NormalWriter{};
-    var wt_reader = MockWriterToReader{ .data = "fast write to" };
-    const n2 = try copy(normal_w.writer(), wt_reader.reader(), &copy_buf);
-    try testing.expectEqual(@as(u64, 13), n2);
-    try testing.expect(wt_reader.called);
-    try testing.expectEqual(@as(usize, 13), normal_w.written);
-
-    // 3. Test copyBuffer fallback
-    var normal_r2 = NormalReader{ .data = "buffered fallback" };
-    var normal_w2 = NormalWriter{};
-    const n3 = try copyBuffer(normal_w2.writer(), normal_r2.reader(), null);
-    try testing.expectEqual(@as(u64, 17), n3);
-    try testing.expectEqual(@as(usize, 17), normal_w2.written);
+    const copied = try copy(&dst_alloc.writer, &src);
+    try testing.expectEqual(@as(u64, data.len), copied);
+    try testing.expectEqualStrings(data, dst_alloc.writer.buffer[0..dst_alloc.writer.end]);
 }

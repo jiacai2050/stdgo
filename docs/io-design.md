@@ -1,140 +1,109 @@
-# stdgo I/O 设计取舍与架构规范
+# stdgo I/O 设计演进与架构规范
 
-本文档记录了 `stdgo` 项目在数据流抽象（`io.Reader` / `io.Writer`）上的设计取舍、架构权衡、与 Zig 0.17 原生 `std.Io` 的底层能力对比，以及工程落地中的演进方案。
+本文档记录了 `stdgo` 在数据流抽象（`io.Reader` / `io.Writer`）上的演进历程、设计取舍、与 Zig 0.17 原生 `std.Io` 的底层能力对比，以及最终确立的**原生归一化架构**。
 
 ---
 
-## 1. 背景与核心分歧
+## 1. 架构演进与最终决策
 
-在现代系统编程中，I/O 流抽象的设计往往决定了整个标准库生态的组合能力与人体工学。在构建 `stdgo` 时，我们面临核心抉择：**是直接使用 Zig 0.17 的 `std.Io` 接口，还是复刻 Go 经典的 `io.Reader` / `io.Writer` 体系？**
+在 `stdgo` 项目初期，曾尝试过两种路线：
+1. **初期探索（Go 风格无状态虚表）**：引入极简的 `read([]u8)` / `write([]const u8)` 虚表，外挂 `bufio` 与中继桥接 `bridge.zig`。
+2. **最终确立（原生归一化架构）**：**全面沿用 Zig 0.17 原生 `std.Io.Reader` 与 `std.Io.Writer` 作为 `stdgo` 的主流式抽象，彻底移除冗余的 `bufio` 与 `bridge.zig`。**
 
-### 两者的本质哲学差异
+### 决策理由：
+- **性能不妥协**：`stdgo` 的定位是把 Go 标准库的丰富生态与优雅人体工学带给 Zig，但**绝不能妥协性能**。Zig 0.17 原生的 `std.Io` 拥有内置三指针滑动窗口、向量化 I/O（Scatter-Gather）、原生模式填充展开（`splat`）以及内核态直传（`sendFile` / `sendFileAll`），这些机器效率是 Go 经典无状态虚表无法企及的。
+- **消灭冗余抽象**：由于 Zig 0.17 的 `std.Io.Reader` 和 `std.Io.Writer` 结构体自身已是有状态的高性能缓冲容器，Go 时代的 `bufio.Reader` / `bufio.Writer` 在 Zig 0.17 下已丧失存在意义；将其移除可以消除多层内存中继与二次虚表分发。
 
-| 维度 | Go 风格设计（`stdgo` 采用） | Zig 0.17 设计（`std.Io`） |
+---
+
+## 2. 核心流模型对比
+
+| 维度 | 旧版 Go 虚表模式（已废弃） | 最终归一架构（Zig 0.17 原生 `std.Io`） |
 | :--- | :--- | :--- |
-| **基础抽象** | **无状态的原语（Unbuffered Primitive）**<br>`read(buf)` / `write(bytes)` | **有状态的容器（Buffered Container）**<br>结构体内置 `buffer: []u8`、`seek`、`end` 三指针模型 |
-| **缓冲职责** | **正交分层**：基础层无缓冲；需要缓冲时显式包裹 `bufio.Reader` / `bufio.Writer` | **侵入式内建**：所有 `Reader`/`Writer` 实例都携带缓冲切片状态机（即便切片长度为 0） |
-| **Flush 机制** | **按需触发**：仅在使用 `bufio.Writer` 时才需要 `Flush()`；直接写底层句柄即刻同步生效 | **强制心智**：写操作默认先入内部缓冲区，使用者在写完后必须时刻谨防是否需要 `flush()` |
-| **数据所有权** | **Caller 驱动**：调用方显式传入切片，被调方纯搬运，无内部悬挂指针风险（契合 TigerStyle） | **Callee 维护**：结构体自持 buffer，存在内部游标移动、借用及扩容状态 |
-| **实现门槛** | **极低**：只需实现单个函数即可接入全量流生态 | **较高**：必须维护 `buffer`/`seek`/`end`，并实现满足规范的 `stream`/`drain` 虚表 |
+| **基础类型** | 自定义无状态胖指针 `ptr + vtable` | 原生结构体容器 `pub const Reader = std.Io.Reader;` |
+| **缓冲职责** | 外挂 `bufio` 堆内存二次包装 | 侵入式三指针内建（`buffer` / `seek` / `end`），零堆分配 |
+| **数据流转** | 外部分配 32KB 临时 buffer 循环搬运 | 原生 `src.stream(dst, limit)`，直通快路径与 `sendFileAll` |
+| **探查能力** | 必须由外部预供切片并内存复制 | `take`/`peek` 直接原地借用内部切片，O(1) 零拷贝 |
+| **刷新语义** | 仅 `bufio` 需 flush；其余依赖即时写 | 写端有缓冲，流末尾显式 `try w.flush()` 保证数据完整 |
+| **互操作性** | 需经 `bridge.zig` 转换，中断内核管道 | 100% 无缝对接 Zig 官方标准库与第三方库生态 |
 
 ---
 
-## 2. 为什么不能直接全盘采用 Zig 0.17 `std.Io`？
+## 3. 全局技术亮点与零拷贝实现
 
-1. **避免上层移植发生“语义雪崩”**：
-   Go 庞大的标准库生态（`archive/tar`、`archive/zip`、`compress/gzip`、`encoding/csv`、`mime/multipart`、`net/http`）全部建立在“调用 `write` 即同步交付”的心智模型上。如果基础 `Writer` 强制带有缓冲和 `flush`，上层数十个模块都必须重构引入 `flush` 传播逻辑，任何漏调都会导致尾部数据丢失，引发灾难性隐蔽 Bug。
-2. **生命周期与显式内存（TigerStyle）**：
-   Go 风格的无状态 `io.Reader` / `io.Writer` 只有两个指针（`ptr` + `vtable`，共 16 字节），零内部内存分配、零生命周期绑定。
-3. **即时流与交互协议的健壮性**：
-   在 Server-Sent Events (SSE)、HTTP Chunked 传输、TCP 双工通信等场景下，无缓冲基础层天然保证低延迟，杜绝因遗漏 `flush` 导致的数据死锁与迟发。
+在全面归一至 `std.Io` 后，`stdgo` 各模块展现出极致的系统级效率：
 
----
+### 1) 内存流的原生零拷贝
+- **`bytes.Reader`**：内部包装 `std.Io.Reader.fixed(b)`，直接将外部不可变字节切片作为就绪缓冲区，`read`、`buffered`、`stream` 均为 O(1) 零分配。
+- **`bytes.Buffer`**：内部通过 `@fieldParentPtr` 将其动态扩容数组直接挂载为 `std.Io.Writer` 的内部缓冲区，`w.writeAll` 在容量充足时走内联 `@memcpy` 快路径；容量不足时通过 `drain` 自动扩容并挂载新切片。
 
-## 3. Zig 0.17 的新能力剖析
-
-Zig 0.17 废弃旧版宏混入泛型 Reader、改用具体结构体，其核心驱动力在于追求**极致的底层机器效率与避免多余内存中继拷贝**：
-
-1. **三指针物理模型（`buffer: []u8`, `seek`, `end`）**：
-   - `[0 .. seek]`：已消费区域（无用历史数据）；
-   - `[seek .. end]`：就绪有效数据（零拷贝直接读取，提供原地 `peek`）；
-   - `[end .. len]`：空闲待写入区域（供底层系统调用直接填充）。
-   - **快慢路径分离**：内部有效数据充足时，走快路径 `@memcpy`；当内部数据耗尽时，慢路径通过向量封装调用系统调用（如 `readv` / `io_uring`），将目标切片当作 DMA 目标内存直读，跳过中间临时缓冲。
-2. **聚集写入（Gather I/O）与 `splat` 对齐填充**：
-   `drain(w, data: []const []const u8, splat: usize)` 天然支持切片向量与尾部填充，一次系统调用批量刷入协议头、消息体与对齐字节。
-3. **内核级零拷贝与自动降级（`sendFile` / `sendFileAll`）**：
-   `w.sendFile` 对接内核级直传（如 Linux `copy_file_range`、macOS `fcopyfile`），不支持时自动借用 `w.buffer` 回退到常规读写循环。
-
----
-
-## 4. 能力对等与互补机制：`WriterTo` 与 `ReaderFrom`
-
-虽然 Zig 0.17 将高级能力内建在容器中，但 Go 体系通过 **“主客体双向能力探测”** 同样实现了对等的零拷贝优化，且保持了基础接口的纯粹：
-
+### 2) 流流转的极致简化：`io.copy`
+在去除了复杂的探测逻辑后，`stdgo.io.copy` 完全委托给 Zig 0.17 原生流转引擎：
+```zig
+pub fn copy(dst: *Writer, src: *Reader) anyerror!u64 {
+    const bytes = try src.stream(dst, .unlimited);
+    return @intCast(bytes);
+}
 ```
-                    ┌────────────────────────┐
-                    │      io.copy(dst, src) │
-                    └───────────┬────────────┘
-                                │
-               ┌────────────────┴────────────────┐
-               ▼                                 ▼
-      【源端驱动优化】                    【目标端驱动优化】
-        src.writeTo                       dst.readFrom
-   (如 bytes.Buffer/Reader)          (如 TCPConn / File / Buffer)
-               │                                 │
-     直接切片交付，消除用户态               直通操作系统内核
-         32KB 中继拷贝                         sendFile / splice
-```
+当 `src` 或 `dst` 支持文件内核直传时，自动走操作系统的 `copy_file_range` / `fcopyfile`，用户态零拷贝。
 
-### 1) 源驱动优化：`WriterTo`
-- **适用场景**：源端最清楚自己的内存布局（如 `bytes.Buffer`、`bytes.Reader`、`strings.Reader`）。
-- **优势**：源端直接调用 `w.writeAll(slice)`，**彻底消除 32KB 临时中继栈缓冲与多次无意义的内存拷贝**。
-
-### 2) 目标驱动优化：`ReaderFrom`
-- **适用场景**：目标端拥有特殊的吸收通道（如网络套接字、文件或内存接收容器）。
-- **优势**：
-  - **内存端（`bytes.Buffer`）**：直接在内部存储尾部原地扩容读取，数据一次性落入目标地址；
-  - **操作系统端（`Socket` / `File`）**：若源端是文件，直接触发底层 `sendFile` 进行内核态零拷贝。
+### 3) 协议解析器的零拷贝探查
+在 `encoding/csv`、`archive/tar`、`compress/gzip`、`net/http` 等流式解析器中：
+- 采用 `r.takeDelimiterExclusive('\n')` 和 `r.take(512)` 直接原地借用滑动窗口内部切片；
+- CSV 解析器针对未转义字段直接生成子切片，杜绝了中间 `bytes.Buffer` 的额外堆分配与重复复制。
 
 ---
 
-## 5. 关于 `sendFile` 在 Bridge 中的取舍与权衡
+## 4. 关键代码模式
 
-在类型擦除的流抽象中，`sendFile` 能够生效必须同时具备：
-1. **写端目标（Sink）** 具备内核发送接口（如 Zig `std.Io.Writer` 或系统套接字）；
-2. **读端来源（Source）** 必须能够暴露出操作系统文件句柄（如 `*std.Io.File.Reader` 或系统 fd）。
-
-### 设计权衡：
-- **常规切片 Bridge**：将 `std.Io.Reader` 桥接为 `stdgo.io.Reader` 时，若只进行通用数据搬运，底层只能依赖 `readSliceShort` 与 `drain`，在传输文件时会退化为内存中继；
-- **打通零拷贝通路**：可通过在 `Reader.VTable` 扩展轻量可选探针（如 `getFile`），并在写端 `FromZigWriter.readFrom` 中探测该探针，一旦匹配则直调 Zig 0.17 的 `self.zig_writer.sendFileAll(file_reader, .unlimited)`，兼顾 Go 的简洁调用与 Zig 的内核级直传。
-
----
-
-## 6. stdgo I/O 三层架构体系
-
-`stdgo` 确立了如下三层分工明确的架构体系：
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. 上层标准库生态层 (stdgo 生态闭环)                         │
-│    net/http, archive/tar, compress/gzip, bufio, csv...      │
-│    (统一基于无状态极简 stdgo.io.Reader / Writer VTable)       │
-├─────────────────────────────────────────────────────────────┤
-│ 2. 快速路径与优化层 (Go 风格的零拷贝加速)                    │
-│    io.copy / io.copyBuffer 自动路由探测:                     │
-│    • ReaderFrom (如 bytes.Buffer.readFrom)                  │
-│    • WriterTo   (如 bytes.Reader.writeTo, Buffer.writeTo)   │
-├─────────────────────────────────────────────────────────────┤
-│ 3. Zig 0.17 原生互操作层 (src/io/bridge.zig)                 │
-│    • fromZigReader / fromZigWriter: 接入 Zig 0.17 std.Io    │
-│    • toZigReader / toZigWriter:     导出给 Zig 0.17 std.Io   │
-│    • 零拷贝扩展: 联动 sendFileAll 内核直传                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 7. 关键代码模式速查
-
-### 从 Zig 原生 I/O 桥接到 stdgo
+### 1) 读取端（Reader 消费者）
 ```zig
 const stdgo = @import("stdgo");
 const io = stdgo.io;
 
-// 将 Zig 0.17 std.Io.Reader 转换为 stdgo.io.Reader
-var bridge = io.fromZigReader(&zig_stream_reader);
-const reader = bridge.reader();
-
-// 直接传给 stdgo 的流式解析器
-var tar_r = stdgo.archive.tar.Reader.init(reader);
+// 接受 *io.Reader 指针驱动读取
+pub fn processStream(r: *io.Reader) !void {
+    var line_buf: [256]u8 = undefined;
+    const n = try r.readSliceShort(&line_buf);
+    _ = n;
+}
 ```
 
-### 从 stdgo 导出到 Zig 原生 I/O
+### 2) 写入端（Writer 生产者）
 ```zig
-// 将 stdgo 的 reader 包装为 Zig 0.17 原生 std.Io.Reader
-var r_buf: [4096]u8 = undefined;
-var to_zig = io.toZigReader(my_stdgo_reader, &r_buf);
+const stdgo = @import("stdgo");
+const io = stdgo.io;
 
-// 供 Zig 原生支持 std.Io 的库直接消费
-_ = try to_zig.reader.readSliceShort(&dest);
+// 写入完毕后必须显式调用 flush，确保缓冲区数据交付
+pub fn writeOutput(w: *io.Writer) !void {
+    try w.writeAll("hello world\n");
+    try w.flush();
+}
 ```
+
+### 3) 自定义组件实现 `writer()`
+通过 `@fieldParentPtr` 原生对接 `std.Io.Writer`：
+```zig
+pub fn writer(self: *MyComponent) *io.Writer {
+    self.writer_inst = .{
+        .buffer = &.{},
+        .vtable = &.{
+            .drain = drainImpl,
+            .flush = flushImpl,
+        },
+    };
+    return &self.writer_inst;
+}
+
+fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const self: *MyComponent = @alignCast(@fieldParentPtr("writer_inst", w));
+    // 直接消费数据切片并处理 splat 展开
+    ...
+}
+```
+
+---
+
+## 5. 总结
+
+`stdgo` 坚决贯彻 **“借鉴 Go 标准库的人体工学与丰富生态，但不向性能妥协”** 的原则。通过彻底拥抱 Zig 0.17 的 `std.Io` 体系并剥离历史冗余，`stdgo` 在保持 Go 风格直观 API 的同时，获得了完全对齐 Zig 现代化系统级 I/O 的极致性能与内存安全保障。

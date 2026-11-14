@@ -98,13 +98,13 @@ pub fn extractHeaderParam(header_val: []const u8, param_name: []const u8) ?[]con
 /// Writer for multipart/form-data generation.
 pub const Writer = struct {
     allocator: Allocator,
-    w: io.Writer,
+    w: *io.Writer,
     boundary_buf: [70]u8 = undefined,
     boundary_len: usize = 0,
     last_part_open: bool = false,
     closed: bool = false,
 
-    pub fn init(allocator: Allocator, w: io.Writer) Writer {
+    pub fn init(allocator: Allocator, w: *io.Writer) Writer {
         var self = Writer{
             .allocator = allocator,
             .w = w,
@@ -140,7 +140,7 @@ pub const Writer = struct {
     }
 
     /// CreatePart creates a new multipart section with the provided header.
-    pub fn createPart(self: *Writer, header: *const Header) !io.Writer {
+    pub fn createPart(self: *Writer, header: *const Header) !*io.Writer {
         if (self.closed) return error.WriterClosed;
 
         var prefix_buf: [128]u8 = undefined;
@@ -165,7 +165,7 @@ pub const Writer = struct {
     }
 
     /// CreateFormField creates a new part with the provided form field name.
-    pub fn createFormField(self: *Writer, fieldname: []const u8) !io.Writer {
+    pub fn createFormField(self: *Writer, fieldname: []const u8) !*io.Writer {
         var h = Header.init(self.allocator);
         defer h.deinit();
 
@@ -177,7 +177,7 @@ pub const Writer = struct {
     }
 
     /// CreateFormFile creates a new part with Content-Disposition for file uploads.
-    pub fn createFormFile(self: *Writer, fieldname: []const u8, filename: []const u8) !io.Writer {
+    pub fn createFormFile(self: *Writer, fieldname: []const u8, filename: []const u8) !*io.Writer {
         var h = Header.init(self.allocator);
         defer h.deinit();
 
@@ -208,6 +208,7 @@ pub const Writer = struct {
             const s = try std.fmt.bufPrint(&suffix_buf, "--{s}--\r\n", .{self.boundary()});
             try self.w.writeAll(s);
         }
+        try self.w.flush();
     }
 };
 
@@ -241,30 +242,20 @@ pub const Part = struct {
         return n;
     }
 
-    pub fn reader(self: *Part) io.Reader {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .read = readImpl,
-            },
-        };
-    }
-
-    fn readImpl(ctx: *anyopaque, dest: []u8) anyerror!usize {
-        const self: *Part = @ptrCast(@alignCast(ctx));
-        return self.read(dest);
+    pub fn reader(self: *Part) std.Io.Reader {
+        return std.Io.Reader.fixed(self.body[self.read_pos..]);
     }
 };
 
 /// Reader parses multipart/form-data streams.
 pub const Reader = struct {
     allocator: Allocator,
-    r: io.Reader,
+    r: *io.Reader,
     boundary: []const u8,
     buf: std.ArrayListUnmanaged(u8) = .empty,
     eof: bool = false,
 
-    pub fn init(allocator: Allocator, r: io.Reader, b: []const u8) Reader {
+    pub fn init(allocator: Allocator, r: *io.Reader, b: []const u8) Reader {
         return .{
             .allocator = allocator,
             .r = r,
@@ -286,7 +277,7 @@ pub const Reader = struct {
 
         while (std.mem.indexOf(u8, self.buf.items, dash_boundary) == null) {
             var temp: [1024]u8 = undefined;
-            const n = try self.r.read(&temp);
+            const n = try self.r.readSliceShort(&temp);
             if (n == 0) return null;
             try self.buf.appendSlice(self.allocator, temp[0..n]);
         }
@@ -308,7 +299,7 @@ pub const Reader = struct {
         // Find end of headers (\r\n\r\n)
         while (std.mem.indexOfPos(u8, self.buf.items, header_start, "\r\n\r\n") == null) {
             var temp: [1024]u8 = undefined;
-            const n = try self.r.read(&temp);
+            const n = try self.r.readSliceShort(&temp);
             if (n == 0) return error.UnexpectedEOF;
             try self.buf.appendSlice(self.allocator, temp[0..n]);
         }
@@ -335,7 +326,7 @@ pub const Reader = struct {
 
         while (std.mem.indexOfPos(u8, self.buf.items, body_start, next_delim) == null) {
             var temp: [1024]u8 = undefined;
-            const n = try self.r.read(&temp);
+            const n = try self.r.readSliceShort(&temp);
             if (n == 0) return error.UnexpectedEOF;
             try self.buf.appendSlice(self.allocator, temp[0..n]);
         }
@@ -381,7 +372,8 @@ test "mime.multipart Writer and Reader roundtrip" {
     try w.close();
 
     // Now parse back with Reader
-    var r = Reader.init(testing.allocator, out_buf.reader(), "my-custom-boundary-12345");
+    var in_r = out_buf.reader();
+    var r = Reader.init(testing.allocator, &in_r, "my-custom-boundary-12345");
     defer r.deinit();
 
     // Part 1: username

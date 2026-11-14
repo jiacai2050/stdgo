@@ -4,7 +4,6 @@ const std = @import("std");
 pub const io = @import("io.zig");
 pub const bytes = @import("bytes.zig");
 pub const strings = @import("strings.zig");
-pub const bufio = @import("bufio.zig");
 pub const encoding = @import("encoding.zig");
 pub const path = @import("path.zig");
 pub const net = @import("net.zig");
@@ -33,14 +32,13 @@ test "stdgo integration: bytes.Buffer + io.copy + bytes.Reader" {
     var buf = bytes.Buffer.init(testing.allocator);
     defer buf.deinit();
 
-    var temp_buf: [16]u8 = undefined;
-    const copied = try io.copy(buf.writer(), r.reader(), &temp_buf);
+    const copied = try io.copy(buf.writer(), r.reader());
 
     try testing.expectEqual(@as(u64, source_text.len), copied);
     try testing.expectEqualStrings(source_text, buf.string());
 }
 
-test "stdgo integration: bufio.Scanner + encoding.binary" {
+test "stdgo integration: bytes.Reader + encoding.binary" {
     const testing = std.testing;
 
     var buf = bytes.Buffer.init(testing.allocator);
@@ -57,7 +55,7 @@ test "stdgo integration: bufio.Scanner + encoding.binary" {
     var decoded: [4]i64 = undefined;
     var idx: usize = 0;
     while (r.len() > 0) {
-        const res = try encoding.binary.varint(r.s[@intCast(r.i)..]);
+        const res = try encoding.binary.varint(r.buffered());
         _ = try r.seek(@intCast(res.bytes_read), .current);
         decoded[idx] = res.val;
         idx += 1;
@@ -169,8 +167,7 @@ test "stdgo integration: tar + crypto.sha256 streaming hash" {
     try testing.expectEqualStrings("payload.bin", ent.name);
 
     var sha_digest = crypto.sha256.New();
-    var temp_chunk: [16]u8 = undefined;
-    const copied = try io.copy(sha_digest.writer(), tr.reader(), &temp_chunk);
+    const copied = try io.copy(sha_digest.writer(), tr.reader());
     try testing.expectEqual(@as(u64, payload.len), copied);
 
     var final_hash: [32]u8 = undefined;
@@ -370,7 +367,6 @@ test {
     _ = io;
     _ = bytes;
     _ = strings;
-    _ = bufio;
     _ = encoding;
     _ = path;
     _ = net;

@@ -678,7 +678,6 @@ test "Client: CheckRedirect and cross-origin header stripping" {
 
 test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" {
     const testing = std.testing;
-    const io_mod = @import("../../io.zig");
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -743,33 +742,12 @@ test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" 
     const s_thread = try std.Thread.spawn(.{}, ServerHandler.run, .{ &server, io, &uploaded, testing.allocator });
 
     // Stream from custom Reader
-    const StreamSource = struct {
-        chunks: [3][]const u8 = .{ "first-chunk ", "second-chunk ", "third-chunk" },
-        idx: usize = 0,
-
-        fn read(ctx: *anyopaque, buf: []u8) anyerror!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (self.idx >= self.chunks.len) return 0;
-            const src = self.chunks[self.idx];
-            @memcpy(buf[0..src.len], src);
-            self.idx += 1;
-            return src.len;
-        }
-
-        fn reader(self: *@This()) io_mod.Reader {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .read = read },
-            };
-        }
-    };
-
-    var src = StreamSource{};
+    var src = std.Io.Reader.fixed("first-chunk second-chunk third-chunk");
     const target_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/stream-upload", .{port});
     defer testing.allocator.free(target_url);
 
     // Create request with body_reader and unknown length (null) -> chunked
-    var req = try newRequestWithReader(testing.allocator, .POST, target_url, src.reader(), null);
+    var req = try newRequestWithReader(testing.allocator, .POST, target_url, &src, null);
     defer req.deinit();
 
     var c = Client.init(testing.allocator, io, .{

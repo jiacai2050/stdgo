@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "multipart", .file = "examples/multipart.zig" },
         .{ .name = "hmac", .file = "examples/hmac.zig" },
         .{ .name = "archive", .file = "examples/archive.zig" },
-        .{ .name = "bufio-io", .file = "examples/bufio_io.zig" },
+        .{ .name = "io", .file = "examples/io.zig" },
         .{ .name = "bytes-strings", .file = "examples/bytes_strings.zig" },
         .{ .name = "compress", .file = "examples/compress.zig" },
         .{ .name = "container", .file = "examples/container.zig" },

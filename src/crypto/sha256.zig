@@ -8,10 +8,12 @@ pub const block_size = 64;
 
 pub const Digest = struct {
     inner: std.crypto.hash.sha2.Sha256,
+    writer_inst: std.Io.Writer = undefined,
 
     pub fn init() Digest {
         return .{
             .inner = std.crypto.hash.sha2.Sha256.init(.{}),
+            .writer_inst = undefined,
         };
     }
 
@@ -42,14 +44,34 @@ pub const Digest = struct {
         };
     }
 
-    pub fn writer(self: *Digest) io.Writer {
-        return .{
-            .ptr = self,
+    pub fn writer(self: *Digest) *io.Writer {
+        self.writer_inst = .{
+            .buffer = &.{},
             .vtable = &.{
-                .write = writeImpl,
+                .drain = drainImpl,
+                .flush = flushImpl,
             },
         };
+        return &self.writer_inst;
     }
+
+    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Digest = @alignCast(@fieldParentPtr("writer_inst", w));
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            _ = self.write(slice) catch return error.WriteFailed;
+            total += slice.len;
+        }
+        const pattern = data[data.len - 1];
+        var i: usize = 0;
+        while (i < splat) : (i += 1) {
+            _ = self.write(pattern) catch return error.WriteFailed;
+            total += pattern.len;
+        }
+        return total;
+    }
+
+    fn flushImpl(_: *std.Io.Writer) std.Io.Writer.Error!void {}
 
     fn writeImpl(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *Digest = @ptrCast(@alignCast(ctx));

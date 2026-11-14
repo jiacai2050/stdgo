@@ -140,7 +140,7 @@ pub fn varint(buf: []const u8) Error!VarintResult {
 }
 
 /// Read reads structured binary data from r into data.
-pub fn read(r: io.Reader, endian: Endian, comptime T: type) anyerror!T {
+pub fn read(r: *io.Reader, endian: Endian, comptime T: type) anyerror!T {
     var buf: [@sizeOf(T)]u8 = undefined;
     _ = try io.readFull(r, &buf);
     return switch (endian) {
@@ -150,7 +150,7 @@ pub fn read(r: io.Reader, endian: Endian, comptime T: type) anyerror!T {
 }
 
 /// Write writes the binary representation of data into w.
-pub fn write(w: io.Writer, endian: Endian, comptime T: type, val: T) anyerror!void {
+pub fn write(w: *io.Writer, endian: Endian, comptime T: type, val: T) anyerror!void {
     var buf: [@sizeOf(T)]u8 = undefined;
     switch (endian) {
         .little => std.mem.writeInt(T, &buf, val, .little),

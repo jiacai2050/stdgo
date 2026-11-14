@@ -5,12 +5,12 @@ const Header = header_mod.Header;
 const block_size = header_mod.block_size;
 
 pub const Writer = struct {
-    w: io.Writer,
+    w: *std.Io.Writer,
     curr_file_size: u64 = 0,
     written_in_file: u64 = 0,
     closed: bool = false,
 
-    pub fn init(w: io.Writer) Writer {
+    pub fn init(w: *std.Io.Writer) Writer {
         return .{
             .w = w,
             .curr_file_size = 0,
@@ -68,12 +68,13 @@ pub const Writer = struct {
         }
     }
 
-    /// Close closes the tar archive by writing the padding and two 512-byte zero blocks.
+    /// Close closes the tar archive by writing the padding and two 512-byte zero blocks, then flushing.
     pub fn close(self: *Writer) anyerror!void {
         if (self.closed) return;
         try self.padPrevious();
         // Write two 512-byte zero blocks
         try self.writeZeroes(block_size * 2);
+        try self.w.flush();
         self.closed = true;
     }
 };

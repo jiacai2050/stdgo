@@ -330,7 +330,7 @@ pub const Transport = struct {
                 var remaining = req.content_length.?;
                 while (remaining > 0) {
                     const to_read = @min(buf.len, remaining);
-                    const n = try r.read(buf[0..to_read]);
+                    const n = try r.readSliceShort(buf[0..to_read]);
                     if (n == 0) break;
                     try conn.writeAll(self.io, buf[0..n], self.options.timeout_ns);
                     remaining -= n;
@@ -338,7 +338,7 @@ pub const Transport = struct {
             } else {
                 // chunked streaming upload
                 while (true) {
-                    const n = try r.read(&buf);
+                    const n = try r.readSliceShort(&buf);
                     if (n == 0) break;
                     var hex_buf: [16]u8 = undefined;
                     const hex_str = try std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{n});

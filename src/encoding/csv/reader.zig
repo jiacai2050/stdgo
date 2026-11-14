@@ -1,6 +1,5 @@
 const std = @import("std");
 const io = @import("../../io.zig");
-const bufio = @import("../../bufio.zig");
 const bytes = @import("../../bytes.zig");
 const Allocator = std.mem.Allocator;
 
@@ -13,7 +12,7 @@ pub const Error = error{
 };
 
 pub const Reader = struct {
-    r: bufio.Reader,
+    r: *std.Io.Reader,
     comma: u8 = ',',
     comment: ?u8 = null,
     fields_per_record: i32 = 0,
@@ -23,10 +22,9 @@ pub const Reader = struct {
     line_number: usize = 0,
     num_fields: ?usize = null,
 
-    pub fn init(allocator: Allocator, rd: io.Reader) Allocator.Error!Reader {
-        const br = try bufio.Reader.init(allocator, rd);
+    pub fn init(rd: *std.Io.Reader) Reader {
         return .{
-            .r = br,
+            .r = rd,
             .comma = ',',
             .comment = null,
             .fields_per_record = 0,
@@ -37,16 +35,14 @@ pub const Reader = struct {
         };
     }
 
-    pub fn deinit(self: *Reader) void {
-        self.r.deinit();
-    }
+    pub fn deinit(_: *Reader) void {}
 
     /// Read reads one record (a slice of fields) from the CSV reader.
     /// Caller owns the returned record and must call `freeRecord(allocator, record)`.
     pub fn read(self: *Reader, allocator: Allocator) anyerror!?[]const []const u8 {
         while (true) {
             const raw_line = self.readLine(allocator) catch |err| {
-                if (err == io.Error.EndOfStream) return null;
+                if (err == error.EndOfStream or err == io.Error.EndOfStream) return null;
                 return err;
             };
             defer allocator.free(raw_line);
@@ -92,17 +88,15 @@ pub const Reader = struct {
 
         var in_quotes = false;
         while (true) {
-            const ch = self.r.readByte() catch |err| {
-                if (err == io.Error.EndOfStream) {
+            const ch = self.r.takeByte() catch |err| {
+                if (err == error.EndOfStream) {
                     if (line.len() > 0) {
                         if (in_quotes and !self.lazy_quotes) {
                             return Error.Quote;
                         }
-                        const res = try allocator.dupe(u8, line.bytes());
-                        line.deinit();
-                        return res;
+                        return try line.toOwnedSlice();
                     }
-                    return io.Error.EndOfStream;
+                    return error.EndOfStream;
                 }
                 return err;
             };
@@ -118,9 +112,7 @@ pub const Reader = struct {
             }
         }
 
-        const res = try allocator.dupe(u8, line.bytes());
-        line.deinit();
-        return res;
+        return try line.toOwnedSlice();
     }
 
     fn parseRecord(self: *Reader, allocator: Allocator, raw: []const u8) anyerror![]const []const u8 {
@@ -144,11 +136,11 @@ pub const Reader = struct {
                 }
             }
 
-            var field_buf = bytes.Buffer.init(allocator);
-            errdefer field_buf.deinit();
-
             if (field_start < src.len and src[field_start] == '"') {
                 // Quoted field
+                var field_buf = bytes.Buffer.init(allocator);
+                errdefer field_buf.deinit();
+
                 var j = field_start + 1;
                 var inside = true;
                 while (j < src.len) {
@@ -176,19 +168,18 @@ pub const Reader = struct {
                     j += 1;
                 }
                 i = j + 1;
+                const field_str = try field_buf.toOwnedSlice();
+                try fields.append(allocator, field_str);
             } else {
-                // Unquoted field
+                // Unquoted field: zero intermediate buffer allocation!
                 var j = field_start;
                 while (j < src.len and src[j] != self.comma) {
-                    try field_buf.writeByte(src[j]);
                     j += 1;
                 }
+                const field_str = try allocator.dupe(u8, src[field_start..j]);
                 i = j + 1;
+                try fields.append(allocator, field_str);
             }
-
-            const field_str = try allocator.dupe(u8, field_buf.bytes());
-            field_buf.deinit();
-            try fields.append(allocator, field_str);
         }
 
         return try fields.toOwnedSlice(allocator);
@@ -214,7 +205,7 @@ test "csv.Reader basic and quoted records" {
         \\line",field2,field3
     ;
     var br = bytes.Reader.init(input);
-    var reader = try Reader.init(testing.allocator, br.reader());
+    var reader = Reader.init(br.reader());
     defer reader.deinit();
 
     // 1st row
@@ -261,7 +252,7 @@ test "csv.Reader custom comma, comments and trailing comma" {
         \\val3;val4;val5
     ;
     var br = bytes.Reader.init(input);
-    var reader = try Reader.init(testing.allocator, br.reader());
+    var reader = Reader.init(br.reader());
     defer reader.deinit();
     reader.comma = ';';
     reader.comment = '#';

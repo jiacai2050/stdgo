@@ -108,10 +108,10 @@ pub const Handler = struct {
 
 /// TextHandler formats log records as key=value lines.
 pub const TextHandler = struct {
-    w: io.Writer,
+    w: *io.Writer,
     min_level: Level = .Info,
 
-    pub fn init(w: io.Writer, min_level: Level) TextHandler {
+    pub fn init(w: *io.Writer, min_level: Level) TextHandler {
         return .{
             .w = w,
             .min_level = min_level,
@@ -179,15 +179,16 @@ pub const TextHandler = struct {
             }
         }
         try self.w.writeAll("\n");
+        try self.w.flush();
     }
 };
 
 /// JSONHandler formats log records as JSON objects.
 pub const JSONHandler = struct {
-    w: io.Writer,
-    min_level: Level = .Info,
+    w: *io.Writer,
+    min_level: Level = .Warn,
 
-    pub fn init(w: io.Writer, min_level: Level) JSONHandler {
+    pub fn init(w: *io.Writer, min_level: Level) JSONHandler {
         return .{
             .w = w,
             .min_level = min_level,
@@ -253,6 +254,7 @@ pub const JSONHandler = struct {
             }
         }
         try self.w.writeAll("}\n");
+        try self.w.flush();
     }
 
     fn writeEscaped(self: *JSONHandler, s: []const u8) !void {

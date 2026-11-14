@@ -112,29 +112,7 @@ pub fn main(init: std.process.Init) !void {
     // -------------------------------------------------------------
     // 3. Streaming Chunked Upload via stdgo.io.Reader
     // -------------------------------------------------------------
-    const StreamBuffer = struct {
-        data: []const u8,
-        cursor: usize = 0,
-
-        fn read(ctx_ptr: *anyopaque, buf: []u8) anyerror!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            if (self.cursor >= self.data.len) return 0;
-            const avail = self.data.len - self.cursor;
-            const n = @min(avail, @min(buf.len, 10)); // send in 10-byte chunks
-            @memcpy(buf[0..n], self.data[self.cursor .. self.cursor + n]);
-            self.cursor += n;
-            return n;
-        }
-
-        fn reader(self: *@This()) stdgo.io.Reader {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .read = read },
-            };
-        }
-    };
-
-    var stream_src = StreamBuffer{ .data = "Streaming dynamic log payload line by line without buffering everything!" };
+    var stream_src = stdgo.bytes.Reader.init("Streaming dynamic log payload line by line without buffering everything!");
     const upload_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/upload", .{server_port});
     defer gpa.free(upload_url);
 

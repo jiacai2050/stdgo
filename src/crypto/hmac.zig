@@ -11,6 +11,7 @@ pub const Hmac = struct {
     opad: [128]u8,
     block_size: usize,
     hash_size: usize,
+    writer_inst: std.Io.Writer = undefined,
 
     /// New initializes an HMAC using the provided Hash instances for inner and outer hashing.
     /// The caller provides two Hash instances (inner and outer) initialized to the same algorithm,
@@ -88,14 +89,34 @@ pub const Hmac = struct {
     }
 
     /// Writer returns an io.Writer interface.
-    pub fn writer(self: *Hmac) io.Writer {
-        return .{
-            .ptr = self,
+    pub fn writer(self: *Hmac) *io.Writer {
+        self.writer_inst = .{
+            .buffer = &.{},
             .vtable = &.{
-                .write = writeImpl,
+                .drain = drainImpl,
+                .flush = flushImpl,
             },
         };
+        return &self.writer_inst;
     }
+
+    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Hmac = @alignCast(@fieldParentPtr("writer_inst", w));
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            _ = self.write(slice) catch return error.WriteFailed;
+            total += slice.len;
+        }
+        const pattern = data[data.len - 1];
+        var i: usize = 0;
+        while (i < splat) : (i += 1) {
+            _ = self.write(pattern) catch return error.WriteFailed;
+            total += pattern.len;
+        }
+        return total;
+    }
+
+    fn flushImpl(_: *std.Io.Writer) std.Io.Writer.Error!void {}
 
     fn writeImpl(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
         const self: *Hmac = @ptrCast(@alignCast(ctx));

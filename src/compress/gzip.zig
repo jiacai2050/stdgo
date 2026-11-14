@@ -28,12 +28,12 @@ pub const Header = struct {
 };
 
 pub const Writer = struct {
-    w: io.Writer,
+    w: *io.Writer,
     crc: u32 = 0,
     uncompressed_size: u32 = 0,
     closed: bool = false,
 
-    pub fn init(w: io.Writer, header: Header) anyerror!Writer {
+    pub fn init(w: *io.Writer, header: Header) anyerror!Writer {
         // Write 10-byte fixed header
         var hdr: [10]u8 = undefined;
         hdr[0] = gzip_id1;
@@ -79,20 +79,21 @@ pub const Writer = struct {
         try binary.LittleEndian.writeU32(trailer[0..4], self.crc);
         try binary.LittleEndian.writeU32(trailer[4..8], self.uncompressed_size);
         try self.w.writeAll(&trailer);
+        try self.w.flush();
 
         self.closed = true;
     }
 };
 
 pub const Reader = struct {
-    r: io.Reader,
+    r: *io.Reader,
     header: Header,
     crc: u32 = 0,
     uncompressed_size: u32 = 0,
     read_so_far: u32 = 0,
     name_buf: [128]u8 = undefined,
 
-    pub fn init(r: io.Reader) anyerror!Reader {
+    pub fn init(r: *io.Reader) anyerror!Reader {
         var hdr: [10]u8 = undefined;
         _ = try io.readFull(r, &hdr);
 
@@ -138,8 +139,8 @@ pub const Reader = struct {
 
         var buf: [512]u8 = undefined;
         while (true) {
-            const nr = self.r.read(&buf) catch |err| {
-                if (err == io.Error.EndOfStream) break;
+            const nr = self.r.readSliceShort(&buf) catch |err| {
+                if (err == error.EndOfStream or err == io.Error.EndOfStream) break;
                 return err;
             };
             if (nr == 0) break;

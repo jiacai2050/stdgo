@@ -200,7 +200,7 @@ pub const FlagSet = struct {
     }
 
     /// PrintDefaults prints usage of all defined flags to writer.
-    pub fn printDefaults(self: *const FlagSet, w: io.Writer) anyerror!void {
+    pub fn printDefaults(self: *const FlagSet, w: *io.Writer) anyerror!void {
         for (self.flags.items) |f| {
             try w.writeAll("  -");
             try w.writeAll(f.name);
@@ -219,6 +219,7 @@ pub const FlagSet = struct {
             }
             try w.writeAll("\n");
         }
+        try w.flush();
     }
 };
 
