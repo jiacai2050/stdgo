@@ -82,28 +82,6 @@ pub fn parseUrlTarget(raw_url: []const u8) !ParsedTarget {
     };
 }
 
-pub const SliceReaderState = struct {
-    data: []const u8,
-    cursor: usize = 0,
-
-    pub fn read(ctx_ptr: *anyopaque, buf: []u8) anyerror!usize {
-        const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-        if (self.cursor >= self.data.len) return 0;
-        const avail = self.data.len - self.cursor;
-        const n = @min(avail, buf.len);
-        @memcpy(buf[0..n], self.data[self.cursor .. self.cursor + n]);
-        self.cursor += n;
-        return n;
-    }
-
-    pub fn reader(self: *@This()) io.Reader {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .read = read },
-        };
-    }
-};
-
 pub const Request = struct {
     allocator: std.mem.Allocator,
     method: Method = .GET,
