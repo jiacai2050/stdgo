@@ -12,14 +12,14 @@ pub const Value = union(enum) {
     string: []const u8,
     bytes: []const u8,
 
-    pub fn format(self: Value, writer: anytype) !void {
+    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .null => try writer.writeAll("NULL"),
             .int => |i| try writer.print("{d}", .{i}),
             .float => |f| try writer.print("{d}", .{f}),
             .bool => |b| try writer.writeAll(if (b) "true" else "false"),
             .string => |s| try writer.print("'{s}'", .{s}),
-            .bytes => |b| try writer.print("0x{s}", .{std.fmt.fmtSliceHexLower(b)}),
+            .bytes => |b| try writer.print("0x{x}", .{b}),
         }
     }
 };
@@ -229,3 +229,20 @@ pub const Driver = struct {
         return self.vtable.open(self.ptr, dsn);
     }
 };
+
+test "Value format" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    const cases = [_]struct { []const u8, Value }{
+        .{ "NULL", .null },
+        .{ "-42", .{ .int = -42 } },
+        .{ "1.5", .{ .float = 1.5 } },
+        .{ "true", .{ .bool = true } },
+        .{ "'hi'", .{ .string = "hi" } },
+        .{ "0x00ff1a", .{ .bytes = &.{ 0x00, 0xff, 0x1a } } },
+    };
+    for (cases) |c| {
+        const want, const v = c;
+        try testing.expectEqualStrings(want, try std.fmt.bufPrint(&buf, "{f}", .{v}));
+    }
+}

@@ -76,10 +76,8 @@ pub const IP = union(enum) {
         return std.mem.eql(u8, &a16, &b16);
     }
 
-    /// Formats the IP address into a string buffer or writer.
-    pub fn format(self: IP, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    /// Formats the IP address with `{f}`.
+    pub fn format(self: IP, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .v4 => |b| try writer.print("{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }),
             .v6 => |b| {
@@ -409,4 +407,15 @@ test "net.ip: IPv6 CIDR" {
 
     try testing.expect(res.ipnet.contains(inside));
     try testing.expect(!res.ipnet.contains(outside));
+}
+
+test "net.ip: IP format matches stringBuf" {
+    const testing = std.testing;
+    var fmt_buf: [64]u8 = undefined;
+    var str_buf: [64]u8 = undefined;
+    const v4_in_v6: IP = .{ .v6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 } };
+    for ([_]IP{ parseIp("192.168.1.1").?, v4_in_v6, parseIp("2001:db8::1").? }) |ip| {
+        try testing.expectEqualStrings(ip.stringBuf(&str_buf), try std.fmt.bufPrint(&fmt_buf, "{f}", .{ip}));
+    }
+    try testing.expectEqualStrings("::ffff:10.0.0.1", try std.fmt.bufPrint(&fmt_buf, "{f}", .{v4_in_v6}));
 }

@@ -97,12 +97,9 @@ pub const Addr = struct {
         return self;
     }
 
-    pub fn format(
-        self: Addr,
-        writer: anytype,
-    ) !void {
+    pub fn format(self: Addr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.is_v4) {
-            try std.fmt.format(writer, "{d}.{d}.{d}.{d}", .{
+            try writer.print("{d}.{d}.{d}.{d}", .{
                 self.bytes[12],
                 self.bytes[13],
                 self.bytes[14],
@@ -114,7 +111,7 @@ pub const Addr = struct {
             while (i < 16) : (i += 2) {
                 const chunk = (@as(u16, self.bytes[i]) << 8) | self.bytes[i + 1];
                 if (i > 0) try writer.writeByte(':');
-                try std.fmt.format(writer, "{x}", .{chunk});
+                try writer.print("{x}", .{chunk});
             }
         }
     }
@@ -243,4 +240,10 @@ test "netip: AddrPort parsing" {
     const ap = try parseAddrPort("127.0.0.1:8080");
     try testing.expect(ap.addr.isLoopback());
     try testing.expectEqual(@as(u16, 8080), ap.port);
+}
+
+test "netip: Addr format" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("192.168.1.1", try std.fmt.bufPrint(&buf, "{f}", .{try parseAddr("192.168.1.1")}));
+    try testing.expectEqualStrings("2001:db8:0:0:0:0:0:1", try std.fmt.bufPrint(&buf, "{f}", .{try parseAddr("2001:db8::1")}));
 }
