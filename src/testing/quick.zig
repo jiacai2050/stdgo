@@ -48,8 +48,8 @@ pub const Generator = struct {
             },
             .@"struct" => |s| {
                 var res: T = undefined;
-                inline for (s.fields) |field| {
-                    @field(res, field.name) = self.gen(field.type);
+                inline for (s.field_names, s.field_types) |name, FieldType| {
+                    @field(res, name) = self.gen(FieldType);
                 }
                 return res;
             },
@@ -149,4 +149,30 @@ test "testing/quick: check and checkEqual property verification" {
     }.g;
 
     try checkEqual(f_mult, g_shift, .{ .max_count = 100 });
+}
+
+test "testing/quick: Generator fills struct fields" {
+    const Point = struct {
+        x: u8,
+        y: bool,
+        tag: [2]u4,
+    };
+    const Custom = struct {
+        v: u32,
+
+        pub fn generate(rand: std.Random) @This() {
+            _ = rand;
+            return .{ .v = 7 };
+        }
+    };
+    const Pair = struct { p: Point, c: Custom };
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const gen = Generator.init(prng.random());
+    const pair = gen.gen(Pair);
+    try std.testing.expectEqual(@as(u32, 7), pair.c.v);
+
+    var same_prng = std.Random.DefaultPrng.init(42);
+    const same = Generator.init(same_prng.random()).gen(Pair);
+    try std.testing.expect(std.meta.eql(pair, same));
 }
