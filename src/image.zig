@@ -105,13 +105,22 @@ pub const Rectangle = struct {
     }
 
     pub fn inset(self: Rectangle, n: i32) Rectangle {
-        if (self.dx() < 2 * n) {
-            return Rectangle.rect((self.min.x + self.max.x) / 2, self.min.y, (self.min.x + self.max.x) / 2, self.max.y);
+        var r = self;
+        if (r.dx() < 2 * n) {
+            r.min.x = @divTrunc(r.min.x + r.max.x, 2);
+            r.max.x = r.min.x;
+        } else {
+            r.min.x += n;
+            r.max.x -= n;
         }
-        if (self.dy() < 2 * n) {
-            return Rectangle.rect(self.min.x, (self.min.y + self.max.y) / 2, self.max.x, (self.min.y + self.max.y) / 2);
+        if (r.dy() < 2 * n) {
+            r.min.y = @divTrunc(r.min.y + r.max.y, 2);
+            r.max.y = r.min.y;
+        } else {
+            r.min.y += n;
+            r.max.y -= n;
         }
-        return Rectangle.rect(self.min.x + n, self.min.y + n, self.max.x - n, self.max.y - n);
+        return r;
     }
 };
 
@@ -278,6 +287,12 @@ test "point and rectangle geometry" {
 
     const un = r1.unionRect(r2);
     try testing.expect(un.eq(rect(0, 0, 150, 150)));
+
+    try testing.expect(r1.inset(10).eq(rect(10, 10, 90, 90)));
+    try testing.expect(r1.inset(-10).eq(rect(-10, -10, 110, 110)));
+    try testing.expect(rect(0, 0, 3, 100).inset(2).eq(rect(1, 2, 1, 98)));
+    // Like Go, the midpoint truncates toward zero: (-5 + -2) / 2 == -3.
+    try testing.expect(rect(-5, 0, -2, 3).inset(2).eq(rect(-3, 1, -3, 1)));
 }
 
 test "RGBAImage and subImage" {
