@@ -35,32 +35,99 @@ pub const Duration = enum(i64) {
         return self.minutes() / 60.0;
     }
 
+    /// String returns a string representing the duration in the form "72h3m0.5s",
+    /// like Go's time.Duration.String. Durations less than one second use a smaller
+    /// unit (ms, µs, ns) so that the leading digit is non-zero. The zero duration
+    /// formats as "0s". The caller owns the returned slice.
     pub fn string(self: Duration, allocator: Allocator) Allocator.Error![]u8 {
+        const ns = @intFromEnum(self);
+        if (ns == 0) return try allocator.dupe(u8, "0s");
+
         var buf: [32]u8 = undefined;
-        const total_ns = @intFromEnum(self);
-        if (total_ns == 0) {
-            return try allocator.dupe(u8, "0s");
+        var u: u64 = @abs(ns);
+        var w: usize = buf.len;
+
+        if (u < std.time.ns_per_s) {
+            w -= 1;
+            buf[w] = 's';
+            var prec: usize = undefined;
+            if (u < std.time.ns_per_us) {
+                prec = 0;
+                w -= 1;
+                buf[w] = 'n';
+            } else if (u < std.time.ns_per_ms) {
+                prec = 3;
+                w -= "µ".len;
+                @memcpy(buf[w..][0.."µ".len], "µ");
+            } else {
+                prec = 6;
+                w -= 1;
+                buf[w] = 'm';
+            }
+            w, u = fmtFrac(buf[0..w], u, prec);
+            w = fmtInt(buf[0..w], u);
+        } else {
+            w -= 1;
+            buf[w] = 's';
+            w, u = fmtFrac(buf[0..w], u, 9);
+            w = fmtInt(buf[0..w], u % 60);
+            u /= 60;
+            if (u > 0) {
+                w -= 1;
+                buf[w] = 'm';
+                w = fmtInt(buf[0..w], u % 60);
+                u /= 60;
+                if (u > 0) {
+                    w -= 1;
+                    buf[w] = 'h';
+                    w = fmtInt(buf[0..w], u);
+                }
+            }
         }
 
-        var u = total_ns;
-        var is_neg = false;
-        if (u < 0) {
-            is_neg = true;
-            u = -u;
+        if (ns < 0) {
+            w -= 1;
+            buf[w] = '-';
         }
-
-        const out = if (u < 1000)
-            try std.fmt.bufPrint(&buf, "{s}{d}ns", .{ if (is_neg) "-" else "", u })
-        else if (u < 1_000_000)
-            try std.fmt.bufPrint(&buf, "{s}{d}us", .{ if (is_neg) "-" else "", @divTrunc(u, 1000) })
-        else if (u < 1_000_000_000)
-            try std.fmt.bufPrint(&buf, "{s}{d}ms", .{ if (is_neg) "-" else "", @divTrunc(u, 1_000_000) })
-        else
-            try std.fmt.bufPrint(&buf, "{s}{d}s", .{ if (is_neg) "-" else "", @divTrunc(u, 1_000_000_000) });
-
-        return try allocator.dupe(u8, out);
+        return try allocator.dupe(u8, buf[w..]);
     }
 };
+
+/// Formats the fraction of v / 10^prec (e.g. ".12345") into the tail of buf, omitting
+/// trailing zeros, and omitting the decimal point when the fraction is 0.
+/// Returns the index where the output begins and v / 10^prec.
+fn fmtFrac(buf: []u8, v: u64, prec: usize) struct { usize, u64 } {
+    var w = buf.len;
+    var rest = v;
+    var print = false;
+    for (0..prec) |_| {
+        const digit: u8 = @intCast(rest % 10);
+        print = print or digit != 0;
+        if (print) {
+            w -= 1;
+            buf[w] = digit + '0';
+        }
+        rest /= 10;
+    }
+    if (print) {
+        w -= 1;
+        buf[w] = '.';
+    }
+    return .{ w, rest };
+}
+
+/// Formats v into the tail of buf and returns the index where the output begins.
+fn fmtInt(buf: []u8, v: u64) usize {
+    var w = buf.len;
+    var rest = v;
+    while (true) {
+        w -= 1;
+        buf[w] = @as(u8, @intCast(rest % 10)) + '0';
+        rest /= 10;
+        if (rest == 0) break;
+    }
+    return w;
+}
 
 pub const Error = error{
     InvalidDuration,
@@ -180,4 +247,30 @@ test "time.parseDuration Go test cases" {
     try testing.expectError(Error.InvalidDuration, parseDuration(""));
     try testing.expectError(Error.InvalidDuration, parseDuration("xyz"));
     try testing.expectError(Error.InvalidDuration, parseDuration("10")); // missing unit
+}
+
+test "time.Duration.string Go test cases" {
+    const testing = std.testing;
+    const minute: i64 = 60 * std.time.ns_per_s;
+    const hour: i64 = 60 * minute;
+    const cases = [_]struct { []const u8, i64 }{
+        .{ "0s", 0 },
+        .{ "1ns", 1 },
+        .{ "1.1µs", 1100 },
+        .{ "2.2ms", 2_200_000 },
+        .{ "3.3s", 3_300_000_000 },
+        .{ "4m5s", 4 * minute + 5 * std.time.ns_per_s },
+        .{ "4m5.001s", 4 * minute + 5001 * std.time.ns_per_ms },
+        .{ "5h6m7.001s", 5 * hour + 6 * minute + 7001 * std.time.ns_per_ms },
+        .{ "8m0.000000001s", 8 * minute + 1 },
+        .{ "-1.5s", -1_500_000_000 },
+        .{ "2562047h47m16.854775807s", std.math.maxInt(i64) },
+        .{ "-2562047h47m16.854775808s", std.math.minInt(i64) },
+    };
+    for (cases) |c| {
+        const want, const ns = c;
+        const got = try (@as(Duration, @enumFromInt(ns))).string(testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
 }
