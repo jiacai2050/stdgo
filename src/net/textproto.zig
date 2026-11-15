@@ -180,6 +180,7 @@ pub const Reader = struct {
 
     /// Reads a possibly continued line from r, per RFC 822 / RFC 2822.
     /// A continued line begins with a space or tab on subsequent lines.
+    /// Peeks at the byte after each line, so r must have a buffer of at least one byte.
     pub fn readContinuedLine(self: *Reader) anyerror!?[]u8 {
         const first = try self.readLine() orelse return null;
         var full = bytes.Buffer.init(self.allocator);
@@ -190,13 +191,14 @@ pub const Reader = struct {
         var continuation_count: usize = 0;
         while (continuation_count < continued_lines_max) : (continuation_count += 1) {
             // Peek at next character to see if it's space or tab
-            const b = self.r.takeByte() catch |err| {
+            const b = self.r.peekByte() catch |err| {
                 if (err == error.EndOfStream or err == io.Error.EndOfStream) break;
                 return err;
             };
 
             if (b == ' ' or b == '\t') {
                 // Continuation line: read rest of line and append with single leading space
+                self.r.toss(1);
                 const rest = try self.readLine() orelse "";
                 defer self.allocator.free(rest);
 
@@ -207,12 +209,7 @@ pub const Reader = struct {
                 try full.writeByte(' ');
                 _ = try full.write(rest[start..]);
             } else {
-                // Not a continuation line; put back the byte if possible or simulate by seeking back 1
-                // Since Io.Reader does not have putBack, we use takeByte's peek equivalent or buffer.
-                // In standard std.Io.Reader, we can seek back 1 if seeker, or we parse via buffered reader.
-                // For general stream compatibility, we return full line:
-                // To avoid requiring seeker, readContinuedLine handles continuation by checking buffered bytes.
-                _ = self.r.seek(-1, .current) catch {};
+                // Not a continuation line; the peeked byte stays in the reader for the next call.
                 break;
             }
         } else {
@@ -397,6 +394,29 @@ test "Reader: readLine and readMIMEHeader" {
     try testing.expectEqual(@as(usize, 2), tags.len);
     try testing.expectEqualStrings("alpha", tags[0]);
     try testing.expectEqualStrings("beta", tags[1]);
+}
+
+test "Reader: readContinuedLine" {
+    const testing = std.testing;
+    const raw =
+        "Subject: hello\r\n" ++
+        " big\r\n" ++
+        "\t  world\r\n" ++
+        "Next: line\r\n";
+
+    var r = @import("../bytes/reader.zig").Reader.init(raw);
+    var tp_reader = Reader.init(testing.allocator, r.reader());
+
+    const first = (try tp_reader.readContinuedLine()).?;
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("Subject: hello big world", first);
+
+    // The byte peeked after the continued line is not consumed.
+    const second = (try tp_reader.readContinuedLine()).?;
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings("Next: line", second);
+
+    try testing.expectEqual(@as(?[]u8, null), try tp_reader.readContinuedLine());
 }
 
 test "Reader: readDotBytes" {
