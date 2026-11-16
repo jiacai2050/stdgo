@@ -86,6 +86,18 @@ pub const ResponseBodyReader = struct {
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *ResponseBodyReader = @fieldParentPtr("interface", r);
+        // Writers with an empty buffer (e.g. hash writers) only accept bytes
+        // through `drain`, so read into scratch space and forward them.
+        if (w.buffer.len == 0) {
+            var tmp: [4096]u8 = undefined;
+            const n = self.read(limit.slice(&tmp)) catch |err| {
+                self.read_err = err;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            try w.writeAll(tmp[0..n]);
+            return n;
+        }
         const dest = limit.slice(try w.writableSliceGreedy(1));
         const n = self.read(dest) catch |err| {
             self.read_err = err;
@@ -384,4 +396,21 @@ test "ResponseBodyReader.reader reads fixed and chunked bodies" {
     const chunked_len = try r.readSliceShort(&out);
     try testing.expectEqualStrings("lo world", out[0..chunked_len]);
     try testing.expectError(error.EndOfStream, r.takeByte());
+}
+
+test "ResponseBodyReader.reader streams into writers with an empty buffer" {
+    const testing = std.testing;
+    const Digest = @import("../../crypto/sha256.zig").Digest;
+    var buf: [4]u8 = undefined;
+
+    var body = ResponseBodyReader.init(undefined, undefined, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    var digest = Digest.init();
+    const n = try body.reader(&buf).streamRemaining(digest.writer());
+    try testing.expectEqual(@as(usize, 11), n);
+
+    var got: [32]u8 = undefined;
+    digest.sum(&got);
+    var want: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("hello world", &want, .{});
+    try testing.expectEqualSlices(u8, &want, &got);
 }
