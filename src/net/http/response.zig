@@ -46,7 +46,9 @@ pub const ResponseBodyReader = struct {
     leftover: []const u8,
     leftover_pos: usize = 0,
     gzip_state: ?*GzipState = null,
-    interface: std.Io.Reader = .fixed(&.{}),
+    /// Preallocated reader interface storage, populated when `reader()` is called.
+    /// Do not access this field directly before calling `reader()`.
+    interface: std.Io.Reader = undefined,
     read_err: ?anyerror = null,
 
     pub fn init(
@@ -66,6 +68,8 @@ pub const ResponseBodyReader = struct {
             .leftover = leftover,
             .leftover_pos = 0,
             .gzip_state = null,
+            .interface = undefined,
+            .read_err = null,
         };
     }
 
