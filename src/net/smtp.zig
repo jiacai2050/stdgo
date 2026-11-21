@@ -31,7 +31,7 @@ pub fn sendMail(
     const hp = try hostport.splitHostPort(addr);
     const host = hp.host;
 
-    const c = try conn_mod.dial(allocator, io, "tcp", addr);
+    const c = try conn_mod.dial(allocator, io, "tcp", addr, .none);
     const cl = try Client.init(allocator, c, host);
     defer cl.close();
 

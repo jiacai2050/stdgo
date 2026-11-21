@@ -37,7 +37,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bytes-strings", .file = "examples/bytes_strings.zig" },
         .{ .name = "compress", .file = "examples/compress.zig" },
         .{ .name = "container", .file = "examples/container.zig" },
-        .{ .name = "context", .file = "examples/context.zig" },
         .{ .name = "database-sql", .file = "examples/database_sql.zig" },
         .{ .name = "crypto", .file = "examples/crypto.zig" },
         .{ .name = "encoding", .file = "examples/encoding.zig" },

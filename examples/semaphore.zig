@@ -5,28 +5,27 @@
 const std = @import("std");
 const stdgo = @import("stdgo");
 const sync = stdgo.sync;
-const context = stdgo.context;
 
 pub fn main(init: std.process.Init) !void {
     std.debug.print("=== stdgo sync.semaphore (Weighted) Demo ===\n\n", .{});
 
     // 1. Initialize a weighted semaphore with capacity 4 driven by init.io
-    var sem = sync.Semaphore.init(4, init.io);
+    var sem = sync.Semaphore.init(4);
 
     std.debug.print("1. Semaphore created with total capacity: 4\n\n", .{});
 
     // 2. TryAcquire demonstration
     std.debug.print("2. TryAcquire tests:\n", .{});
-    const ok1 = sem.tryAcquire(3);
+    const ok1 = sem.tryAcquire(init.io, 3);
     std.debug.print("   -> tryAcquire(3): {s} (cur = 3/4)\n", .{if (ok1) "SUCCESS" else "FAILED"});
 
-    const ok2 = sem.tryAcquire(2);
+    const ok2 = sem.tryAcquire(init.io, 2);
     std.debug.print("   -> tryAcquire(2): {s} (insufficient capacity, 1 remaining)\n", .{if (ok2) "SUCCESS" else "FAILED"});
 
-    const ok3 = sem.tryAcquire(1);
+    const ok3 = sem.tryAcquire(init.io, 1);
     std.debug.print("   -> tryAcquire(1): {s} (cur = 4/4)\n", .{if (ok3) "SUCCESS" else "FAILED"});
 
-    sem.release(4);
+    sem.release(init.io, 4);
     std.debug.print("   -> Released 4 weight (cur = 0/4)\n\n", .{});
 
     // 3. Concurrent Task Rate Limiting
@@ -36,11 +35,11 @@ pub fn main(init: std.process.Init) !void {
         id: usize,
         weight: i64,
         sem_ptr: *sync.Semaphore,
+        io: std.Io,
 
         fn run(self: @This()) void {
-            const bg_ctx = context.background();
-            self.sem_ptr.acquire(bg_ctx, self.weight) catch return;
-            defer self.sem_ptr.release(self.weight);
+            self.sem_ptr.acquire(self.io, self.weight, .none) catch return;
+            defer self.sem_ptr.release(self.io, self.weight);
 
             std.debug.print("   [Task {d}] Acquired weight {d}. Processing...\n", .{ self.id, self.weight });
             var dummy: u64 = 0;
@@ -60,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
             .id = i + 1,
             .weight = weights[i],
             .sem_ptr = &sem,
+            .io = init.io,
         }});
     }
 

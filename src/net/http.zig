@@ -257,7 +257,7 @@ test "http custom RoundTripper injection and closeIdleConnections" {
         calls: usize = 0,
         idle_closed: bool = false,
 
-        fn roundTrip(ctx: *anyopaque, _: *Request) anyerror!Response {
+        fn roundTrip(ctx: *anyopaque, _: *Request, _: @import("../io/deadline.zig").Deadline) anyerror!Response {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return error.MockNetworkError;
@@ -288,7 +288,7 @@ test "http custom RoundTripper injection and closeIdleConnections" {
     var req = try newRequest(testing.allocator, .GET, "http://mock.local/test", null);
     defer req.deinit();
 
-    const res = c.do(&req);
+    const res = c.do(&req, .none);
     try testing.expectError(error.MockNetworkError, res);
     try testing.expectEqual(@as(usize, 1), mock.calls);
 

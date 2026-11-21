@@ -12,6 +12,8 @@ const CookieJar = @import("jar.zig").CookieJar;
 const Status = @import("status.zig").Status;
 const Method = @import("method.zig").Method;
 const time_mod = @import("../../time.zig");
+const deadline_mod = @import("../../io/deadline.zig");
+const io_util = @import("../io_util.zig");
 
 pub const ClientOptions = struct {
     proxy_url: ?[]const u8 = null,
@@ -22,6 +24,8 @@ pub const ClientOptions = struct {
     round_tripper: ?RoundTripper = null,
     max_redirects: u8 = 10,
     jar: ?*CookieJar = null,
+    /// Total request budget, including redirects and response body reads.
+    /// Custom round trippers and request body readers must cooperate with cancellation.
     timeout_ns: ?u64 = null,
     timeout: ?time_mod.Duration = null,
     check_redirect: ?*const fn (ctx_ptr: ?*anyopaque, req: *Request, via: []const *const Request) anyerror!void = null,
@@ -40,7 +44,7 @@ pub const Client = struct {
         var effective_timeout_ns = options.timeout_ns;
         if (options.timeout) |d| {
             if (effective_timeout_ns == null) {
-                effective_timeout_ns = @intCast(d.nanoseconds());
+                if (d.nanoseconds() > 0) effective_timeout_ns = @intCast(d.nanoseconds());
             }
         }
         if (options.proxy_url) |p| {
@@ -53,10 +57,6 @@ pub const Client = struct {
         if (trans_opts.env_lookup == null and options.env_lookup != null) {
             trans_opts.env_lookup = options.env_lookup;
         }
-        if (trans_opts.timeout_ns == null and effective_timeout_ns != null) {
-            trans_opts.timeout_ns = effective_timeout_ns;
-        }
-
         var client_opts = options;
         client_opts.timeout_ns = effective_timeout_ns;
 
@@ -84,10 +84,10 @@ pub const Client = struct {
         }
     }
 
-    pub fn do(self: *Client, req: *Request) !Response {
-        const start_ns = std.Io.Clock.boot.now(self.io).nanoseconds;
-        const has_timeout = self.options.timeout_ns != null;
-        const timeout_ns = self.options.timeout_ns orelse 0;
+    pub fn do(self: *Client, req: *Request, deadline: deadline_mod.Deadline) !Response {
+        try deadline.validate();
+        try self.io.checkCancel();
+        const request_deadline = deadline.earlier(io_util.fromTimeout(self.io, self.options.timeout_ns));
 
         var current_url = try self.allocator.dupe(u8, req.url);
         defer self.allocator.free(current_url);
@@ -107,12 +107,8 @@ pub const Client = struct {
         }
 
         while (true) {
-            if (req.ctx) |c| {
-                if (c.err()) |e| return e;
-            }
-            if (has_timeout and (std.Io.Clock.boot.now(self.io).nanoseconds -% start_ns >= timeout_ns)) {
-                return error.Timeout;
-            }
+            try self.io.checkCancel();
+            try request_deadline.check(self.io);
 
             const target = try parseUrlTarget(current_url);
 
@@ -153,14 +149,14 @@ pub const Client = struct {
             } else if (current_body_reader) |r| {
                 try round_trip_req.setBodyReader(r, req.content_length);
             }
-            if (req.ctx) |c| {
-                round_trip_req.withContext(c);
-            }
-
             var resp = if (self.custom_round_tripper) |rt|
-                try rt.roundTrip(round_trip_req)
+                try rt.roundTrip(round_trip_req, request_deadline)
             else
-                try self.transport.roundTrip(round_trip_req);
+                try self.transport.roundTripWithBudget(round_trip_req, request_deadline);
+            request_deadline.check(self.io) catch |err| {
+                resp.close();
+                return err;
+            };
 
             // Collect Set-Cookie into jar
             if (self.options.jar) |jar| {
@@ -189,6 +185,10 @@ pub const Client = struct {
                 }
 
                 const location = resp.header.get("Location") orelse {
+                    request_deadline.check(self.io) catch |err| {
+                        resp.close();
+                        return err;
+                    };
                     return resp;
                 };
 
@@ -249,6 +249,10 @@ pub const Client = struct {
                 continue;
             }
 
+            request_deadline.check(self.io) catch |err| {
+                resp.close();
+                return err;
+            };
             round_trip_req.deinit();
             self.allocator.destroy(round_trip_req);
             return resp;
@@ -258,13 +262,13 @@ pub const Client = struct {
     pub fn get(self: *Client, url: []const u8) !Response {
         var req = Request.init(self.allocator, .GET, url);
         defer req.deinit();
-        return self.do(&req);
+        return self.do(&req, .none);
     }
 
     pub fn head(self: *Client, url: []const u8) !Response {
         var req = Request.init(self.allocator, .HEAD, url);
         defer req.deinit();
-        return self.do(&req);
+        return self.do(&req, .none);
     }
 
     pub fn post(self: *Client, url: []const u8, content_type: []const u8, body: []const u8) !Response {
@@ -272,7 +276,7 @@ pub const Client = struct {
         defer req.deinit();
         try req.header.set("Content-Type", content_type);
         try req.setBody(body);
-        return self.do(&req);
+        return self.do(&req, .none);
     }
 
     pub fn put(self: *Client, url: []const u8, content_type: []const u8, body: []const u8) !Response {
@@ -280,13 +284,13 @@ pub const Client = struct {
         defer req.deinit();
         try req.header.set("Content-Type", content_type);
         try req.setBody(body);
-        return self.do(&req);
+        return self.do(&req, .none);
     }
 
     pub fn delete(self: *Client, url: []const u8) !Response {
         var req = Request.init(self.allocator, .DELETE, url);
         defer req.deinit();
-        return self.do(&req);
+        return self.do(&req, .none);
     }
 
     pub fn patch(self: *Client, url: []const u8, content_type: []const u8, body: []const u8) !Response {
@@ -294,7 +298,7 @@ pub const Client = struct {
         defer req.deinit();
         try req.header.set("Content-Type", content_type);
         try req.setBody(body);
-        return self.do(&req);
+        return self.do(&req, .none);
     }
 
     pub fn postForm(self: *Client, url: []const u8, data: []const u8) !Response {
@@ -397,7 +401,7 @@ test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
         defer req.deinit();
         try req.header.set("X-Stdgo-Test", "Zig-First-Principles");
 
-        var resp = c.do(&req) catch |err| {
+        var resp = c.do(&req, .none) catch |err| {
             std.debug.print("edgebin /headers skip: {s}\n", .{@errorName(err)});
             return error.SkipZigTest;
         };
@@ -595,9 +599,8 @@ test "Client: HTTP proxy and HTTPS CONNECT tunneling via 127.0.0.1:8888" {
     try testing.expect(std.mem.indexOf(u8, body, "\"country\":") != null);
 }
 
-test "Client: Context cancellation aborts request" {
+test "Client: expired and invalid deadlines fail before request" {
     const testing = std.testing;
-    const context_mod = @import("../../context.zig");
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -606,18 +609,12 @@ test "Client: Context cancellation aborts request" {
     var c = Client.init(testing.allocator, io, .{});
     defer c.deinit();
 
-    var cancel_ctx = try context_mod.withCancel(testing.allocator, context_mod.background());
-    defer testing.allocator.destroy(cancel_ctx);
-
-    // Cancel context immediately
-    cancel_ctx.cancel();
-
     var req = try newRequest(testing.allocator, .GET, "http://127.0.0.1:9", null);
     defer req.deinit();
-    req.withContext(cancel_ctx.context());
-
-    const res = c.do(&req);
-    try testing.expectError(context_mod.Error.Canceled, res);
+    const deadline = deadline_mod.Deadline.after(io, .zero);
+    try testing.expectError(error.Timeout, c.do(&req, deadline));
+    const invalid: deadline_mod.Deadline = .{ .timestamp = .now(io, .real) };
+    try testing.expectError(error.InvalidDeadline, c.do(&req, invalid));
 }
 
 test "Client: CheckRedirect and cross-origin header stripping" {
@@ -711,7 +708,7 @@ test "Client: CheckRedirect and cross-origin header stripping" {
     defer req.deinit();
     try req.setHeader("Authorization", "Bearer sensitive-token");
 
-    var resp = try c.do(&req);
+    var resp = try c.do(&req, .none);
     defer resp.close();
 
     t1.join();
@@ -771,7 +768,7 @@ test "Client: max_redirects exceeded returns error.TooManyRedirects without doub
     var req = try newRequest(testing.allocator, .GET, start_url, null);
     defer req.deinit();
 
-    const res = c.do(&req);
+    const res = c.do(&req, .none);
     try testing.expectError(error.TooManyRedirects, res);
 
     s_thread.join();
@@ -856,7 +853,7 @@ test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" 
     });
     defer c.deinit();
 
-    var resp = try c.do(&req);
+    var resp = try c.do(&req, .none);
     defer resp.close();
 
     s_thread.join();
@@ -942,4 +939,452 @@ test "Client: Transparent response gzip decompression" {
     const body = try resp.readAllAlloc(1024);
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("Hello world\n", body);
+}
+
+test "Client: timeout interrupts socket reads and writes" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Scenario = enum { headers, body, gzip, upload, tls, socks, connect_proxy, transport_headers, zero_timeout, tls_phase, header_phase };
+    const Server = struct {
+        fn run(server: *std.Io.net.Server, server_io: std.Io, scenario: Scenario) !void {
+            var stream = try server.accept(server_io);
+            defer stream.close(server_io);
+            if (scenario == .body or scenario == .gzip or scenario == .zero_timeout) {
+                var read_buf: [1024]u8 = undefined;
+                var reader = stream.reader(server_io, &read_buf);
+                while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                    try reader.interface.fillMore();
+                }
+                var write_buf: [512]u8 = undefined;
+                var writer = stream.writer(server_io, &write_buf);
+                if (scenario == .zero_timeout) {
+                    try std.Io.sleep(server_io, .fromMilliseconds(250), .awake);
+                    try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                } else if (scenario == .body) {
+                    try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na");
+                } else {
+                    try writer.interface.writeAll(
+                        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 30\r\n\r\n" ++
+                            "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03",
+                    );
+                }
+                try writer.interface.flush();
+            }
+            try std.Io.sleep(server_io, .fromMilliseconds(700), .awake);
+        }
+    };
+
+    for ([_]Scenario{ .headers, .body, .gzip, .upload, .tls, .socks, .connect_proxy, .transport_headers, .zero_timeout, .tls_phase, .header_phase }) |scenario| {
+        const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var server = try address.listen(io, .{ .reuse_address = true });
+        defer server.deinit(io);
+        const url = try testing.allocator.print("{s}://127.0.0.1:{d}/", .{
+            if (scenario == .tls or scenario == .connect_proxy or scenario == .tls_phase) "https" else "http",
+            server.socket.address.ip4.port,
+        });
+        defer testing.allocator.free(url);
+        const proxy = try testing.allocator.print("{s}://127.0.0.1:{d}", .{
+            if (scenario == .connect_proxy) "http" else "socks5h",
+            server.socket.address.ip4.port,
+        });
+        defer testing.allocator.free(proxy);
+
+        var client = Client.init(testing.allocator, io, .{
+            .proxy_from_env = false,
+            .proxy_url = if (scenario == .socks or scenario == .connect_proxy) proxy else null,
+            .transport = if (scenario == .transport_headers)
+                .{ .timeout_ns = 200 * std.time.ns_per_ms }
+            else if (scenario == .tls_phase)
+                .{ .tls_handshake_timeout = @fromBackingInt(200 * std.time.ns_per_ms) }
+            else if (scenario == .header_phase)
+                .{ .response_header_timeout = @fromBackingInt(200 * std.time.ns_per_ms) }
+            else
+                null,
+            .timeout_ns = if (scenario == .transport_headers or scenario == .tls_phase or scenario == .header_phase)
+                null
+            else if (scenario == .zero_timeout)
+                0
+            else
+                200 * std.time.ns_per_ms,
+        });
+        defer client.deinit();
+        var req = Request.init(testing.allocator, if (scenario == .upload) .POST else .GET, url);
+        defer req.deinit();
+        const upload = try testing.allocator.alloc(u8, if (scenario == .upload) 16 * 1024 * 1024 else 0);
+        defer testing.allocator.free(upload);
+        @memset(upload, 0x61);
+        if (scenario == .upload) try req.setBody(upload);
+        var server_task = try io.concurrent(Server.run, .{ &server, io, scenario });
+        defer server_task.cancel(io) catch |err| switch (err) {
+            error.Canceled => {},
+            else => std.debug.panic("HTTP test server: {s}", .{@errorName(err)}),
+        };
+
+        if (scenario == .zero_timeout) {
+            var response = try client.do(&req, .none);
+            response.close();
+        } else if (scenario == .body or scenario == .gzip) {
+            var response = try client.do(&req, .none);
+            defer response.close();
+            var bytes: [64]u8 = undefined;
+            if (scenario == .body) {
+                try testing.expectEqual(@as(usize, 1), try response.body.read(&bytes));
+            }
+            try testing.expectError(error.Timeout, response.body.read(&bytes));
+            var reader_buffer: [32]u8 = undefined;
+            try testing.expectError(error.ReadFailed, response.reader(&reader_buffer).takeByte());
+            try testing.expectEqual(error.Timeout, response.body.read_err.?);
+            response.close();
+            try testing.expectEqual(@as(usize, 0), client.transport.pool.entries.items.len);
+        } else {
+            try testing.expectError(error.Timeout, client.do(&req, .none));
+        }
+    }
+}
+
+test "Client: timeout budget spans redirects" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const Server = struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io) !void {
+            for (0..2) |index| {
+                var stream = try s.accept(server_io);
+                defer stream.close(server_io);
+                var read_buf: [1024]u8 = undefined;
+                var reader = stream.reader(server_io, &read_buf);
+                while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                    try reader.interface.fillMore();
+                }
+                try std.Io.sleep(server_io, .fromMilliseconds(250), .awake);
+                if (index == 0) {
+                    var write_buf: [256]u8 = undefined;
+                    var writer = stream.writer(server_io, &write_buf);
+                    try writer.interface.writeAll("HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    try writer.interface.flush();
+                }
+            }
+        }
+    };
+    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    defer testing.allocator.free(url);
+    var client = Client.init(testing.allocator, io, .{
+        .proxy_from_env = false,
+        .timeout_ns = 400 * std.time.ns_per_ms,
+    });
+    defer client.deinit();
+    var server_task = try io.concurrent(Server.run, .{ &server, io });
+    defer server_task.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => std.debug.panic("HTTP test server: {s}", .{@errorName(err)}),
+    };
+    try testing.expectError(error.Timeout, client.get(url));
+}
+
+test "Client: body deadline remains active after headers arrive" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const Server = struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io) !void {
+            var stream = try s.accept(server_io);
+            defer stream.close(server_io);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(server_io, &read_buf);
+            while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                try reader.interface.fillMore();
+            }
+            var write_buf: [128]u8 = undefined;
+            var writer = stream.writer(server_io, &write_buf);
+            try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+            try writer.interface.flush();
+            try std.Io.sleep(server_io, .fromMilliseconds(400), .awake);
+        }
+    };
+    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    defer testing.allocator.free(url);
+    var client = Client.init(testing.allocator, io, .{
+        .proxy_from_env = false,
+        .timeout_ns = 120 * std.time.ns_per_ms,
+    });
+    defer client.deinit();
+    var server_task = try io.concurrent(Server.run, .{ &server, io });
+    defer server_task.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => std.debug.panic("HTTP test server: {s}", .{@errorName(err)}),
+    };
+    var response = try client.get(url);
+    defer response.close();
+    try std.Io.sleep(io, .fromMilliseconds(200), .awake);
+    var bytes: [2]u8 = undefined;
+    try testing.expectError(error.Timeout, response.body.read(&bytes));
+}
+
+test "Client: Expect 100-continue handles interim responses and early rejection" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Scenario = enum { accepted, partial_timeout, rejected, immediate };
+    const Server = struct {
+        fn run(server: *std.Io.net.Server, server_io: std.Io, scenario: Scenario) !void {
+            var stream = try server.accept(server_io);
+            defer stream.close(server_io);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(server_io, &read_buf);
+            while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                try reader.interface.fillMore();
+            }
+            const end = std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n").? + 4;
+            reader.interface.toss(end);
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(server_io, &write_buf);
+            switch (scenario) {
+                .accepted => try writer.interface.writeAll(
+                    "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n",
+                ),
+                .partial_timeout => try writer.interface.writeAll("HTTP/1.1 100"),
+                .rejected => try writer.interface.writeAll(
+                    "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n",
+                ),
+                .immediate => {},
+            }
+            try writer.interface.flush();
+            if (scenario == .rejected) {
+                try testing.expectEqual(@as(usize, 0), reader.interface.buffered().len);
+                try testing.expectError(error.EndOfStream, reader.interface.fillMore());
+                return;
+            }
+            try reader.interface.fill(3);
+            try testing.expectEqualStrings("abc", reader.interface.buffered()[0..3]);
+            if (scenario == .partial_timeout) {
+                try writer.interface.writeAll(" Continue\r\n\r\n");
+            }
+            try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            try writer.interface.flush();
+        }
+    };
+    for ([_]Scenario{ .accepted, .partial_timeout, .rejected, .immediate }) |scenario| {
+        const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var server = try address.listen(io, .{ .reuse_address = true });
+        defer server.deinit(io);
+        const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+        defer testing.allocator.free(url);
+        var client = Client.init(testing.allocator, io, .{
+            .proxy_from_env = false,
+            .timeout_ns = 2 * std.time.ns_per_s,
+            .transport = .{
+                .expect_continue_timeout = if (scenario == .immediate)
+                    null
+                else
+                    @fromBackingInt(50 * std.time.ns_per_ms),
+            },
+        });
+        defer client.deinit();
+        var server_task = try io.concurrent(Server.run, .{ &server, io, scenario });
+        defer server_task.cancel(io) catch |err| switch (err) {
+            error.Canceled => {},
+            else => std.debug.panic("100-continue test server: {s}", .{@errorName(err)}),
+        };
+        var request = Request.init(testing.allocator, .POST, url);
+        defer request.deinit();
+        try request.setBody("abc");
+        try request.header.add("Expect", "100-continue");
+        var response = try client.do(&request, .none);
+        try testing.expectEqual(@as(u16, if (scenario == .rejected) 417 else 200), response.status_code);
+        response.close();
+        try server_task.await(io);
+    }
+}
+
+test "Client: custom round tripper receives the earliest request deadline" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Custom = struct {
+        received: deadline_mod.Deadline = .none,
+
+        fn roundTrip(ctx: *anyopaque, _: *Request, deadline: deadline_mod.Deadline) anyerror!Response {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.received = deadline;
+            return error.TestRoundTrip;
+        }
+    };
+    var custom: Custom = .{};
+    const vtable: RoundTripper.VTable = .{ .roundTrip = Custom.roundTrip };
+    var client = Client.init(testing.allocator, io, .{
+        .round_tripper = .{ .ptr = &custom, .vtable = &vtable },
+        .timeout_ns = 30 * std.time.ns_per_s,
+    });
+    defer client.deinit();
+    var req = Request.init(testing.allocator, .GET, "http://example.test/");
+    defer req.deinit();
+
+    const deadline = deadline_mod.Deadline.after(io, .fromSeconds(1));
+    try testing.expectError(error.TestRoundTrip, client.do(&req, deadline));
+    try testing.expectEqual(deadline.timestamp.?, custom.received.timestamp.?);
+    try testing.expectError(error.TestRoundTrip, client.do(&req, .none));
+    try testing.expect(!custom.received.isNone());
+    try custom.received.check(io);
+}
+
+test "Client: cancellation interrupts a timed socket read" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var accepted: std.Io.Event = .unset;
+    const Server = struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io, ready: *std.Io.Event) !void {
+            var stream = try s.accept(server_io);
+            defer stream.close(server_io);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(server_io, &read_buf);
+            while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                try reader.interface.fillMore();
+            }
+            ready.set(server_io);
+            try std.Io.sleep(server_io, .fromMilliseconds(500), .awake);
+        }
+    };
+    const Worker = struct {
+        fn run(client: *Client, url: []const u8) !void {
+            var response = try client.get(url);
+            response.close();
+        }
+    };
+    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    defer testing.allocator.free(url);
+    var client = Client.init(testing.allocator, io, .{
+        .proxy_from_env = false,
+        .timeout_ns = 10 * std.time.ns_per_s,
+    });
+    defer client.deinit();
+    var server_task = try io.concurrent(Server.run, .{ &server, io, &accepted });
+    defer server_task.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => std.debug.panic("HTTP test server: {s}", .{@errorName(err)}),
+    };
+    var future = try io.concurrent(Worker.run, .{ &client, url });
+    try accepted.wait(io);
+    try testing.expectError(error.Canceled, future.cancel(io));
+}
+
+test "Client: pooled connections receive a fresh request deadline" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const Server = struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io) !void {
+            var stream = try s.accept(server_io);
+            defer stream.close(server_io);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(server_io, &read_buf);
+            var write_buf: [128]u8 = undefined;
+            var writer = stream.writer(server_io, &write_buf);
+            for (0..2) |_| {
+                while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                    try reader.interface.fillMore();
+                }
+
+                const end = std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n").? + 4;
+                reader.interface.toss(end);
+                try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+                try writer.interface.flush();
+            }
+        }
+    };
+    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    defer testing.allocator.free(url);
+    var client = Client.init(testing.allocator, io, .{
+        .proxy_from_env = false,
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    });
+    defer client.deinit();
+    var server_task = try io.concurrent(Server.run, .{ &server, io });
+    defer server_task.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => std.debug.panic("HTTP test server: {s}", .{@errorName(err)}),
+    };
+    var first = try client.get(url);
+    const first_body = try first.readAllAlloc(2);
+    defer testing.allocator.free(first_body);
+    first.close();
+    try testing.expectEqual(@as(usize, 1), client.transport.pool.entries.items.len);
+    try std.Io.sleep(io, .fromMilliseconds(250), .awake);
+    var second = try client.get(url);
+    defer second.close();
+    const second_body = try second.readAllAlloc(2);
+    defer testing.allocator.free(second_body);
+    try testing.expectEqualStrings("OK", second_body);
+}
+
+test "Client: cancellation interrupts a timed socket write" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var accepted: std.Io.Event = .unset;
+    const Server = struct {
+        fn run(s: *std.Io.net.Server, server_io: std.Io, ready: *std.Io.Event) !void {
+            var stream = try s.accept(server_io);
+            defer stream.close(server_io);
+            var buffer: [1024]u8 = undefined;
+            var reader = stream.reader(server_io, &buffer);
+            while (std.mem.indexOf(u8, reader.interface.buffered(), "\r\n\r\n") == null) {
+                try reader.interface.fillMore();
+            }
+            ready.set(server_io);
+            try std.Io.sleep(server_io, .fromSeconds(1), .awake);
+        }
+    };
+    const Worker = struct {
+        fn run(client: *Client, url: []const u8, payload: []const u8) !void {
+            var request = Request.init(client.allocator, .POST, url);
+            defer request.deinit();
+            try request.setBody(payload);
+            var response = try client.do(&request, .none);
+            response.close();
+        }
+    };
+    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    defer testing.allocator.free(url);
+    const payload = try testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer testing.allocator.free(payload);
+    @memset(payload, 0x61);
+    var client = Client.init(testing.allocator, io, .{
+        .proxy_from_env = false,
+        .timeout_ns = 10 * std.time.ns_per_s,
+    });
+    defer client.deinit();
+    var server_task = try io.concurrent(Server.run, .{ &server, io, &accepted });
+    defer server_task.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => std.debug.panic("HTTP test server: {s}", .{@errorName(err)}),
+    };
+    var future = try io.concurrent(Worker.run, .{ &client, url, payload });
+    try accepted.wait(io);
+    try testing.expectError(error.Canceled, future.cancel(io));
 }

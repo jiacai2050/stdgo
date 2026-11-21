@@ -52,6 +52,16 @@ pub fn establishSocks5Tunnel(
     var stream_r = stream.reader(io, &read_buf);
     const r = &stream_r.interface;
 
+    try establishWithReaderWriter(r, w, target_host, target_port, auth);
+}
+
+pub fn establishWithReaderWriter(
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    target_host: []const u8,
+    target_port: u16,
+    auth: ?Auth,
+) !void {
     const has_auth = auth != null and auth.?.username != null;
 
     // 1. Initial Greeting: Version 5 + Authentication Methods

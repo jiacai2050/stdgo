@@ -28,7 +28,10 @@ pub const GzipState = struct {
         const state: *GzipState = @fieldParentPtr("bridge_reader", r);
         var tmp: [4096]u8 = undefined;
         const max_len = if (limit == .unlimited) tmp.len else @min(tmp.len, @backingInt(limit));
-        const n = state.parent.readRaw(tmp[0..max_len]) catch return error.ReadFailed;
+        const n = state.parent.readRaw(tmp[0..max_len]) catch |err| {
+            state.parent.read_err = err;
+            return error.ReadFailed;
+        };
         if (n == 0) return error.EndOfStream;
         w.writeAll(tmp[0..n]) catch return error.WriteFailed;
         return n;
@@ -137,8 +140,19 @@ pub const ResponseBodyReader = struct {
 
     pub fn read(self: *ResponseBodyReader, buf: []u8) anyerror!usize {
         if (self.eof_reached or buf.len == 0) return 0;
+        if (self.read_err) |err| return err;
+        return self.readInner(buf) catch |err| {
+            self.read_err = err;
+            return err;
+        };
+    }
+
+    fn readInner(self: *ResponseBodyReader, buf: []u8) anyerror!usize {
+        try self.conn.checkDeadline();
         if (self.gzip_state) |state| {
-            const n = try state.decompress.reader.readSliceShort(buf);
+            const n = state.decompress.reader.readSliceShort(buf) catch |err| {
+                return self.read_err orelse err;
+            };
             if (n == 0) {
                 self.eof_reached = true;
             }
@@ -218,7 +232,7 @@ pub const ResponseBodyReader = struct {
             return n;
         }
 
-        return self.conn.read(self.io, buf, null);
+        return self.conn.read(buf);
     }
 
     fn readByte(self: *ResponseBodyReader) !u8 {
@@ -318,7 +332,7 @@ pub const Response = struct {
                     }
                 }
 
-                if (body_ptr.eof_reached) {
+                if (body_ptr.eof_reached and body_ptr.read_err == null) {
                     pool.release(body_ptr.io, self.pool_host.?, self.pool_port, self.conn.is_tls, self.conn);
                     if (self.pool_host) |h| {
                         self.allocator.free(h);
@@ -386,15 +400,20 @@ pub const Response = struct {
 
 test "ResponseBodyReader.reader reads fixed and chunked bodies" {
     const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn: HttpConn = undefined;
+    conn.stream_reader = .init(io, undefined, &.{}, .none);
     var buf: [4]u8 = undefined;
     var out: [64]u8 = undefined;
 
     // The whole body is in `leftover`, so the connection is never read.
-    var fixed = ResponseBodyReader.init(undefined, undefined, .fixed, 11, "hello worldEXTRA");
+    var fixed = ResponseBodyReader.init(io, &conn, .fixed, 11, "hello worldEXTRA");
     const fixed_len = try fixed.reader(&buf).readSliceShort(&out);
     try testing.expectEqualStrings("hello world", out[0..fixed_len]);
 
-    var chunked = ResponseBodyReader.init(undefined, undefined, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    var chunked = ResponseBodyReader.init(io, &conn, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     const r = chunked.reader(&buf);
     try testing.expectEqualStrings("hel", try r.take(3));
     const chunked_len = try r.readSliceShort(&out);
@@ -404,10 +423,15 @@ test "ResponseBodyReader.reader reads fixed and chunked bodies" {
 
 test "ResponseBodyReader.reader streams into writers with an empty buffer" {
     const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn: HttpConn = undefined;
+    conn.stream_reader = .init(io, undefined, &.{}, .none);
     const Digest = @import("../../crypto/sha256.zig").Digest;
     var buf: [4]u8 = undefined;
 
-    var body = ResponseBodyReader.init(undefined, undefined, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    var body = ResponseBodyReader.init(io, &conn, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     var digest = Digest.init();
     const n = try body.reader(&buf).streamRemaining(digest.writer());
     try testing.expectEqual(@as(usize, 11), n);

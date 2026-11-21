@@ -2,8 +2,21 @@
 //! as required by package database/sql.
 
 const std = @import("std");
-const context = @import("../../context.zig");
-const Context = context.Context;
+const deadlines = @import("../../io/deadline.zig");
+const Deadline = deadlines.Deadline;
+
+pub fn checkOperation(io: std.Io, deadline: Deadline) !void {
+    try io.checkCancel();
+    try deadline.check(io);
+}
+
+/// Drivers opting in must check the deadline throughout the operation and
+/// return only after any work borrowing the operation's resources has stopped.
+/// An uninterruptible backend call can delay return past the deadline.
+pub fn checkDeadlineSupport(io: std.Io, deadline: Deadline, supported: bool) !void {
+    try checkOperation(io, deadline);
+    if (!deadline.isNone() and !supported) return error.DeadlineUnsupported;
+}
 
 /// Driver value representation.
 pub const Value = union(enum) {
@@ -68,8 +81,10 @@ pub const Rows = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Opt in only when all deadline-bearing methods honor the deadline.
+        supports_deadline: bool = false,
         columns: *const fn (ctx: *anyopaque) []const []const u8,
-        next: *const fn (ctx: *anyopaque, dest: []Value) bool,
+        next: *const fn (ctx: *anyopaque, io: std.Io, dest: []Value, deadline: Deadline) anyerror!bool,
         close: *const fn (ctx: *anyopaque) void,
         /// Optional: returns the error, if any, that occurred while iterating.
         err: ?*const fn (ctx: *anyopaque) ?anyerror = null,
@@ -79,8 +94,9 @@ pub const Rows = struct {
         return self.vtable.columns(self.ptr);
     }
 
-    pub fn next(self: *Rows, dest: []Value) bool {
-        return self.vtable.next(self.ptr, dest);
+    pub fn next(self: *Rows, io: std.Io, dest: []Value, deadline: Deadline) !bool {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.next(self.ptr, io, dest, deadline);
     }
 
     pub fn close(self: *Rows) void {
@@ -103,10 +119,12 @@ pub const Stmt = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Opt in only when all deadline-bearing methods honor the deadline.
+        supports_deadline: bool = false,
         close: *const fn (ctx: *anyopaque) void,
         numInput: *const fn (ctx: *anyopaque) i64,
-        exec: *const fn (ctx: *anyopaque, c: Context, args: []const Value) anyerror!Result,
-        query: *const fn (ctx: *anyopaque, c: Context, args: []const Value) anyerror!Rows,
+        exec: *const fn (ctx: *anyopaque, io: std.Io, args: []const Value, deadline: Deadline) anyerror!Result,
+        query: *const fn (ctx: *anyopaque, io: std.Io, args: []const Value, deadline: Deadline) anyerror!Rows,
     };
 
     pub fn close(self: *Stmt) void {
@@ -117,12 +135,14 @@ pub const Stmt = struct {
         return self.vtable.numInput(self.ptr);
     }
 
-    pub fn exec(self: *Stmt, c: Context, args: []const Value) !Result {
-        return self.vtable.exec(self.ptr, c, args);
+    pub fn exec(self: *Stmt, io: std.Io, args: []const Value, deadline: Deadline) !Result {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.exec(self.ptr, io, args, deadline);
     }
 
-    pub fn query(self: *Stmt, c: Context, args: []const Value) !Rows {
-        return self.vtable.query(self.ptr, c, args);
+    pub fn query(self: *Stmt, io: std.Io, args: []const Value, deadline: Deadline) !Rows {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.query(self.ptr, io, args, deadline);
     }
 };
 
@@ -132,16 +152,23 @@ pub const Tx = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        commit: *const fn (ctx: *anyopaque) anyerror!void,
-        rollback: *const fn (ctx: *anyopaque) anyerror!void,
+        /// Both callbacks consume the transaction even when the driver returns an error.
+        supports_deadline: bool = false,
+        commit: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
+        rollback: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
     };
 
-    pub fn commit(self: *Tx) !void {
-        return self.vtable.commit(self.ptr);
+    pub fn commit(self: *Tx, io: std.Io, deadline: Deadline) !void {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.commit(self.ptr, io, deadline);
     }
 
-    pub fn rollback(self: *Tx) !void {
-        return self.vtable.rollback(self.ptr);
+    pub fn rollback(self: *Tx, io: std.Io, deadline: Deadline) !void {
+        try deadline.validate();
+        if (!deadline.isNone()) {
+            try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        }
+        return self.vtable.rollback(self.ptr, io, deadline);
     }
 };
 
@@ -151,50 +178,56 @@ pub const Conn = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        prepare: *const fn (ctx: *anyopaque, c: Context, query: []const u8) anyerror!Stmt,
+        /// Opt in only when all deadline-bearing methods honor the deadline.
+        supports_deadline: bool = false,
+        prepare: *const fn (ctx: *anyopaque, io: std.Io, query: []const u8, deadline: Deadline) anyerror!Stmt,
         close: *const fn (ctx: *anyopaque) void,
-        begin: *const fn (ctx: *anyopaque, c: Context) anyerror!Tx,
-        ping: *const fn (ctx: *anyopaque, c: Context) anyerror!void,
+        begin: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!Tx,
+        ping: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
         /// Optional: starts a transaction with specific options (isolation level, read-only).
-        beginTx: ?*const fn (ctx: *anyopaque, c: Context, opts: TxOptions) anyerror!Tx = null,
+        beginTx: ?*const fn (ctx: *anyopaque, io: std.Io, opts: TxOptions, deadline: Deadline) anyerror!Tx = null,
         /// [Extension to standard Go driver.Conn]
         /// Optional: Interrupts any in-progress query on this connection (e.g. sqlite3_interrupt,
         /// PostgreSQL CancelRequest, MySQL KILL QUERY).
-        /// This extension allows GUI clients (such as Qianliyan) and Context cancellation to
+        /// This extension allows GUI clients (such as Qianliyan) to
         /// abort slow queries out-of-band without destroying the underlying connection or pool.
         interrupt: ?*const fn (ctx: *anyopaque) void = null,
         /// Optional: returns the detailed error message for the last operation on this connection.
         lastError: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     };
 
-    pub fn prepare(self: *Conn, c: Context, query: []const u8) !Stmt {
-        return self.vtable.prepare(self.ptr, c, query);
+    pub fn prepare(self: *Conn, io: std.Io, query: []const u8, deadline: Deadline) !Stmt {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.prepare(self.ptr, io, query, deadline);
     }
 
     pub fn close(self: *Conn) void {
         self.vtable.close(self.ptr);
     }
 
-    pub fn begin(self: *Conn, c: Context) !Tx {
-        return self.vtable.begin(self.ptr, c);
+    pub fn begin(self: *Conn, io: std.Io, deadline: Deadline) !Tx {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.begin(self.ptr, io, deadline);
     }
 
     /// BeginTx starts a transaction with the given options.
     /// If the driver does not implement beginTx and the options are default,
     /// it falls back to begin(). If non-default options are requested and unsupported,
     /// it returns error.TxOptionsNotSupported.
-    pub fn beginTx(self: *Conn, c: Context, opts: TxOptions) !Tx {
+    pub fn beginTx(self: *Conn, io: std.Io, opts: TxOptions, deadline: Deadline) !Tx {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
         if (self.vtable.beginTx) |f| {
-            return f(self.ptr, c, opts);
+            return f(self.ptr, io, opts, deadline);
         }
         if (opts.isolation == .default and !opts.read_only) {
-            return self.vtable.begin(self.ptr, c);
+            return self.vtable.begin(self.ptr, io, deadline);
         }
         return error.TxOptionsNotSupported;
     }
 
-    pub fn ping(self: *Conn, c: Context) !void {
-        return self.vtable.ping(self.ptr, c);
+    pub fn ping(self: *Conn, io: std.Io, deadline: Deadline) !void {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.ping(self.ptr, io, deadline);
     }
 
     /// Interrupt aborts any in-progress database operation on this connection out-of-band.
@@ -224,11 +257,14 @@ pub const Driver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        open: *const fn (ctx: *anyopaque, dsn: []const u8) anyerror!Conn,
+        /// Opt in only when opening honors the deadline.
+        supports_deadline: bool = false,
+        open: *const fn (ctx: *anyopaque, io: std.Io, dsn: []const u8, deadline: Deadline) anyerror!Conn,
     };
 
-    pub fn open(self: Driver, dsn: []const u8) !Conn {
-        return self.vtable.open(self.ptr, dsn);
+    pub fn open(self: Driver, io: std.Io, dsn: []const u8, deadline: Deadline) !Conn {
+        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        return self.vtable.open(self.ptr, io, dsn, deadline);
     }
 };
 

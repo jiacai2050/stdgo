@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("1. SQLite Database opened (DSN: '{s}')\n", .{db.dsn});
 
     // 3. Ping
-    try db.ping();
+    try db.ping(.none);
     std.debug.print("2. Ping successful. Open: {d}, Idle: {d}\n\n", .{
         db.stats().open_connections,
         db.stats().idle,
@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
         \\    price REAL NOT NULL,
         \\    in_stock INTEGER NOT NULL
         \\);
-    , &.{});
+    , &.{}, .none);
     std.debug.print("3. Table 'products' created successfully.\n\n", .{});
 
     // 5. Insert Records via Parameterized Exec
@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
             sql.Value{ .float = 129.99 },
             sql.Value{ .int = 1 },
         },
+        .none,
     );
     std.debug.print("4. Inserted item #1 -> ID: {d}, Rows Affected: {d}\n", .{
         r1.lastInsertId(),
@@ -68,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
             sql.Value{ .float = 79.50 },
             sql.Value{ .int = 1 },
         },
+        .none,
     );
     std.debug.print("   Inserted item #2 -> ID: {d}, Rows Affected: {d}\n\n", .{
         r2.lastInsertId(),
@@ -78,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
     // db.query obtains a pooled connection and prepares the statement.
     // The connection is held until rows.close() is called or rows are exhausted.
     std.debug.print("5. Querying 'products' table:\n", .{});
-    var rows = try db.query("SELECT id, name, price, in_stock FROM products ORDER BY id ASC", &.{});
+    var rows = try db.query("SELECT id, name, price, in_stock FROM products ORDER BY id ASC", &.{}, .none);
     defer rows.close();
 
     const cols = rows.columns();
@@ -91,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Scan column values sequentially into the record buffer
     var record: [4]sql.Value = undefined;
-    while (rows.next(&record)) {
+    while (try rows.next(&record, .none)) {
         std.debug.print("   -> Product #{d}: '{s}' | ${d:.2} | in_stock: {s}\n", .{
             record[0].int,
             record[1].string,
@@ -108,20 +110,20 @@ pub fn main(init: std.process.Init) !void {
     // 7. Single-row Queries (db.queryRow & ErrNoRows)
     std.debug.print("6. Single-row Queries (db.queryRow & ErrNoRows):\n", .{});
     {
-        var row = db.queryRow("SELECT name, price FROM products WHERE id = ?", &.{sql.Value{ .int = 1 }});
+        var row = db.queryRow("SELECT name, price FROM products WHERE id = ?", &.{sql.Value{ .int = 1 }}, .none);
         defer row.close();
         var dest: [2]sql.Value = undefined;
-        try row.scan(&dest);
+        try row.scan(&dest, .none);
         std.debug.print("   -> Product #1 single lookup: '{s}' | ${d:.2}\n", .{
             dest[0].string,
             dest[1].float,
         });
 
         // Querying non-existent item triggers error.ErrNoRows
-        var non_existent = db.queryRow("SELECT name, price FROM products WHERE id = 9999", &.{});
+        var non_existent = db.queryRow("SELECT name, price FROM products WHERE id = 9999", &.{}, .none);
         defer non_existent.close();
         var dummy: [2]sql.Value = undefined;
-        non_existent.scan(&dummy) catch |err| switch (err) {
+        non_existent.scan(&dummy, .none) catch |err| switch (err) {
             error.ErrNoRows => std.debug.print("   -> Querying ID 9999 returned error.ErrNoRows as expected!\n\n", .{}),
             else => return err,
         };
@@ -131,33 +133,33 @@ pub fn main(init: std.process.Init) !void {
     // Supports TxOptions with isolation levels (e.g. .serializable) and read-only flags
     std.debug.print("7. Transactions with Isolation Level (db.beginTx & Tx.queryRow):\n", .{});
     {
-        var tx = try db.beginTx(stdgo.context.background(), .{
+        var tx = try db.beginTx(.{
             .isolation = .serializable,
             .read_only = false,
-        });
-        defer tx.rollback() catch {};
+        }, .none);
+        defer tx.rollback(.none) catch {};
 
-        _ = try tx.exec("UPDATE products SET price = price * 0.9 WHERE id = 1", &.{});
+        _ = try tx.exec("UPDATE products SET price = price * 0.9 WHERE id = 1", &.{}, .none);
 
         // Use tx.queryRow inside transaction to verify new price
-        var tx_row = tx.queryRow("SELECT price FROM products WHERE id = 1", &.{});
+        var tx_row = tx.queryRow("SELECT price FROM products WHERE id = 1", &.{}, .none);
         defer tx_row.close();
         var price_dest: [1]sql.Value = undefined;
-        try tx_row.scan(&price_dest);
+        try tx_row.scan(&price_dest, .none);
         std.debug.print("   -> In-transaction updated price: ${d:.2}\n", .{price_dest[0].float});
 
-        try tx.commit();
+        try tx.commit(.none);
         std.debug.print("   -> Serializable transaction committed successfully!\n\n", .{});
     }
 
     // 9. Native Diagnostic Error Message (conn.lastError)
     std.debug.print("8. Native Detailed Error Reporting (conn.lastError):\n", .{});
     {
-        const pc = try db.conn();
+        const pc = try db.conn(.none);
         defer pc.release();
 
         // Intentionally execute malformed SQL: "FORM" instead of "FROM"
-        _ = pc.exec("SELECT * FORM products", &.{}) catch |err| {
+        _ = pc.exec("SELECT * FORM products", &.{}, .none) catch |err| {
             std.debug.print("   -> Exec failed with Zig error: {any}\n", .{err});
             if (pc.lastError()) |native_msg| {
                 std.debug.print("   -> SQLite Native Detail: \"{s}\"\n\n", .{native_msg});

@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("1. DB Pool initialized (DSN: {s})\n", .{db.dsn});
 
     // 3. Ping Database
-    try db.ping();
+    try db.ping(.none);
     std.debug.print("2. Ping successful. Open Conns: {d}, Idle: {d}\n\n", .{
         db.stats().open_connections,
         db.stats().idle,
@@ -41,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
             sql.Value{ .string = "secops" },
             sql.Value{ .string = "active" },
         },
+        .none,
     );
     std.debug.print("3. db.exec executed:\n   -> Last Insert ID: {d}\n   -> Rows Affected:  {d}\n\n", .{
         res.lastInsertId(),
@@ -49,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 5. Query Rows (SELECT)
     std.debug.print("4. db.query executed (SELECT id, name, role FROM users):\n", .{});
-    var rows = try db.query("SELECT id, name, role FROM users", &.{});
+    var rows = try db.query("SELECT id, name, role FROM users", &.{}, .none);
     defer rows.close();
 
     const cols = rows.columns();
@@ -61,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("]\n", .{});
 
     var row_record: [3]sql.Value = undefined;
-    while (rows.next(&row_record)) {
+    while (try rows.next(&row_record, .none)) {
         std.debug.print("   Row -> ID: {d}, Name: '{s}', Role: '{s}'\n", .{
             row_record[0].int,
             row_record[1].string,
@@ -77,10 +78,10 @@ pub fn main(init: std.process.Init) !void {
     // 6. Single Row Query (db.queryRow & ErrNoRows)
     std.debug.print("5. Single-row Query (db.queryRow & ErrNoRows):\n", .{});
     {
-        var row = db.queryRow("SELECT id, name, role FROM users LIMIT 1", &.{});
+        var row = db.queryRow("SELECT id, name, role FROM users LIMIT 1", &.{}, .none);
         defer row.close();
         var single_dest: [3]sql.Value = undefined;
-        try row.scan(&single_dest);
+        try row.scan(&single_dest, .none);
         std.debug.print("   -> Single row scanned: ID {d}, Name '{s}'\n", .{
             single_dest[0].int,
             single_dest[1].string,
@@ -90,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
         var empty_row = sql.Row{ .rows = null };
         defer empty_row.close();
         var dummy_dest: [1]sql.Value = undefined;
-        empty_row.scan(&dummy_dest) catch |err| switch (err) {
+        empty_row.scan(&dummy_dest, .none) catch |err| switch (err) {
             error.ErrNoRows => std.debug.print("   -> Empty result handled gracefully with error.ErrNoRows!\n\n", .{}),
             else => return err,
         };
@@ -100,22 +101,22 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("6. Transactions (ACID Commit, Rollback, and Isolation Levels):\n", .{});
     // Successful transaction with serializable isolation:
     {
-        var tx = try db.beginTx(stdgo.context.background(), .{
+        var tx = try db.beginTx(.{
             .isolation = .serializable,
             .read_only = false,
-        });
-        _ = try tx.exec("UPDATE accounts SET balance = balance - 250 WHERE id = 1", &.{});
-        _ = try tx.exec("UPDATE accounts SET balance = balance + 250 WHERE id = 2", &.{});
-        try tx.commit();
+        }, .none);
+        _ = try tx.exec("UPDATE accounts SET balance = balance - 250 WHERE id = 1", &.{}, .none);
+        _ = try tx.exec("UPDATE accounts SET balance = balance + 250 WHERE id = 2", &.{}, .none);
+        try tx.commit(.none);
         std.debug.print("   -> Transaction #1 (Serializable) committed successfully!\n", .{});
     }
 
     // Aborted transaction rollback:
     {
-        var tx = try db.begin();
-        _ = try tx.exec("UPDATE inventory SET stock = stock - 10 WHERE item_id = 99", &.{});
+        var tx = try db.begin(.none);
+        _ = try tx.exec("UPDATE inventory SET stock = stock - 10 WHERE item_id = 99", &.{}, .none);
         // Something failed during checkout, rollback:
-        try tx.rollback();
+        try tx.rollback(.none);
         std.debug.print("   -> Transaction #2 rolled back cleanly on error!\n\n", .{});
     }
 
@@ -127,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("   -> Simulating server-side closed connection in idle pool...\n", .{});
 
         // db.exec transparently discards bad connection and retries on a fresh one:
-        const retry_res = try db.exec("SELECT 1", &.{});
+        const retry_res = try db.exec("SELECT 1", &.{}, .none);
         std.debug.print("   -> db.exec auto-retried on fresh connection! Rows Affected: {d}\n\n", .{
             retry_res.rowsAffected(),
         });
@@ -136,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     // 9. Out-of-band Query Interruption (db.interruptAll)
     std.debug.print("8. Out-of-band Interruption (db.interruptAll):\n", .{});
     {
-        const pc = try db.conn();
+        const pc = try db.conn(.none);
         defer pc.release();
 
         const signaled = db.interruptAll();
@@ -149,13 +150,12 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("9. Concurrent Workers Pool Contention (4 threads competing for pool):\n", .{});
     const Worker = struct {
         fn workerThread(db_handle: *sql.DB) void {
-            const bg_ctx = stdgo.context.background();
             for (0..10) |_| {
-                const pc = db_handle.conn() catch return;
+                const pc = db_handle.conn(.none) catch return;
                 defer pc.release();
-                var stmt = pc.raw.prepare(bg_ctx, "SELECT 1") catch continue;
+                var stmt = pc.raw.prepare(db_handle.io, "SELECT 1", .none) catch continue;
                 defer stmt.close();
-                _ = stmt.exec(bg_ctx, &.{}) catch {};
+                _ = stmt.exec(db_handle.io, &.{}, .none) catch {};
             }
         }
     };

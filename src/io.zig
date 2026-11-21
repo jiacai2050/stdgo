@@ -16,6 +16,11 @@ pub const copyN = io.copyN;
 pub const LimitReader = io.LimitReader;
 pub const TeeReader = io.TeeReader;
 
+pub const deadline = @import("io/deadline.zig");
+pub const Deadline = deadline.Deadline;
+pub const CancelSource = @import("io/cancel.zig").CancelSource;
+pub const CancelToken = @import("io/cancel.zig").CancelToken;
+
 const std = @import("std");
 
 test "io.LimitReader and copy" {

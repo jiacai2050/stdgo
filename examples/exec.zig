@@ -1,12 +1,11 @@
 //! Example demonstrating stdgo os/exec package:
 //! 1. Command execution and output capture
 //! 2. Stdin piping via io.Reader into child process
-//! 3. Context cancellation with timeout
+//! 3. Task cancellation
 
 const std = @import("std");
 const stdgo = @import("stdgo");
 const os = stdgo.os;
-const context = stdgo.context;
 const bytes = stdgo.bytes;
 const io_mod = stdgo.io;
 
@@ -44,28 +43,19 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("   Cat output: {s}", .{out2});
 
     // -------------------------------------------------------------
-    // 3. CommandContext with cancellation
+    // 3. Task cancellation
     // -------------------------------------------------------------
-    std.debug.print("\n3. os.exec.commandContext cancellation:\n", .{});
-
-    const bg = context.background();
-    var cancel_ctx = try context.withCancel(gpa, bg);
-    defer gpa.destroy(cancel_ctx);
+    std.debug.print("\n3. os.exec.command task cancellation:\n", .{});
 
     const sleep_args = [_][]const u8{ "sleep", "5" };
-    var cmd3 = os.exec.commandContext(gpa, cancel_ctx.context(), &sleep_args);
-
-    // Cancel in background thread after 20ms
-    const Watcher = struct {
-        fn cancelSoon(c: *context.CancelContext, s_io: std.Io) void {
-            s_io.sleep(std.Io.Duration.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
-            c.cancel();
+    var cmd3 = os.exec.command(gpa, &sleep_args);
+    const Worker = struct {
+        fn run(cmd: *os.exec.Cmd, task_io: std.Io) !std.process.Child.Term {
+            return cmd.run(task_io);
         }
     };
-    const t = try std.Thread.spawn(.{}, Watcher.cancelSoon, .{ cancel_ctx, io });
-    defer t.join();
-
-    if (cmd3.run(io)) |_| {
+    var future = try io.concurrent(Worker.run, .{ &cmd3, io });
+    if (future.cancel(io)) |_| {
         std.debug.print("   Unexpected: sleep completed without cancellation\n", .{});
     } else |err| {
         std.debug.print("   Successfully canceled: {}\n", .{err});

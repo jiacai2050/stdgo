@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     const dialer = net.Dialer{
         .timeout = @fromBackingInt(@intCast(5 * @backingInt(time.Duration.second))),
     };
-    const client_conn = try dialer.dial(gpa, io, "tcp", dial_str);
+    const client_conn = try dialer.dial(gpa, io, "tcp", dial_str, .none);
     defer client_conn.close();
 
     _ = try client_conn.write("PING_STDGO_DIALER");
@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
     // 6. net.pipe In-Memory Full-Duplex Connection (net.Pipe())
     // -------------------------------------------------------------
     std.debug.print("\n6. net.pipe (In-Memory Duplex Pipe):\n", .{});
-    const pair = try net.pipe(gpa);
+    const pair = try net.pipe(gpa, io);
     const c1 = pair.conn1;
     const c2 = pair.conn2;
 

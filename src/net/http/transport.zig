@@ -7,10 +7,18 @@ const ResponseBodyReader = @import("response.zig").ResponseBodyReader;
 const parseResponseHead = @import("response_parser.zig").parseResponseHead;
 const ConnPool = @import("pool.zig").ConnPool;
 const HttpConn = @import("conn.zig").HttpConn;
-const io_util = @import("io_util.zig");
+const io_util = @import("../io_util.zig");
 const proxy_mod = @import("proxy.zig");
 const socks5 = @import("socks5.zig");
 const time_mod = @import("../../time.zig");
+const deadline_mod = @import("../../io/deadline.zig");
+const connect_mod = @import("../connect.zig");
+
+fn durationDeadline(io: std.Io, duration: ?time_mod.Duration) deadline_mod.Deadline {
+    const ns = if (duration) |value| value.nanoseconds() else return .none;
+    if (ns <= 0) return .none;
+    return .after(io, .{ .nanoseconds = ns });
+}
 
 /// RoundTripper is an interface representing the ability to execute a
 /// single HTTP transaction, obtaining the Response for a given Request.
@@ -19,12 +27,12 @@ pub const RoundTripper = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        roundTrip: *const fn (ctx: *anyopaque, req: *Request) anyerror!Response,
+        roundTrip: *const fn (ctx: *anyopaque, req: *Request, deadline: deadline_mod.Deadline) anyerror!Response,
         closeIdleConnections: ?*const fn (ctx: *anyopaque) void = null,
     };
 
-    pub fn roundTrip(self: RoundTripper, req: *Request) anyerror!Response {
-        return self.vtable.roundTrip(self.ptr, req);
+    pub fn roundTrip(self: RoundTripper, req: *Request, deadline: deadline_mod.Deadline) anyerror!Response {
+        return self.vtable.roundTrip(self.ptr, req, deadline);
     }
 
     pub fn closeIdleConnections(self: RoundTripper) void {
@@ -41,14 +49,22 @@ pub const TransportOptions = struct {
     environ_map: ?*const std.process.Environ.Map = null,
     /// Custom environment lookup function. If set, takes precedence over environ_map.
     env_lookup: ?*const fn (key: []const u8) ?[]const u8 = null,
+    /// Total round-trip and body-read budget.
     timeout_ns: ?u64 = null,
     timeout: ?time_mod.Duration = null,
+    tls_handshake_timeout: ?time_mod.Duration = null,
+    response_header_timeout: ?time_mod.Duration = null,
+    /// Time to wait for 100 Continue before sending the request body.
+    expect_continue_timeout: ?time_mod.Duration = null,
+    /// Connections are closed proactively after this long in the idle pool.
+    idle_conn_timeout: ?time_mod.Duration = null,
     max_idle_conns_per_host: usize = 2,
     insecure_skip_verify: bool = false,
     disable_compression: bool = false,
     ca_bundle: ?*std.crypto.Certificate.Bundle = null,
 };
 
+/// Keep at a stable address after the first request when idle expiration is enabled.
 pub const Transport = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -60,14 +76,20 @@ pub const Transport = struct {
         var opts = options;
         if (opts.timeout) |d| {
             if (opts.timeout_ns == null) {
-                opts.timeout_ns = @intCast(d.nanoseconds());
+                if (d.nanoseconds() > 0) opts.timeout_ns = @intCast(d.nanoseconds());
+            }
+        }
+        var pool = ConnPool.init(allocator, options.max_idle_conns_per_host);
+        if (options.idle_conn_timeout) |duration| {
+            if (duration.nanoseconds() > 0) {
+                pool.idle_timeout = .{ .nanoseconds = duration.nanoseconds() };
             }
         }
         return .{
             .allocator = allocator,
             .io = io,
             .options = opts,
-            .pool = ConnPool.init(allocator, options.max_idle_conns_per_host),
+            .pool = pool,
             .ca_bundle = null,
         };
     }
@@ -99,9 +121,9 @@ pub const Transport = struct {
         .closeIdleConnections = vtableCloseIdleConnections,
     };
 
-    fn vtableRoundTrip(ctx: *anyopaque, req: *Request) anyerror!Response {
+    fn vtableRoundTrip(ctx: *anyopaque, req: *Request, deadline: deadline_mod.Deadline) anyerror!Response {
         const self: *Transport = @ptrCast(@alignCast(ctx));
-        return self.roundTrip(req);
+        return self.roundTrip(req, deadline);
     }
 
     fn vtableCloseIdleConnections(ctx: *anyopaque) void {
@@ -109,58 +131,44 @@ pub const Transport = struct {
         self.closeIdleConnections();
     }
 
-    fn connectStream(io: std.Io, host: []const u8, port: u16, timeout: std.Io.Timeout) !std.Io.net.Stream {
-        _ = timeout;
-        if (std.Io.net.IpAddress.parse(host, port)) |ip| {
-            // Zig 0.17's netConnectIpPosix panics if timeout != .none
-            return ip.connect(io, .{ .mode = .stream, .timeout = .none });
-        } else |_| {}
-
-        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        if (host.len > host_buf.len) return error.HostNameTooLong;
-        @memcpy(host_buf[0..host.len], host);
-        const host_name = try std.Io.net.HostName.init(host_buf[0..host.len]);
-
-        // Prefer IPv4 first to avoid IPv6 PMTUD / packet loss on certain ISP international anycast
-        var canonical_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        var lookup_buffer: [16]std.Io.net.HostName.LookupResult = undefined;
-        var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
-        var lookup_future = io.async(std.Io.net.HostName.lookup, .{ host_name, io, &lookup_queue, .{
-            .port = port,
-            .canonical_name_buffer = &canonical_name_buffer,
-            .family = null,
-        } });
-        defer lookup_future.cancel(io) catch {};
-
-        while (lookup_queue.getOne(io)) |dns_result| switch (dns_result) {
-            .address => |address| {
-                // Zig 0.17's netConnectIpPosix panics if timeout != .none, so use .none
-                if (address.connect(io, .{ .mode = .stream, .timeout = .none })) |stream| {
-                    return stream;
-                } else |_| continue;
-            },
-            .canonical_name => continue,
-        } else |_| {}
-
-        return host_name.connect(io, port, .{ .mode = .stream, .timeout = .none });
+    fn connectStream(io: std.Io, host: []const u8, port: u16, deadline: deadline_mod.Deadline) !std.Io.net.Stream {
+        return connect_mod.connectOrdered(io, host, port, deadline);
     }
 
-    fn makeIoTimeout(timeout_ns: ?u64) std.Io.Timeout {
-        if (timeout_ns) |ns| {
-            if (ns == 0) return .none;
-            return .{
-                .duration = .{
-                    .raw = std.Io.Duration.fromNanoseconds(@intCast(ns)),
-                    .clock = .boot,
-                },
+    fn readResponseHeader(self: *Transport, conn: *HttpConn) ![]u8 {
+        const reader = conn.reader();
+        while (true) {
+            try conn.checkDeadline();
+            const buffered = reader.buffered();
+            if (std.mem.indexOf(u8, buffered, "\r\n\r\n")) |index| {
+                const length = index + 4;
+                const header = try self.allocator.dupe(u8, buffered[0..length]);
+                reader.toss(length);
+                return header;
+            }
+            if (buffered.len >= 16 * 1024) return error.ResponseHeaderTooLarge;
+            reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return if (buffered.len == 0)
+                    error.EmptyResponse
+                else
+                    error.ConnectionClosedPrematurely,
+                else => |e| return conn.ioError(e),
             };
         }
-        return .none;
     }
 
-    fn establishConnectTunnel(io: std.Io, stream: std.Io.net.Stream, host: []const u8, port: u16, auth: ?[]const u8) !void {
+    fn expectsContinue(req: *const Request) bool {
+        const value = req.header.get("Expect") orelse return false;
+        var tokens = std.mem.splitScalar(u8, value, ',');
+        while (tokens.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "100-continue")) return true;
+        }
+        return false;
+    }
+
+    fn establishConnectTunnel(io: std.Io, stream: std.Io.net.Stream, host: []const u8, port: u16, auth: ?[]const u8, deadline: deadline_mod.Deadline) !void {
         var write_buf: [512]u8 = undefined;
-        var stream_w = stream.writer(io, &write_buf);
+        var stream_w: io_util.SocketWriter = .init(io, stream, &write_buf, deadline);
         const w = &stream_w.interface;
 
         var req_buf: [512]u8 = undefined;
@@ -176,11 +184,11 @@ pub const Transport = struct {
                 "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\nUser-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n\r\n",
                 .{ host, port, host, port },
             );
-        try w.writeAll(req_str);
-        try w.flush();
+        w.writeAll(req_str) catch |err| return stream_w.err orelse err;
+        w.flush() catch |err| return stream_w.err orelse err;
 
         var read_buf: [1024]u8 = undefined;
-        var stream_r = stream.reader(io, &read_buf);
+        var stream_r: io_util.SocketReader = .init(io, stream, &read_buf, deadline);
         const r = &stream_r.interface;
 
         const proxy_head_bytes_max = read_buf.len;
@@ -199,15 +207,22 @@ pub const Transport = struct {
             }
             r.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return error.ConnectionClosedPrematurely,
-                else => |e| return e,
+                else => |e| return stream_r.err orelse e,
             };
         }
     }
 
-    pub fn roundTrip(self: *Transport, req: *Request) !Response {
-        if (req.ctx) |c| {
-            if (c.errWithIo(self.io)) |e| return e;
-        }
+    pub fn roundTrip(self: *Transport, req: *Request, deadline: deadline_mod.Deadline) !Response {
+        try deadline.validate();
+        return self.roundTripWithBudget(req, deadline);
+    }
+
+    pub fn roundTripWithBudget(self: *Transport, req: *Request, client_deadline: deadline_mod.Deadline) !Response {
+        try client_deadline.validate();
+        const deadline = io_util.earlier(client_deadline, io_util.fromTimeout(self.io, self.options.timeout_ns));
+        try deadline.check(self.io);
+        try self.io.checkCancel();
+        try self.pool.start(self.io);
 
         const target = try parseUrlTarget(req.url);
 
@@ -262,25 +277,33 @@ pub const Transport = struct {
             var conn: *HttpConn = if (pooled) |c|
                 c
             else blk: {
-                const timeout = makeIoTimeout(self.options.timeout_ns);
-
                 if (proxy_connect_url) |proxy_url| {
                     const proxy_target = try parseUrlTarget(proxy_url);
-                    var stream = try connectStream(self.io, proxy_target.host, proxy_target.port, timeout);
+                    var stream = try connectStream(self.io, proxy_target.host, proxy_target.port, deadline);
                     errdefer stream.close(self.io);
+                    try deadline.check(self.io);
 
                     if (is_socks_proxy) {
-                        try socks5.establishSocks5Tunnel(
-                            self.io,
-                            stream,
+                        var read_buf: [512]u8 = undefined;
+                        var write_buf: [512]u8 = undefined;
+                        var reader: io_util.SocketReader = .init(self.io, stream, &read_buf, deadline);
+                        var writer: io_util.SocketWriter = .init(self.io, stream, &write_buf, deadline);
+                        socks5.establishWithReaderWriter(
+                            &reader.interface,
+                            &writer.interface,
                             target.host,
                             target.port,
                             if (socks_user_to_free != null) .{
                                 .username = socks_user_to_free,
                                 .password = socks_pass_to_free,
                             } else null,
-                        );
+                        ) catch |err| {
+                            if (reader.err) |read_err| return read_err;
+                            if (writer.err) |write_err| return write_err;
+                            return err;
+                        };
                         if (target.is_tls) {
+                            const tls_deadline = deadline.earlier(durationDeadline(self.io, self.options.tls_handshake_timeout));
                             break :blk try HttpConn.initTls(
                                 self.allocator,
                                 self.io,
@@ -288,12 +311,14 @@ pub const Transport = struct {
                                 target.host,
                                 self.options.ca_bundle,
                                 self.options.insecure_skip_verify,
+                                tls_deadline,
                             );
                         } else {
-                            break :blk try HttpConn.initPlain(self.allocator, self.io, stream);
+                            break :blk try HttpConn.initPlain(self.allocator, self.io, stream, deadline);
                         }
                     } else if (target.is_tls) {
-                        try establishConnectTunnel(self.io, stream, target.host, target.port, proxy_auth_header);
+                        try establishConnectTunnel(self.io, stream, target.host, target.port, proxy_auth_header, deadline);
+                        const tls_deadline = deadline.earlier(durationDeadline(self.io, self.options.tls_handshake_timeout));
                         break :blk try HttpConn.initTls(
                             self.allocator,
                             self.io,
@@ -301,15 +326,18 @@ pub const Transport = struct {
                             target.host,
                             self.options.ca_bundle,
                             self.options.insecure_skip_verify,
+                            tls_deadline,
                         );
                     } else {
-                        break :blk try HttpConn.initPlain(self.allocator, self.io, stream);
+                        break :blk try HttpConn.initPlain(self.allocator, self.io, stream, deadline);
                     }
                 } else {
-                    var stream = try connectStream(self.io, target.host, target.port, timeout);
+                    var stream = try connectStream(self.io, target.host, target.port, deadline);
                     errdefer stream.close(self.io);
+                    try deadline.check(self.io);
 
                     if (target.is_tls) {
+                        const tls_deadline = deadline.earlier(durationDeadline(self.io, self.options.tls_handshake_timeout));
                         break :blk try HttpConn.initTls(
                             self.allocator,
                             self.io,
@@ -317,9 +345,10 @@ pub const Transport = struct {
                             target.host,
                             self.options.ca_bundle,
                             self.options.insecure_skip_verify,
+                            tls_deadline,
                         );
                     } else {
-                        break :blk try HttpConn.initPlain(self.allocator, self.io, stream);
+                        break :blk try HttpConn.initPlain(self.allocator, self.io, stream, deadline);
                     }
                 }
             };
@@ -327,6 +356,8 @@ pub const Transport = struct {
                 conn.close(self.io);
                 self.allocator.destroy(conn);
             }
+            conn.setDeadline(deadline);
+            try conn.checkDeadline();
 
             // Serialize HTTP/1.1 request
             var req_buf = std.ArrayListUnmanaged(u8).empty;
@@ -420,9 +451,9 @@ pub const Transport = struct {
             }
             try req_buf.appendSlice(self.allocator, "\r\n");
 
-            const write_res = conn.writeAll(self.io, req_buf.items, self.options.timeout_ns);
+            const write_res = conn.writeAll(req_buf.items);
             if (write_res) |_| {} else |err| {
-                if (pooled != null and req.body_reader == null) {
+                if (pooled != null and req.body_reader == null and err != error.Timeout and err != error.Canceled) {
                     conn.close(self.io);
                     self.allocator.destroy(conn);
                     allow_pool = false;
@@ -431,10 +462,66 @@ pub const Transport = struct {
                 return err;
             }
 
-            if (req.body) |b| {
-                const body_res = conn.writeAll(self.io, b, self.options.timeout_ns);
+            var early_header: ?[]u8 = null;
+            var informational_count: usize = 0;
+            var continue_retry = false;
+            const has_body = if (req.body) |body| body.len != 0 else req.body_reader != null;
+            const continue_deadline = durationDeadline(self.io, self.options.expect_continue_timeout);
+            if (has_body and expectsContinue(req) and !continue_deadline.isNone()) {
+                conn.setDeadline(deadline.earlier(continue_deadline));
+                while (true) {
+                    const raw = self.readResponseHeader(conn) catch |err| switch (err) {
+                        error.Timeout => {
+                            conn.stream_reader.err = null;
+                            try deadline.check(self.io);
+                            break;
+                        },
+                        error.EmptyResponse => {
+                            if (pooled != null and req.body_reader == null) {
+                                continue_retry = true;
+                                break;
+                            }
+                            return error.ConnectionClosedPrematurely;
+                        },
+                        else => return err,
+                    };
+                    const interim = parseResponseHead(self.allocator, raw) catch |err| {
+                        self.allocator.free(raw);
+                        return err;
+                    };
+                    var headers = interim.headers;
+                    headers.deinit();
+                    if (interim.status_code == 100) {
+                        self.allocator.free(raw);
+                        break;
+                    }
+                    if (interim.status_code >= 100 and interim.status_code < 200 and interim.status_code != 101) {
+                        informational_count += 1;
+                        if (informational_count > 100) {
+                            self.allocator.free(raw);
+                            return error.TooManyInformationalResponses;
+                        }
+                        self.allocator.free(raw);
+                        continue;
+                    }
+                    early_header = raw;
+                    break;
+                }
+                conn.setDeadline(deadline);
+            }
+            if (continue_retry) {
+                conn.close(self.io);
+                self.allocator.destroy(conn);
+                allow_pool = false;
+                continue;
+            }
+            const sent_body = early_header == null;
+            errdefer if (early_header) |raw| self.allocator.free(raw);
+
+            if (early_header == null) if (req.body) |b| {
+                const body_res = conn.writeAll(b);
                 if (body_res) |_| {} else |err| {
-                    if (pooled != null and req.body_reader == null) {
+                    if (pooled != null and req.body_reader == null and err != error.Timeout and err != error.Canceled) {
                         conn.close(self.io);
                         self.allocator.destroy(conn);
                         allow_pool = false;
@@ -448,42 +535,35 @@ pub const Transport = struct {
                     var remaining = req.content_length.?;
                     while (remaining > 0) {
                         const to_read = @min(buf.len, remaining);
-                        const n = try r.readSliceShort(buf[0..to_read]);
+                        const n = try io_util.readBody(self.io, r, buf[0..to_read], deadline);
                         if (n == 0) break;
-                        try conn.writeAll(self.io, buf[0..n], self.options.timeout_ns);
+                        try conn.writeAll(buf[0..n]);
                         remaining -= n;
                     }
                 } else {
                     // chunked streaming upload
                     while (true) {
-                        const n = try r.readSliceShort(&buf);
+                        const n = try io_util.readBody(self.io, r, &buf, deadline);
                         if (n == 0) break;
                         var hex_buf: [16]u8 = undefined;
                         const hex_str = try std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{n});
-                        try conn.writeAll(self.io, hex_str, self.options.timeout_ns);
-                        try conn.writeAll(self.io, buf[0..n], self.options.timeout_ns);
-                        try conn.writeAll(self.io, "\r\n", self.options.timeout_ns);
+                        try conn.writeAll(hex_str);
+                        try conn.writeAll(buf[0..n]);
+                        try conn.writeAll("\r\n");
                     }
-                    try conn.writeAll(self.io, "0\r\n\r\n", self.options.timeout_ns);
+                    try conn.writeAll("0\r\n\r\n");
                 }
+            };
+
+            if (early_header == null) {
+                conn.setDeadline(deadline.earlier(durationDeadline(self.io, self.options.response_header_timeout)));
             }
-
-            // Read response head using standard Io.Reader buffering & toss
-            const in = conn.reader();
-            var head_len: usize = 0;
-            const max_head_len = 16 * 1024;
             var header_retry = false;
-
+            var raw_head: []u8 = undefined;
             while (true) {
-                const buffered = in.buffered();
-                if (std.mem.indexOf(u8, buffered, "\r\n\r\n")) |idx| {
-                    head_len = idx + 4;
-                    break;
-                }
-                if (buffered.len >= max_head_len) return error.ResponseHeaderTooLarge;
-                in.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => {
-                        if (pooled != null and req.body_reader == null and buffered.len == 0) {
+                raw_head = early_header orelse self.readResponseHeader(conn) catch |err| switch (err) {
+                    error.EmptyResponse => {
+                        if (pooled != null and req.body_reader == null) {
                             header_retry = true;
                             break;
                         }
@@ -491,6 +571,23 @@ pub const Transport = struct {
                     },
                     else => |e| return e,
                 };
+                early_header = null;
+                const interim = parseResponseHead(self.allocator, raw_head) catch |err| {
+                    self.allocator.free(raw_head);
+                    return err;
+                };
+                var headers = interim.headers;
+                headers.deinit();
+                if (interim.status_code >= 100 and interim.status_code < 200 and interim.status_code != 101) {
+                    informational_count += 1;
+                    if (informational_count > 100) {
+                        self.allocator.free(raw_head);
+                        return error.TooManyInformationalResponses;
+                    }
+                    self.allocator.free(raw_head);
+                    continue;
+                }
+                break;
             }
 
             if (header_retry) {
@@ -500,15 +597,15 @@ pub const Transport = struct {
                 continue;
             }
 
-            const raw_head = try self.allocator.dupe(u8, in.buffered()[0..head_len]);
+            conn.setDeadline(deadline);
             errdefer self.allocator.free(raw_head);
-            in.toss(head_len);
 
-            const head = try parseResponseHead(self.allocator, raw_head);
+            var head = try parseResponseHead(self.allocator, raw_head);
+            errdefer head.headers.deinit();
 
             var mode: @import("response.zig").BodyMode = .close_eof;
             var content_length: u64 = 0;
-            var can_keep_alive = true;
+            var can_keep_alive = sent_body;
 
             if (head.headers.get("Transfer-Encoding")) |te| {
                 if (std.mem.indexOf(u8, te, "chunked") != null) {

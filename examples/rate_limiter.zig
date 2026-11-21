@@ -2,7 +2,6 @@ const std = @import("std");
 const stdgo = @import("stdgo");
 const time = stdgo.time;
 const rate = time.rate;
-const context = stdgo.context;
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [1024]u8 = undefined;
@@ -26,12 +25,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // 2. Wait with context and std.Io: pacing requests through token refill
-    try stdout.writeAll("\nSending 3 requests paced with wait(ctx, io):\n");
-    const bg = context.background();
+    // 2. Pace requests through token refill.
+    try stdout.writeAll("\nSending 3 requests paced with wait(io, deadline):\n");
     for (1..4) |i| {
         const t_start = time.Time.now(init.io);
-        try lim.wait(bg, init.io);
+        try lim.wait(init.io, .none);
         const t_end = time.Time.now(init.io);
         const elapsed_ms = t_end.sub(t_start).milliseconds();
         try stdout.print("  Paced Request #{d}: ALLOWED after {d}ms delay\n", .{ i, elapsed_ms });

@@ -1,17 +1,18 @@
 //! HTTP Connection abstraction over plain TCP and TLS streams.
 const std = @import("std");
-const io_util = @import("io_util.zig");
+const io_util = @import("../io_util.zig");
+const Deadline = @import("../../io/deadline.zig").Deadline;
 
 pub const HttpConn = struct {
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     is_tls: bool,
     tls_client: ?*std.crypto.tls.Client = null,
-    stream_reader: std.Io.net.Stream.Reader = undefined,
-    stream_writer: std.Io.net.Stream.Writer = undefined,
+    stream_reader: io_util.SocketReader = undefined,
+    stream_writer: io_util.SocketWriter = undefined,
     tls_mem: ?[]u8 = null,
 
-    pub fn initPlain(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream) !*HttpConn {
+    pub fn initPlain(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, deadline: Deadline) !*HttpConn {
         const buf_size = 16 * 1024;
         const mem = try allocator.alloc(u8, buf_size * 2);
         errdefer allocator.free(mem);
@@ -24,8 +25,8 @@ pub const HttpConn = struct {
             .stream = stream,
             .is_tls = false,
             .tls_mem = mem,
-            .stream_reader = stream.reader(io, mem[0..buf_size]),
-            .stream_writer = stream.writer(io, mem[buf_size .. buf_size * 2]),
+            .stream_reader = .init(io, stream, mem[0..buf_size], deadline),
+            .stream_writer = .init(io, stream, mem[buf_size .. buf_size * 2], deadline),
         };
         return conn;
     }
@@ -37,6 +38,7 @@ pub const HttpConn = struct {
         host: []const u8,
         ca_bundle: ?*std.crypto.Certificate.Bundle,
         insecure_skip_verify: bool,
+        deadline: Deadline,
     ) !*HttpConn {
         const min_buf = std.crypto.tls.Client.min_buffer_len;
         const total_mem = min_buf * 4;
@@ -56,8 +58,8 @@ pub const HttpConn = struct {
             .stream = stream,
             .is_tls = true,
             .tls_mem = mem,
-            .stream_reader = stream.reader(io, socket_read_buf),
-            .stream_writer = stream.writer(io, socket_write_buf),
+            .stream_reader = .init(io, stream, socket_read_buf, deadline),
+            .stream_writer = .init(io, stream, socket_write_buf, deadline),
         };
 
         var random_buf: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
@@ -91,11 +93,11 @@ pub const HttpConn = struct {
         const client_ptr = try allocator.create(std.crypto.tls.Client);
         errdefer allocator.destroy(client_ptr);
 
-        client_ptr.* = try std.crypto.tls.Client.init(
+        client_ptr.* = std.crypto.tls.Client.init(
             &conn.stream_reader.interface,
             &conn.stream_writer.interface,
             ca_opt,
-        );
+        ) catch |err| return conn.ioError(err);
         conn.tls_client = client_ptr;
 
         return conn;
@@ -109,14 +111,31 @@ pub const HttpConn = struct {
         }
     }
 
-    pub fn read(self: *HttpConn, io: std.Io, buf: []u8, timeout_ns: ?u64) !usize {
-        _ = io;
-        _ = timeout_ns;
+    pub fn setDeadline(self: *HttpConn, deadline: Deadline) void {
+        self.stream_reader.deadline = deadline;
+        self.stream_writer.deadline = deadline;
+    }
+
+    pub fn checkDeadline(self: *HttpConn) !void {
+        try self.stream_reader.io.checkCancel();
+        try self.stream_reader.deadline.check(self.stream_reader.io);
+    }
+
+    pub fn ioError(self: *HttpConn, err: anyerror) anyerror {
+        if (err == error.ReadFailed or err == error.WriteFailed) {
+            if (self.stream_reader.err) |read_err| return read_err;
+            if (self.stream_writer.err) |write_err| return write_err;
+        }
+        return err;
+    }
+
+    pub fn read(self: *HttpConn, buf: []u8) !usize {
+        try self.checkDeadline();
         const r = self.reader();
         while (r.seek == r.end) {
             r.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return 0,
-                else => |e| return e,
+                else => |e| return self.ioError(e),
             };
         }
         const avail = r.end - r.seek;
@@ -127,16 +146,15 @@ pub const HttpConn = struct {
         return n;
     }
 
-    pub fn writeAll(self: *HttpConn, io: std.Io, data: []const u8, timeout_ns: ?u64) !void {
-        _ = io;
-        _ = timeout_ns;
+    pub fn writeAll(self: *HttpConn, data: []const u8) !void {
+        try self.checkDeadline();
         if (self.is_tls) {
-            try self.tls_client.?.writer.writeAll(data);
-            try self.tls_client.?.writer.flush();
-            try self.stream_writer.interface.flush();
+            self.tls_client.?.writer.writeAll(data) catch |err| return self.ioError(err);
+            self.tls_client.?.writer.flush() catch |err| return self.ioError(err);
+            self.stream_writer.interface.flush() catch |err| return self.ioError(err);
         } else {
-            try self.stream_writer.interface.writeAll(data);
-            try self.stream_writer.interface.flush();
+            self.stream_writer.interface.writeAll(data) catch |err| return self.ioError(err);
+            self.stream_writer.interface.flush() catch |err| return self.ioError(err);
         }
     }
 

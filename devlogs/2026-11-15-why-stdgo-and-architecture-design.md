@@ -4,6 +4,8 @@
 **作者**: stdgo 团队  
 **仓库**: [https://github.com/jiacai2050/stdgo](https://github.com/jiacai2050/stdgo)
 
+> 本文记录 2026-11-15 的状态。其中 `stdgo.context` 和进程级联取消后来已移除，详见 [Context 改造记录](2026-11-21-context-removal.md)。
+
 ---
 
 ## 1. 为什么要有 stdgo？

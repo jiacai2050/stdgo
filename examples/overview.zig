@@ -96,20 +96,15 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(hexdump);
     std.debug.print("   Hex Dump:\n{s}\n", .{hexdump});
 
-    // 8. Context, Sync Pool & Math Rand
+    // 8. Cancellation signal & Math Rand
     var r = stdgo.math.rand.Rand.init(2026);
     const lucky_num = r.intn(100);
 
-    const bg = stdgo.context.background();
-    var val_ctx = try stdgo.context.withValue(gpa, bg, "user", "gopher");
-    defer gpa.destroy(val_ctx);
-
-    var cancel_ctx = try stdgo.context.withCancel(gpa, val_ctx.context());
-    defer gpa.destroy(cancel_ctx);
-
-    cancel_ctx.cancel();
-    std.debug.print("8. Context canceled: {any}, Lucky Number: {d}\n", .{
-        cancel_ctx.context().done(),
+    var source = stdgo.io.CancelSource.init();
+    const token = source.token();
+    source.cancel(init.io);
+    std.debug.print("8. Signal canceled: {any}, Lucky Number: {d}\n", .{
+        token.isCanceled(),
         lucky_num,
     });
 

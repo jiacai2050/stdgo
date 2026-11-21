@@ -30,7 +30,6 @@ pub const Listener = conn.Listener;
 pub const TCPListener = conn.TCPListener;
 pub const Dialer = conn.Dialer;
 pub const dial = conn.dial;
-pub const dialContext = conn.dialContext;
 pub const listen = conn.listen;
 pub const pipe = conn.pipe;
 pub const PipePair = conn.PipePair;
@@ -104,7 +103,7 @@ test "net.listen and net.Dialer loopback integration" {
     const d = Dialer{
         .timeout = @fromBackingInt(@intCast(5 * @backingInt(time.Duration.second))),
     };
-    const client_conn = try d.dial(testing.allocator, io, "tcp", addr_str);
+    const client_conn = try d.dial(testing.allocator, io, "tcp", addr_str, .none);
     defer client_conn.close();
 
     _ = try client_conn.write("PING_STDGO");
@@ -115,11 +114,32 @@ test "net.listen and net.Dialer loopback integration" {
     try testing.expectEqualStrings("PING_STDGO", reply[0..rn]);
 }
 
+test "net.Dialer rejects expired configured and call deadlines before connecting" {
+    const std = @import("std");
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Deadline = @import("io/deadline.zig").Deadline;
+    const deadline = Deadline.after(io, .zero);
+    const configured: Dialer = .{ .deadline = deadline };
+    try testing.expectError(
+        error.Timeout,
+        configured.dial(testing.allocator, io, "tcp", "127.0.0.1:1", .none),
+    );
+    try testing.expectError(
+        error.Timeout,
+        (Dialer{}).dial(testing.allocator, io, "tcp", "127.0.0.1:1", deadline),
+    );
+}
+
 test "net.pipe in-memory bidirectional communication" {
     const testing = @import("std").testing;
     const std = @import("std");
 
-    const pair = try pipe(testing.allocator);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const pair = try pipe(testing.allocator, threaded.io());
     const c1 = pair.conn1;
     const c2 = pair.conn2;
 

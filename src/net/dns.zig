@@ -7,6 +7,7 @@ const IP = ip_mod.IP;
 const Allocator = std.mem.Allocator;
 const time_mod = @import("../time.zig");
 const Duration = time_mod.Duration;
+const Deadline = @import("../io/deadline.zig").Deadline;
 
 pub const RecordType = enum(u16) {
     A = 1,
@@ -190,13 +191,15 @@ pub const Resolver = struct {
     /// Look up host addresses returning IP structs.
     pub fn lookupIP(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![]IP {
         std.debug.assert(host.len > 0);
+        const deadline_value = self.deadline(io);
         var list: std.ArrayListUnmanaged(IP) = .empty;
         errdefer list.deinit(allocator);
 
         var last_err: ?anyerror = null;
 
         // First query IPv4 (A)
-        const a_records = self.queryRaw(allocator, io, host, .A) catch |err| switch (err) {
+        const a_records = self.queryRaw(allocator, io, host, .A, deadline_value) catch |err| switch (err) {
+            error.Timeout, error.Canceled => |e| return e,
             error.DnsNameError => null,
             else => |e| blk: {
                 last_err = e;
@@ -216,7 +219,8 @@ pub const Resolver = struct {
         }
 
         // Then query IPv6 (AAAA)
-        const aaaa_records = self.queryRaw(allocator, io, host, .AAAA) catch |err| switch (err) {
+        const aaaa_records = self.queryRaw(allocator, io, host, .AAAA, deadline_value) catch |err| switch (err) {
+            error.Timeout, error.Canceled => |e| return e,
             error.DnsNameError => null,
             else => |e| blk: {
                 last_err = e;
@@ -243,7 +247,7 @@ pub const Resolver = struct {
     /// Look up CNAME record.
     pub fn lookupCNAME(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![]const u8 {
         std.debug.assert(host.len > 0);
-        const records = try self.queryRaw(allocator, io, host, .CNAME);
+        const records = try self.queryRaw(allocator, io, host, .CNAME, self.deadline(io));
         defer {
             for (records) |r| allocator.free(r.data);
             allocator.free(records);
@@ -261,7 +265,7 @@ pub const Resolver = struct {
     /// Look up TXT records.
     pub fn lookupTXT(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![][]const u8 {
         std.debug.assert(host.len > 0);
-        const records = try self.queryRaw(allocator, io, host, .TXT);
+        const records = try self.queryRaw(allocator, io, host, .TXT, self.deadline(io));
         defer {
             for (records) |r| allocator.free(r.data);
             allocator.free(records);
@@ -286,7 +290,7 @@ pub const Resolver = struct {
     /// Look up MX records sorted by preference.
     pub fn lookupMX(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![]MX {
         std.debug.assert(host.len > 0);
-        const records = try self.queryRaw(allocator, io, host, .MX);
+        const records = try self.queryRaw(allocator, io, host, .MX, self.deadline(io));
         defer {
             for (records) |r| allocator.free(r.data);
             allocator.free(records);
@@ -324,12 +328,20 @@ pub const Resolver = struct {
         data: []u8,
     };
 
+    fn deadline(self: Resolver, io: std.Io) Deadline {
+        const duration = self.timeout orelse return .none;
+        const ns = duration.nanoseconds();
+        if (ns <= 0) return .none;
+        return Deadline.after(io, .{ .nanoseconds = ns });
+    }
+
     fn queryRaw(
         self: Resolver,
         allocator: Allocator,
         io: std.Io,
         host: []const u8,
         qtype: RecordType,
+        deadline_value: Deadline,
     ) ![]RawRecord {
         std.debug.assert(host.len > 0);
         const uc = try udp_mod.dialUDP(allocator, io, "udp", null, self.nameserver);
@@ -341,11 +353,11 @@ pub const Resolver = struct {
         const query_id: u16 = std.mem.readInt(u16, &rand_bytes, .big);
         const q_len = try buildQuery(query_id, host, qtype, &query_buf);
 
-        const sent = try uc.write(query_buf[0..q_len]);
+        const sent = try uc.writeDeadline(query_buf[0..q_len], deadline_value);
         std.debug.assert(sent == q_len);
 
         var resp_buf: [1500]u8 = undefined;
-        const rn = try uc.read(&resp_buf);
+        const rn = try uc.readDeadline(&resp_buf, deadline_value);
         if (rn < 12) return error.DnsPacketTooShort;
 
         const packet = resp_buf[0..rn];
@@ -480,4 +492,20 @@ test "net.dns: lookupIP propagates network errors instead of swallowing into NoR
     const res = r.lookupIP(testing.allocator, io, "example.com");
     // Must propagate the underlying parsing/network error, NEVER swallow into NoRecordsFound!
     try testing.expect(res != error.NoRecordsFound);
+}
+
+test "net.dns: resolver timeout bounds an unresponsive nameserver" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const server = try udp_mod.listenUDP(testing.allocator, io, "udp", "127.0.0.1:0");
+    defer server.close();
+    const address = try testing.allocator.print("127.0.0.1:{d}", .{server.port()});
+    defer testing.allocator.free(address);
+    const resolver: Resolver = .{
+        .nameserver = address,
+        .timeout = @fromBackingInt(50 * std.time.ns_per_ms),
+    };
+    try testing.expectError(error.Timeout, resolver.lookupIP(testing.allocator, io, "example.test"));
 }

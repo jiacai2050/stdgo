@@ -1,7 +1,7 @@
 const std = @import("std");
 const time_mod = @import("time.zig");
 const duration_mod = @import("duration.zig");
-const context = @import("../context.zig");
+const deadlines = @import("../io/deadline.zig");
 const Mutex = @import("../sync/mutex.zig").Mutex;
 
 pub const Time = time_mod.Time;
@@ -28,6 +28,7 @@ pub const Reservation = struct {
     tokens: u32,
     time_to_act: Time,
     limit: Limit,
+    generation: u64 = 0,
 
     pub fn delayFrom(self: Reservation, now: Time) Duration {
         if (!self.ok) return @fromBackingInt(@intCast(0));
@@ -45,21 +46,26 @@ pub const Reservation = struct {
     }
 
     pub fn cancelAt(self: *Reservation, now: Time) void {
-        if (!self.ok) return;
         self.lim.mutex.lock();
         defer self.lim.mutex.unlock();
-        self.lim.advance(now);
-        self.lim.tokens = @min(
-            @as(f64, @floatFromInt(self.lim.burst_val)),
-            self.lim.tokens + @as(f64, @floatFromInt(self.tokens)),
-        );
+        if (!self.ok) return;
+        if (self.time_to_act.sub(now).nanoseconds() > 0 and
+            !self.lim.refunds_disabled and self.generation == self.lim.generation)
+        {
+            self.lim.advance(now);
+            self.lim.tokens = @min(
+                @as(f64, @floatFromInt(self.lim.burst_val)),
+                self.lim.tokens + @as(f64, @floatFromInt(self.tokens)),
+            );
+        }
         self.ok = false;
+        self.lim.bumpGeneration();
     }
 };
 
 pub const RateError = error{
     ExceedsBurst,
-} || context.Error || std.Io.Cancelable || std.Io.UnexpectedError;
+} || deadlines.Error || std.Io.Cancelable;
 
 /// Limiter controls how frequently events are allowed to happen.
 /// It implements a "token bucket" of size b, initially full and refilled
@@ -70,6 +76,8 @@ pub const Limiter = struct {
     tokens: f64,
     last: Time,
     mutex: Mutex = .{},
+    generation: u64 = 0,
+    refunds_disabled: bool = false,
 
     pub fn init(r: Limit, b: u32) Limiter {
         return .{
@@ -90,6 +98,7 @@ pub const Limiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.limit_val = new_limit;
+        self.bumpGeneration();
     }
 
     pub fn setLimitAt(self: *Limiter, now: Time, new_limit: Limit) void {
@@ -97,6 +106,7 @@ pub const Limiter = struct {
         defer self.mutex.unlock();
         self.advance(now);
         self.limit_val = new_limit;
+        self.bumpGeneration();
     }
 
     pub fn burst(self: *Limiter) u32 {
@@ -109,6 +119,7 @@ pub const Limiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.burst_val = new_burst;
+        self.bumpGeneration();
         if (self.tokens > @as(f64, @floatFromInt(new_burst))) {
             self.tokens = @as(f64, @floatFromInt(new_burst));
         }
@@ -119,8 +130,17 @@ pub const Limiter = struct {
         defer self.mutex.unlock();
         self.advance(now);
         self.burst_val = new_burst;
+        self.bumpGeneration();
         if (self.tokens > @as(f64, @floatFromInt(new_burst))) {
             self.tokens = @as(f64, @floatFromInt(new_burst));
+        }
+    }
+
+    fn bumpGeneration(self: *Limiter) void {
+        if (self.generation == std.math.maxInt(u64)) {
+            self.refunds_disabled = true;
+        } else {
+            self.generation += 1;
         }
     }
 
@@ -183,12 +203,14 @@ pub const Limiter = struct {
         const n_f = @as(f64, @floatFromInt(n));
         if (self.tokens >= n_f) {
             self.tokens -= n_f;
+            self.bumpGeneration();
             return .{
                 .ok = true,
                 .lim = self,
                 .tokens = n,
                 .time_to_act = now,
                 .limit = self.limit_val,
+                .generation = self.generation,
             };
         }
 
@@ -222,6 +244,7 @@ pub const Limiter = struct {
 
         const time_to_act = now.add(delay_d);
         self.tokens -= n_f;
+        self.bumpGeneration();
 
         return .{
             .ok = true,
@@ -229,17 +252,20 @@ pub const Limiter = struct {
             .tokens = n,
             .time_to_act = time_to_act,
             .limit = self.limit_val,
+            .generation = self.generation,
         };
     }
 
-    /// Wait is shorthand for WaitN(ctx, io, 1).
-    pub fn wait(self: *Limiter, ctx: context.Context, io: std.Io) RateError!void {
-        return self.waitN(ctx, io, 1);
+    /// Wait is shorthand for waitN(io, 1, deadline).
+    pub fn wait(self: *Limiter, io: std.Io, deadline: deadlines.Deadline) RateError!void {
+        return self.waitN(io, 1, deadline);
     }
 
-    /// WaitN blocks until n events are allowed, or until ctx is canceled.
-    pub fn waitN(self: *Limiter, ctx: context.Context, io: std.Io, n: u32) RateError!void {
-        if (ctx.errWithIo(io)) |e| return e;
+    /// WaitN blocks until n events are allowed, the task is canceled, or the deadline expires.
+    pub fn waitN(self: *Limiter, io: std.Io, n: u32, deadline: deadlines.Deadline) RateError!void {
+        try deadline.validate();
+        try io.checkCancel();
+        try deadline.check(io);
 
         const now = Time.now(io);
         var res = self.reserveN(now, n);
@@ -248,29 +274,17 @@ pub const Limiter = struct {
         const d = res.delayFrom(now);
         if (d.nanoseconds() <= 0) return;
 
-        // Check deadline before sleeping
-        if (ctx.deadline()) |dl| {
-            if (now.add(d).sub(dl).nanoseconds() > 0) {
-                res.cancelAt(now);
-                return context.Error.DeadlineExceeded;
+        const ready_at = deadlines.Deadline.after(io, .fromNanoseconds(d.nanoseconds())).timestamp.?;
+        if (deadline.timestamp) |end| {
+            if (ready_at.compare(.gt, end)) {
+                res.cancelAt(Time.now(io));
+                return error.Timeout;
             }
         }
-
-        const timeout: std.Io.Timeout = .{ .duration = .{
-            .raw = .fromNanoseconds(d.nanoseconds()),
-            .clock = .awake,
-        } };
-        ctx.waitTimeout(io, timeout) catch |wait_err| switch (wait_err) {
-            error.Timeout => {},
-            error.Canceled, error.DeadlineExceeded => |e| {
-                res.cancelAt(Time.now(io));
-                return e;
-            },
-        };
-        if (ctx.errWithIo(io)) |e| {
+        ready_at.wait(io) catch |err| {
             res.cancelAt(Time.now(io));
-            return e;
-        }
+            return err;
+        };
     }
 };
 
@@ -323,7 +337,45 @@ test "rate.Limiter reservation and cancellation" {
     try testing.expect(r3.ok);
 }
 
-test "rate.Limiter wait with context and std.Io" {
+test "rate.Limiter cancel preserves later reservations" {
+    const testing = std.testing;
+    var lim = Limiter.init(1, 1);
+    const start = Time.unix(2000, 0);
+    try testing.expect(lim.allowN(start, 1));
+    var first = lim.reserveN(start, 1);
+    const second = lim.reserveN(start, 1);
+    try testing.expectEqual(@as(i64, std.time.ns_per_s), first.delayFrom(start).nanoseconds());
+    try testing.expectEqual(@as(i64, 2 * std.time.ns_per_s), second.delayFrom(start).nanoseconds());
+    first.cancelAt(start);
+    first.cancelAt(start);
+    const second_ready = start.add(@fromBackingInt(@as(i64, 2 * std.time.ns_per_s)));
+    try testing.expect(!lim.allowN(second_ready, 1));
+}
+
+test "rate.Limiter configuration changes invalidate reservation refunds" {
+    const testing = std.testing;
+    const start = Time.unix(2000, 0);
+    var lim = Limiter.init(1, 1);
+    try testing.expect(lim.allowN(start, 1));
+    var reservation = lim.reserveN(start, 1);
+    lim.setLimitAt(start, 2);
+    reservation.cancelAt(start);
+    try testing.expectEqual(@as(f64, -1), lim.tokens);
+}
+
+test "rate.Limiter generation overflow disables refunds" {
+    const testing = std.testing;
+    const start = Time.unix(2000, 0);
+    var lim = Limiter.init(1, 1);
+    try testing.expect(lim.allowN(start, 1));
+    lim.generation = std.math.maxInt(u64);
+    var reservation = lim.reserveN(start, 1);
+    try testing.expect(lim.refunds_disabled);
+    reservation.cancelAt(start);
+    try testing.expectEqual(@as(f64, -1), lim.tokens);
+}
+
+test "rate.Limiter wait with deadline and std.Io" {
     const testing = std.testing;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -331,25 +383,18 @@ test "rate.Limiter wait with context and std.Io" {
     const io = threaded.io();
 
     var lim = Limiter.init(50, 2); // 50 tokens/sec
-    const bg = context.background();
 
     // Burst tokens should not wait
-    try lim.wait(bg, io);
-    try lim.wait(bg, io);
+    try lim.wait(io, .none);
+    try lim.wait(io, .none);
 
     // Next token should wait ~20ms and succeed
-    try lim.wait(bg, io);
-
-    // Test context deadline exceeded
-    const expired = Time.unix(0, 0);
-    const dl_node = try context.withDeadline(testing.allocator, bg, expired);
-    defer testing.allocator.destroy(dl_node);
+    try lim.wait(io, .none);
 
     // Consume burst
     _ = lim.reserve(io);
     _ = lim.reserve(io);
 
     // Should fail with deadline exceeded because deadline is already in the past
-    const err = lim.wait(dl_node.context(), io);
-    try testing.expectEqual(context.Error.DeadlineExceeded, err);
+    try testing.expectError(error.Timeout, lim.wait(io, deadlines.Deadline.after(io, .zero)));
 }

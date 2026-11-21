@@ -1,13 +1,12 @@
 //! Example demonstrating stdgo's net.http Client capabilities:
-//! 1. Client initialization with timeout & proxy configuration
-//! 2. Context-bound cancellation
+//! 1. Client initialization and proxy configuration
+//! 2. HTTP request deadlines
 //! 3. Streaming uploads via io.Reader (Transfer-Encoding: chunked)
 //! 4. Transparent Gzip response decompression
 
 const std = @import("std");
 const stdgo = @import("stdgo");
 const http = stdgo.net.http;
-const context = stdgo.context;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
@@ -102,13 +101,13 @@ pub fn main(init: std.process.Init) !void {
     // 2. Configure HTTP Client with Options
     // -------------------------------------------------------------
     var client = http.Client.init(gpa, io, .{
-        .timeout_ns = 5 * std.time.ns_per_s, // 5 second end-to-end deadline
+        .timeout_ns = 5 * std.time.ns_per_s,
         .max_redirects = 5,
         .proxy_from_env = false, // disable env proxy for loopback demo
     });
     defer client.deinit();
 
-    std.debug.print("1. Client initialized with 5s timeout\n", .{});
+    std.debug.print("1. Client initialized with a 5s request and response-body budget\n", .{});
 
     // -------------------------------------------------------------
     // 3. Streaming Chunked Upload via stdgo.io.Reader
@@ -121,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
     var upload_req = try http.newRequestWithReader(gpa, .POST, upload_url, stream_src.reader(), null);
     defer upload_req.deinit();
 
-    var upload_resp = try client.do(&upload_req);
+    var upload_resp = try client.do(&upload_req, .none);
     defer upload_resp.close();
 
     const upload_body = try upload_resp.readAllAlloc(1024);
@@ -148,23 +147,17 @@ pub fn main(init: std.process.Init) !void {
     server_thread.join();
 
     // -------------------------------------------------------------
-    // 5. Context Cancellation Demo
+    // 5. Deadline capability
     // -------------------------------------------------------------
-    var cancel_ctx = try context.withCancel(gpa, context.background());
-    defer gpa.destroy(cancel_ctx);
-
     var req_ctx = try http.newRequest(gpa, .GET, "http://127.0.0.1:1/cancelled", null);
     defer req_ctx.deinit();
-    req_ctx.withContext(cancel_ctx.context());
-
-    // Cancel before or during request
-    cancel_ctx.cancel();
-    if (client.do(&req_ctx)) |res_val| {
+    const deadline = stdgo.io.Deadline.after(io, .fromNanoseconds(0));
+    if (client.do(&req_ctx, deadline)) |res_val| {
         var res = res_val;
         res.close();
-        std.debug.print("\n4. Context-cancelled request unexpected success\n", .{});
+        std.debug.print("\n4. Expired deadline request unexpectedly succeeded\n", .{});
     } else |err| {
-        std.debug.print("\n4. Context-cancelled request result: {s} (Expected: Canceled)\n", .{@errorName(err)});
+        std.debug.print("\n4. Deadline request result: {s} (Expected: Timeout)\n", .{@errorName(err)});
     }
 
     // -------------------------------------------------------------

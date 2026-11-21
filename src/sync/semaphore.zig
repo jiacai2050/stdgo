@@ -1,24 +1,18 @@
 //! Package sync/semaphore provides a weighted semaphore implementation,
 //! equivalent to Go's golang.org/x/sync/semaphore.
 //!
-//! Designed for cooperative concurrency control without POSIX C system calls,
-//! fully integrating with stdgo.context.Context for deadlines and cancellation.
-
 const std = @import("std");
-const Mutex = @import("mutex.zig").Mutex;
-const context = @import("../context.zig");
-const Context = context.Context;
+const deadlines = @import("../io/deadline.zig");
 
 pub const Error = error{
-    Canceled,
-    DeadlineExceeded,
     WeightExceedsCapacity,
-};
+} || deadlines.Error || std.Io.Cancelable;
 
 /// Waiter node in the FIFO queue to guarantee fair, starvation-free scheduling.
 const Waiter = struct {
     n: i64,
-    ready: std.atomic.Value(bool),
+    ready: std.Io.Event = .unset,
+    granted: bool = false,
     next: ?*Waiter = null,
     prev: ?*Waiter = null,
 };
@@ -27,31 +21,22 @@ const Waiter = struct {
 pub const Weighted = struct {
     size: i64,
     cur: i64 = 0,
-    io: ?std.Io = null,
-    mu: Mutex = .{},
+    mu: std.Io.Mutex = .init,
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
 
     /// Initializes a Weighted semaphore with the given maximum weight capacity.
-    /// An optional std.Io can be provided to drive cooperative sleeping without OS calls.
-    pub fn init(n: i64, io: ?std.Io) Weighted {
+    pub fn init(n: i64) Weighted {
         std.debug.assert(n > 0);
-        return .{
-            .size = n,
-            .cur = 0,
-            .io = io,
-            .mu = .{},
-            .head = null,
-            .tail = null,
-        };
+        return .{ .size = n };
     }
 
     /// Tries to acquire the semaphore with weight n without blocking.
     /// On success, returns true. On failure, returns false and leaves the semaphore unchanged.
-    pub fn tryAcquire(self: *Weighted, n: i64) bool {
+    pub fn tryAcquire(self: *Weighted, io: std.Io, n: i64) bool {
         std.debug.assert(n > 0);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
 
         if (self.size - self.cur >= n and self.head == null) {
             self.cur += n;
@@ -61,34 +46,29 @@ pub const Weighted = struct {
     }
 
     /// Acquires the semaphore with weight n, blocking until resources are available
-    /// or ctx is done (canceled or deadline exceeded).
+    /// or the task is canceled or the deadline expires.
     /// On failure, no resources are retained.
-    pub fn acquire(self: *Weighted, ctx: Context, n: i64) Error!void {
+    pub fn acquire(self: *Weighted, io: std.Io, n: i64, deadline: deadlines.Deadline) Error!void {
         std.debug.assert(n > 0);
         if (n > self.size) {
             return Error.WeightExceedsCapacity;
         }
 
-        self.mu.lock();
-
-        // 1. Fast path: enough capacity and nobody ahead in FIFO queue
+        try deadline.validate();
+        try io.checkCancel();
+        try self.mu.lock(io);
+        deadline.check(io) catch |err| {
+            self.mu.unlock(io);
+            return err;
+        };
         if (self.size - self.cur >= n and self.head == null) {
             self.cur += n;
-            self.mu.unlock();
+            self.mu.unlock(io);
             return;
         }
 
-        // Check if context is already expired
-        if (ctx.done()) {
-            self.mu.unlock();
-            return mapContextError(ctx);
-        }
-
-        // 2. Slow path: enqueue waiter to ensure FIFO fairness and prevent starvation
         var w = Waiter{
             .n = n,
-            .ready = std.atomic.Value(bool).init(false),
-            .next = null,
             .prev = self.tail,
         };
 
@@ -100,52 +80,63 @@ pub const Weighted = struct {
             self.tail = &w;
         }
 
-        self.mu.unlock();
+        self.mu.unlock(io);
 
-        // 3. Wait loop: yield / sleep cooperatively while monitoring ready and ctx
         while (true) {
-            if (w.ready.load(.acquire)) {
+            const result = if (!deadline.isNone())
+                w.ready.waitTimeout(io, deadline.timeout())
+            else
+                w.ready.wait(io);
+            self.mu.lockUncancelable(io);
+            if (result) |_| {
+                std.debug.assert(w.granted);
+                self.mu.unlock(io);
                 return;
-            }
-
-            if (ctx.done()) {
-                self.mu.lock();
-                // Check if ready became true just before taking the lock
-                if (w.ready.load(.acquire)) {
-                    self.mu.unlock();
-                    return;
-                }
-
-                // Remove from waiter queue
-                self.removeWaiter(&w);
-                // Wake up next eligible waiters if any
-                self.notifyWaiters();
-                self.mu.unlock();
-                return mapContextError(ctx);
-            }
-
-            if (self.io) |io_val| {
-                io_val.sleep(std.Io.Duration.fromNanoseconds(100 * std.time.ns_per_us), .awake) catch {};
-            } else {
-                std.Thread.yield() catch {};
+            } else |err| switch (err) {
+                error.Canceled => {
+                    if (w.granted) {
+                        self.cur -= n;
+                    } else {
+                        self.removeWaiter(&w);
+                    }
+                    self.notifyWaiters(io);
+                    self.mu.unlock(io);
+                    return error.Canceled;
+                },
+                error.Timeout => {
+                    if (w.granted) {
+                        self.mu.unlock(io);
+                        return;
+                    }
+                    deadline.check(io) catch |check_err| switch (check_err) {
+                        error.InvalidDeadline => unreachable,
+                        error.Timeout => {
+                            self.removeWaiter(&w);
+                            self.notifyWaiters(io);
+                            self.mu.unlock(io);
+                            return error.Timeout;
+                        },
+                    };
+                    self.mu.unlock(io);
+                },
             }
         }
     }
 
     /// Releases the semaphore with a weight of n.
-    pub fn release(self: *Weighted, n: i64) void {
+    pub fn release(self: *Weighted, io: std.Io, n: i64) void {
         std.debug.assert(n > 0);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
 
         self.cur -= n;
         std.debug.assert(self.cur >= 0);
 
-        self.notifyWaiters();
+        self.notifyWaiters(io);
     }
 
     /// Wakes up as many FIFO waiters as capacity allows.
-    fn notifyWaiters(self: *Weighted) void {
+    fn notifyWaiters(self: *Weighted, io: std.Io) void {
         while (self.head) |w| {
             if (self.size - self.cur < w.n) {
                 // Front waiter cannot be satisfied; don't bypass (FIFO)
@@ -153,7 +144,8 @@ pub const Weighted = struct {
             }
             self.cur += w.n;
             self.removeWaiter(w);
-            w.ready.store(true, .release);
+            w.granted = true;
+            w.ready.set(io);
         }
     }
 
@@ -173,16 +165,6 @@ pub const Weighted = struct {
         w.prev = null;
         w.next = null;
     }
-
-    fn mapContextError(ctx: Context) Error {
-        if (ctx.err()) |e| {
-            return switch (e) {
-                error.Canceled => Error.Canceled,
-                error.DeadlineExceeded => Error.DeadlineExceeded,
-            };
-        }
-        return Error.Canceled;
-    }
 };
 
 // -------------------------------------------------------------------------
@@ -192,66 +174,136 @@ pub const Weighted = struct {
 test "Weighted: tryAcquire and release" {
     const testing = std.testing;
 
-    var sem = Weighted.init(3, null);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sem = Weighted.init(3);
 
-    try testing.expect(sem.tryAcquire(2));
-    try testing.expect(!sem.tryAcquire(2)); // Remaining is 1
-    try testing.expect(sem.tryAcquire(1)); // Remaining is 0
-    try testing.expect(!sem.tryAcquire(1));
+    try testing.expect(sem.tryAcquire(io, 2));
+    try testing.expect(!sem.tryAcquire(io, 2));
+    try testing.expect(sem.tryAcquire(io, 1));
+    try testing.expect(!sem.tryAcquire(io, 1));
 
-    sem.release(2);
-    try testing.expect(sem.tryAcquire(2));
-    sem.release(3);
+    sem.release(io, 2);
+    try testing.expect(sem.tryAcquire(io, 2));
+    sem.release(io, 3);
 }
 
-test "Weighted: acquire with background context" {
+test "Weighted: acquire and deadline" {
     const testing = std.testing;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    var sem = Weighted.init(2, io);
-    const bg = context.background();
+    var sem = Weighted.init(2);
 
-    try sem.acquire(bg, 1);
-    try sem.acquire(bg, 1);
-    try testing.expect(!sem.tryAcquire(1));
+    try sem.acquire(io, 1, .none);
+    try sem.acquire(io, 1, .none);
+    try testing.expect(!sem.tryAcquire(io, 1));
+    try testing.expectError(error.Timeout, sem.acquire(io, 1, deadlines.Deadline.after(io, .zero)));
+    try testing.expectError(error.WeightExceedsCapacity, sem.acquire(io, 3, .none));
 
-    sem.release(2);
+    sem.release(io, 2);
 }
 
-test "Weighted: acquire context cancel" {
+test "Weighted: cancel a waiting task" {
     const testing = std.testing;
 
-    var sem = Weighted.init(1, null);
-    const bg = context.background();
-    try sem.acquire(bg, 1);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sem = Weighted.init(1);
+    try sem.acquire(io, 1, .none);
 
-    var cancel_ctx = try context.withCancel(testing.allocator, bg);
-    defer testing.allocator.destroy(cancel_ctx);
+    const Worker = struct {
+        fn run(s: *Weighted, task_io: std.Io) Error!void {
+            try s.acquire(task_io, 1, .none);
+        }
+    };
+    var future = try io.concurrent(Worker.run, .{ &sem, io });
+    try testing.expectError(error.Canceled, future.cancel(io));
+    sem.release(io, 1);
+    try testing.expect(sem.tryAcquire(io, 1));
+    sem.release(io, 1);
+}
 
-    // Cancel immediately
-    cancel_ctx.cancel();
+test "Weighted: queued waiters are served in FIFO order" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sem = Weighted.init(3);
+    try sem.acquire(io, 2, .none);
+    var held: i64 = 2;
+    defer if (held > 0) sem.release(io, held);
 
-    const err = sem.acquire(cancel_ctx.context(), 1);
-    try testing.expectEqual(Error.Canceled, err);
-
-    sem.release(1);
+    const Worker = struct {
+        fn run(s: *Weighted, task_io: std.Io, weight: i64, acquired: *std.Io.Event, gate: *std.Io.Event) !void {
+            try s.acquire(task_io, weight, .none);
+            defer s.release(task_io, weight);
+            acquired.set(task_io);
+            try gate.wait(task_io);
+        }
+        fn waitQueued(s: *Weighted, task_io: std.Io, count: usize) !void {
+            for (0..1000) |_| {
+                s.mu.lockUncancelable(task_io);
+                var waiter = s.head;
+                var queued: usize = 0;
+                while (waiter) |node| : (waiter = node.next) queued += 1;
+                s.mu.unlock(task_io);
+                if (queued >= count) return;
+                try task_io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.WaiterDidNotBlock;
+        }
+    };
+    var first_acquired: std.Io.Event = .unset;
+    var second_acquired: std.Io.Event = .unset;
+    var first_gate: std.Io.Event = .unset;
+    var second_gate: std.Io.Event = .unset;
+    var first = try io.concurrent(Worker.run, .{ &sem, io, 2, &first_acquired, &first_gate });
+    var first_pending = true;
+    defer if (first_pending) {
+        first.cancel(io) catch {};
+    };
+    try Worker.waitQueued(&sem, io, 1);
+    var second = try io.concurrent(Worker.run, .{ &sem, io, 1, &second_acquired, &second_gate });
+    var second_pending = true;
+    defer if (second_pending) {
+        second.cancel(io) catch {};
+    };
+    try Worker.waitQueued(&sem, io, 2);
+    try testing.expect(!second_acquired.isSet());
+    sem.release(io, 1);
+    held -= 1;
+    try first_acquired.wait(io);
+    try testing.expect(!second_acquired.isSet());
+    first_gate.set(io);
+    try second_acquired.wait(io);
+    second_gate.set(io);
+    const first_result = first.await(io);
+    first_pending = false;
+    try first_result;
+    const second_result = second.await(io);
+    second_pending = false;
+    try second_result;
 }
 
 test "Weighted: concurrent worker rate limiting" {
     const testing = std.testing;
 
-    var sem = Weighted.init(2, null);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sem = Weighted.init(2);
     var active_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
     var max_observed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
     const Worker = struct {
-        fn run(s: *Weighted, active: *std.atomic.Value(usize), max_obs: *std.atomic.Value(usize)) void {
-            const bg = context.background();
+        fn run(s: *Weighted, task_io: std.Io, active: *std.atomic.Value(usize), max_obs: *std.atomic.Value(usize)) void {
             for (0..10) |_| {
-                s.acquire(bg, 1) catch return;
+                s.acquire(task_io, 1, .none) catch return;
                 const cur = active.fetchAdd(1, .monotonic) + 1;
 
                 var old_max = max_obs.load(.monotonic);
@@ -265,15 +317,15 @@ test "Weighted: concurrent worker rate limiting" {
                 }
                 std.mem.doNotOptimizeAway(dummy);
                 _ = active.fetchSub(1, .monotonic);
-                s.release(1);
+                s.release(task_io, 1);
             }
         }
     };
 
-    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, &active_count, &max_observed });
-    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, &active_count, &max_observed });
-    const t3 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, &active_count, &max_observed });
-    const t4 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, &active_count, &max_observed });
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, io, &active_count, &max_observed });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, io, &active_count, &max_observed });
+    const t3 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, io, &active_count, &max_observed });
+    const t4 = try std.Thread.spawn(.{}, Worker.run, .{ &sem, io, &active_count, &max_observed });
 
     t1.join();
     t2.join();

@@ -8,6 +8,7 @@ const Conn = conn_mod.Conn;
 const Addr = addr_mod.Addr;
 const UDPAddr = addr_mod.UDPAddr;
 const Allocator = std.mem.Allocator;
+const Deadline = @import("../io/deadline.zig").Deadline;
 
 /// PacketConn is a generic packet-oriented network connection,
 /// equivalent to Go's net.PacketConn interface.
@@ -101,7 +102,21 @@ pub const UDPConn = struct {
     }
 
     pub fn readFrom(self: *UDPConn, buf: []u8) anyerror!PacketConn.ReadFromResult {
-        const msg = try self.socket.receive(self.io, buf);
+        return self.readFromDeadline(buf, .none);
+    }
+
+    pub fn readFromDeadline(self: *UDPConn, buf: []u8, deadline: Deadline) anyerror!PacketConn.ReadFromResult {
+        var message: std.Io.net.IncomingMessage = .init;
+        const result = try self.operate(.{ .net_receive = .{
+            .socket_handle = self.socket.handle,
+            .message_buffer = (&message)[0..1],
+            .data_buffer = buf,
+            .flags = .{},
+        } }, deadline);
+        const receive_error, const count = result.net_receive;
+        if (receive_error) |err| return err;
+        if (count != 1) return error.Unexpected;
+        const msg = message;
         const sender_port = switch (msg.from) {
             .ip4 => |v4| v4.port,
             .ip6 => |v6| v6.port,
@@ -128,8 +143,12 @@ pub const UDPConn = struct {
     }
 
     pub fn read(self: *UDPConn, buf: []u8) anyerror!usize {
+        return self.readDeadline(buf, .none);
+    }
+
+    pub fn readDeadline(self: *UDPConn, buf: []u8, deadline: Deadline) anyerror!usize {
         while (true) {
-            const res = try self.readFrom(buf);
+            const res = try self.readFromDeadline(buf, deadline);
             if (self.connected_dest) |dest| {
                 const match = switch (dest) {
                     .ip4 => |v4| switch (res.addr.ip) {
@@ -148,11 +167,58 @@ pub const UDPConn = struct {
     }
 
     pub fn write(self: *UDPConn, bytes: []const u8) anyerror!usize {
+        return self.writeDeadline(bytes, .none);
+    }
+
+    pub fn writeDeadline(self: *UDPConn, bytes: []const u8, deadline: Deadline) anyerror!usize {
         if (self.connected_dest) |dest| {
-            try self.socket.send(self.io, &dest, bytes);
+            var message: std.Io.net.OutgoingMessage = .{
+                .address = &dest,
+                .data_ptr = bytes.ptr,
+                .data_len = bytes.len,
+            };
+            const result = try self.operate(.{ .net_send = .{
+                .socket_handle = self.socket.handle,
+                .messages = (&message)[0..1],
+                .flags = .{},
+            } }, deadline);
+            const send_error, const count = result.net_send;
+            if (send_error) |err| return err;
+            if (count != 1) return error.Unexpected;
             return bytes.len;
         }
         return error.SocketUnconnected;
+    }
+
+    fn operate(self: *UDPConn, operation: std.Io.Operation, deadline: Deadline) !std.Io.Operation.Result {
+        try deadline.validate();
+        if (deadline.isNone()) return self.io.operate(operation);
+        try deadline.check(self.io);
+        var ready: std.Io.Event = .unset;
+        var future = try self.io.concurrent(operateTask, .{ self.io, operation, &ready });
+        var pending = true;
+        defer if (pending) {
+            if (future.cancel(self.io)) |_| {} else |_| {}
+        };
+        while (true) {
+            try self.io.checkCancel();
+            try deadline.check(self.io);
+            const tick = deadline.earlier(Deadline.after(self.io, .fromMilliseconds(25)));
+            ready.waitTimeout(self.io, tick.timeout()) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return error.Canceled,
+            };
+            try self.io.checkCancel();
+            try deadline.check(self.io);
+            const result = future.await(self.io);
+            pending = false;
+            return result;
+        }
+    }
+
+    fn operateTask(io: std.Io, operation: std.Io.Operation, ready: *std.Io.Event) std.Io.Cancelable!std.Io.Operation.Result {
+        defer ready.set(io);
+        return io.operate(operation);
     }
 
     pub fn close(self: *UDPConn) void {

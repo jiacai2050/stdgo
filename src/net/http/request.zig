@@ -3,8 +3,6 @@ const std = @import("std");
 const Method = @import("method.zig").Method;
 const Header = @import("header.zig").Header;
 const io = @import("../../io.zig");
-const context = @import("../../context.zig");
-const Context = context.Context;
 
 pub const ParsedTarget = struct {
     scheme: []const u8,
@@ -94,7 +92,6 @@ pub const Request = struct {
     get_body_ctx: ?*anyopaque = null,
     /// Preallocated reader storage for slice bodies, populated when `setBody()` is called.
     slice_reader: std.Io.Reader = undefined,
-    ctx: ?Context = null,
     cl_str: ?[]u8 = null,
     extra_strings: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -110,7 +107,6 @@ pub const Request = struct {
             .get_body = null,
             .get_body_ctx = null,
             .slice_reader = undefined,
-            .ctx = null,
             .cl_str = null,
             .extra_strings = .empty,
         };
@@ -126,10 +122,6 @@ pub const Request = struct {
         }
         self.extra_strings.deinit(self.allocator);
         self.header.deinit();
-    }
-
-    pub fn withContext(self: *Request, ctx: Context) void {
-        self.ctx = ctx;
     }
 
     pub fn setHeader(self: *Request, name: []const u8, value: []const u8) !void {
@@ -222,7 +214,6 @@ pub const Request = struct {
         copy.body = self.body;
         copy.body_reader = self.body_reader;
         copy.content_length = self.content_length;
-        copy.ctx = self.ctx;
         return copy;
     }
 

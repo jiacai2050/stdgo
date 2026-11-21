@@ -104,6 +104,38 @@ pub fn main(init: std.process.Init) !void {
 
 ---
 
+## Cancellation and deadlines
+
+The former `stdgo.context` API has been removed. Own and join tasks with
+`std.Io.Future` or `std.Io.Group`; use `stdgo.io.CancelSource` and its borrowed
+token only for broadcasting a signal. Keep the source at a stable address until
+all token users and concurrent cancellation calls have finished.
+
+Semaphore and rate-limiter waits, network operations, HTTP requests, and SQL
+operations accept a `Deadline` (`.none` or an `.awake` absolute deadline). TCP and
+in-memory connections expose `readDeadline` and `writeDeadline`; `net.pipe`
+requires an injected `std.Io`. HTTP client timeouts share one budget across
+redirects and response body reads; transport options also support TLS handshake,
+response-header, `100-continue`, and idle-connection timeouts.
+
+SQL drivers must opt in to deadline support; other drivers return
+`error.DeadlineUnsupported`. SQLite checks deadlines during VM execution and pool
+waits, but an uninterruptible SQLite or filesystem call may delay return.
+Completed writes can have side effects even when a timeout is reported.
+Transaction `commit` and `rollback` also take a deadline; `rollback(.none)` remains
+available for cleanup after cancellation.
+
+Timed network operations require a concurrent, cancelable `std.Io` backend.
+Cancellation waits for the underlying operation to exit, so an uncooperative backend
+or request body reader can delay return beyond the deadline. A timed-out network
+write may have sent a prefix. Custom round trippers
+must enforce the deadline they receive. A transport with an idle-connection timeout
+must remain at a stable address after its first request until it is deinitialized.
+Subprocess cancellation during child wait is deferred until the child exits.
+See [timeout limitations and Go comparison](docs/timeouts.md) for details.
+
+---
+
 ## Modular Examples
 
 Every single module in `stdgo` is accompanied by a dedicated, runnable example in the `examples/` directory:
@@ -111,9 +143,9 @@ Every single module in `stdgo` is accompanied by a dedicated, runnable example i
 | Example Step | Source File | Description |
 | :--- | :--- | :--- |
 | `zig build run` | [`examples/overview.zig`](examples/overview.zig) | Comprehensive cross-module tour |
-| `zig build run-http` | [`examples/http_client.zig`](examples/http_client.zig) | HTTP Client with SOCKS5/HTTP proxy, timeout, chunked upload, gzip & context cancellation |
+| `zig build run-http` | [`examples/http_client.zig`](examples/http_client.zig) | HTTP client with SOCKS5/HTTP proxy, chunked upload, and gzip |
 | `zig build run-slog` | [`examples/slog.zig`](examples/slog.zig) | Structured logging with `TextHandler`, `JSONHandler`, and attributes |
-| `zig build run-errgroup` | [`examples/errgroup.zig`](examples/errgroup.zig) | Concurrent task group with error propagation, cancellation, & rate limiting |
+| `zig build run-errgroup` | [`examples/errgroup.zig`](examples/errgroup.zig) | Bounded task group with error propagation and sibling cancellation |
 | `zig build run-multipart` | [`examples/multipart.zig`](examples/multipart.zig) | RFC 2046 multipart form-data writer and streaming reader |
 | `zig build run-hmac` | [`examples/hmac.zig`](examples/hmac.zig) | HMAC-SHA256, HMAC-MD5 signing and constant-time verification |
 | `zig build run-archive` | [`examples/archive.zig`](examples/archive.zig) | In-memory TAR and ZIP archive creation and inspection |
@@ -122,11 +154,10 @@ Every single module in `stdgo` is accompanied by a dedicated, runnable example i
 | `zig build run-bytes-strings` | [`examples/bytes_strings.zig`](examples/bytes_strings.zig) | `bytes.Buffer`, `strings.Builder`, trimming, splitting, and join |
 | `zig build run-compress` | [`examples/compress.zig`](examples/compress.zig) | `compress.gzip` (RFC 1952), `compress.zlib` (RFC 1950 Adler-32), and `compress.flate` (RFC 1951 Deflate) |
 | `zig build run-container` | [`examples/container.zig`](examples/container.zig) | Doubly-linked list (`List`), Min-heap (`Heap`), circular ring buffer (`Ring`) |
-| `zig build run-context` | [`examples/context.zig`](examples/context.zig) | Context trees, `withValue` metadata, `withCancel`, `withDeadline` |
 | `zig build run-crypto` | [`examples/crypto.zig`](examples/crypto.zig) | One-shot and streaming SHA-256 and MD5 cryptographic digests |
 | `zig build run-encoding` | [`examples/encoding.zig`](examples/encoding.zig) | RFC 4180 CSV reader/writer, Protobuf Varint, Base64, and Hex dump |
 | `zig build run-base32` | [`examples/base32.zig`](examples/base32.zig) | RFC 4648 Base32 encoding, `StdEncoding`, `HexEncoding`, TOTP unpadded |
-| `zig build run-exec` | [`examples/exec.zig`](examples/exec.zig) | External command execution, piped standard I/O streams, and context cancellation |
+| `zig build run-exec` | [`examples/exec.zig`](examples/exec.zig) | External command execution and piped standard I/O streams |
 | `zig build run-flag` | [`examples/flag.zig`](examples/flag.zig) | Command-line flag parsing (`FlagSet`), argument bindings, and defaults |
 | `zig build run-json` | [`examples/json.zig`](examples/json.zig) | RFC 8259 JSON streaming `Decoder`/`Encoder`, Token iterator, `marshal`/`unmarshal` |
 | `zig build run-net` | [`examples/net.zig`](examples/net.zig) | IP address parsing (IPv4/IPv6), CIDR calculations, `net.listen`, `net.Dialer`, in-memory `net.pipe()`, `lookupPort` |

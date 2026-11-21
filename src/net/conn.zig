@@ -1,12 +1,11 @@
 //! Generic network connection abstraction conforming to Go's net.Conn, net.Listener, and net.Dialer interfaces.
 const std = @import("std");
 const io_mod = @import("../io.zig");
-const context = @import("../context.zig");
-const Context = context.Context;
 const time_mod = @import("../time.zig");
 const Duration = time_mod.Duration;
-const Time = time_mod.Time;
 const hostport = @import("hostport.zig");
+const connect_mod = @import("connect.zig");
+const socket_io = @import("io_util.zig");
 
 /// Conn represents a generic stream-oriented network connection,
 /// equivalent to Go's net.Conn interface.
@@ -18,6 +17,8 @@ pub const Conn = struct {
         read: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
         write: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!usize,
         close: *const fn (ctx: *anyopaque) void,
+        readDeadline: ?*const fn (ctx: *anyopaque, buf: []u8, deadline: io_mod.Deadline) anyerror!usize = null,
+        writeDeadline: ?*const fn (ctx: *anyopaque, bytes: []const u8, deadline: io_mod.Deadline) anyerror!usize = null,
         localAddr: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
         remoteAddr: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     };
@@ -28,6 +29,21 @@ pub const Conn = struct {
 
     pub fn write(self: Conn, bytes: []const u8) anyerror!usize {
         return self.vtable.write(self.ptr, bytes);
+    }
+
+    pub fn readDeadline(self: Conn, buf: []u8, deadline: io_mod.Deadline) anyerror!usize {
+        try deadline.validate();
+        if (self.vtable.readDeadline) |read_deadline| return read_deadline(self.ptr, buf, deadline);
+        if (!deadline.isNone()) return error.DeadlineUnsupported;
+        return self.read(buf);
+    }
+
+    /// A failed write may have sent a prefix of bytes before the error.
+    pub fn writeDeadline(self: Conn, bytes: []const u8, deadline: io_mod.Deadline) anyerror!usize {
+        try deadline.validate();
+        if (self.vtable.writeDeadline) |write_deadline| return write_deadline(self.ptr, bytes, deadline);
+        if (!deadline.isNone()) return error.DeadlineUnsupported;
+        return self.write(bytes);
     }
 
     pub fn close(self: Conn) void {
@@ -81,10 +97,6 @@ pub const StreamConn = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     stream: std.Io.net.Stream,
-    read_buf: [4096]u8 = undefined,
-    reader_inst: std.Io.net.Stream.Reader = undefined,
-    write_buf: [4096]u8 = undefined,
-    writer_inst: std.Io.net.Stream.Writer = undefined,
     remote_addr_buf: [64]u8 = undefined,
     remote_addr_len: usize = 0,
 
@@ -95,9 +107,6 @@ pub const StreamConn = struct {
             .io = io_inst,
             .stream = stream,
         };
-        sc.reader_inst = stream.reader(io_inst, &sc.read_buf);
-        sc.writer_inst = stream.writer(io_inst, &sc.write_buf);
-
         if (remote_addr_str) |s| {
             const copy_len = @min(s.len, sc.remote_addr_buf.len);
             @memcpy(sc.remote_addr_buf[0..copy_len], s[0..copy_len]);
@@ -115,27 +124,41 @@ pub const StreamConn = struct {
     }
 
     fn readImpl(ctx: *anyopaque, buf: []u8) anyerror!usize {
+        return readDeadlineImpl(ctx, buf, .none);
+    }
+
+    fn readDeadlineImpl(ctx: *anyopaque, buf: []u8, deadline: io_mod.Deadline) anyerror!usize {
         const self: *StreamConn = @ptrCast(@alignCast(ctx));
-        const r = &self.reader_inst.interface;
-        if (r.buffered().len == 0) {
-            r.fillMore() catch |err| {
-                if (err == error.EndOfStream) return 0;
-                return err;
-            };
-        }
-        const avail = r.buffered();
-        if (avail.len == 0) return 0;
-        const n = @min(avail.len, buf.len);
-        @memcpy(buf[0..n], avail[0..n]);
-        r.toss(n);
-        return n;
+        try self.io.checkCancel();
+        try deadline.check(self.io);
+        if (buf.len == 0) return 0;
+        var vectors: [1][]u8 = .{buf};
+        const result = try socket_io.operate(self.io, .{ .net_read = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = &vectors,
+        } }, deadline);
+        return (try result.net_read).data_len;
     }
 
     fn writeImpl(ctx: *anyopaque, bytes: []const u8) anyerror!usize {
+        return writeDeadlineImpl(ctx, bytes, .none);
+    }
+
+    fn writeDeadlineImpl(ctx: *anyopaque, bytes: []const u8, deadline: io_mod.Deadline) anyerror!usize {
         const self: *StreamConn = @ptrCast(@alignCast(ctx));
-        const w = &self.writer_inst.interface;
-        try w.writeAll(bytes);
-        try w.flush();
+        try self.io.checkCancel();
+        try deadline.check(self.io);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const vectors = [_][]const u8{bytes[offset..]};
+            const result = try socket_io.operate(self.io, .{ .net_write = .{
+                .socket_handle = self.stream.socket.handle,
+                .data = &vectors,
+            } }, deadline);
+            const written = try result.net_write;
+            if (written == 0) return error.WriteFailed;
+            offset += written;
+        }
         return bytes.len;
     }
 
@@ -156,6 +179,8 @@ pub const StreamConn = struct {
     const stream_conn_vtable: Conn.VTable = .{
         .read = readImpl,
         .write = writeImpl,
+        .readDeadline = readDeadlineImpl,
+        .writeDeadline = writeDeadlineImpl,
         .close = closeImpl,
         .remoteAddr = remoteAddrImpl,
     };
@@ -246,23 +271,29 @@ pub fn listen(allocator: std.mem.Allocator, io: std.Io, network: []const u8, add
 /// Dialer contains options for connecting to an address.
 pub const Dialer = struct {
     timeout: ?Duration = null,
-    deadline: ?Time = null,
+    deadline: io_mod.Deadline = .none,
     local_addr: ?[]const u8 = null,
     keep_alive: ?Duration = null,
 
-    pub fn dial(self: Dialer, allocator: std.mem.Allocator, io: std.Io, network: []const u8, address: []const u8) !Conn {
-        return self.dialContext(allocator, io, context.background(), network, address);
-    }
-
-    pub fn dialContext(
+    pub fn dial(
         self: Dialer,
         allocator: std.mem.Allocator,
         io: std.Io,
-        ctx: Context,
         network: []const u8,
         address: []const u8,
+        deadline: io_mod.Deadline,
     ) !Conn {
-        if (ctx.errWithIo(io)) |e| return e;
+        try deadline.validate();
+        try self.deadline.validate();
+        var effective_deadline = deadline.earlier(self.deadline);
+        if (self.timeout) |duration| {
+            if (duration.nanoseconds() > 0) {
+                effective_deadline = effective_deadline.earlier(
+                    .after(io, .{ .nanoseconds = duration.nanoseconds() }),
+                );
+            }
+        }
+        try io.checkCancel();
 
         if (!std.mem.startsWith(u8, network, "tcp")) {
             return error.UnknownNetwork;
@@ -271,43 +302,15 @@ pub const Dialer = struct {
         const hp = try hostport.splitHostPort(address);
         const port = std.fmt.parseInt(u16, hp.port, 10) catch return error.InvalidPort;
 
-        // Note: Zig 0.17.0 std.Io.Threaded netConnectIpPosix panics if options.timeout != .none:
-        // "TODO implement netConnectIpPosix with timeout".
-        // Until upstream implements POSIX connect timeout in std.Io, we must pass .none to avoid panic.
-        const timeout_io: std.Io.Timeout = .none;
-        _ = self.timeout;
-
-        var stream: std.Io.net.Stream = undefined;
-
-        if (std.Io.net.IpAddress.parse(hp.host, port)) |ip| {
-            stream = try ip.connect(io, .{ .mode = .stream, .timeout = timeout_io });
-        } else |_| {
-            var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-            if (hp.host.len > host_buf.len) return error.HostNameTooLong;
-            @memcpy(host_buf[0..hp.host.len], hp.host);
-            const host_name = try std.Io.net.HostName.init(host_buf[0..hp.host.len]);
-            stream = try host_name.connect(io, port, .{ .mode = .stream, .timeout = timeout_io });
-        }
+        var stream = try connect_mod.connect(io, hp.host, port, effective_deadline);
         errdefer stream.close(io);
 
-        if (ctx.errWithIo(io)) |e| return e;
+        try io.checkCancel();
 
         const sc = try StreamConn.init(allocator, io, stream, address);
         return sc.conn();
     }
 };
-
-/// DialContext connects to the address on the named network using the provided context.
-pub fn dialContext(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    ctx: Context,
-    network: []const u8,
-    address: []const u8,
-) !Conn {
-    const d = Dialer{};
-    return d.dialContext(allocator, io, ctx, network, address);
-}
 
 /// Dial connects to the address on the named network.
 pub fn dial(
@@ -315,8 +318,54 @@ pub fn dial(
     io: std.Io,
     network: []const u8,
     address: []const u8,
+    deadline: io_mod.Deadline,
 ) !Conn {
-    return dialContext(allocator, io, context.background(), network, address);
+    const d = Dialer{};
+    return d.dial(allocator, io, network, address, deadline);
+}
+
+test "TCP connection deadlines bound reads and preserve later use" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const stream = try server.socket.address.connect(io, .{ .mode = .stream });
+    const concrete = StreamConn.init(testing.allocator, io, stream, null) catch |err| {
+        stream.close(io);
+        return err;
+    };
+    const connection = concrete.conn();
+    defer connection.close();
+    var peer = try server.accept(io);
+    defer peer.close(io);
+
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.Timeout, connection.readDeadline(
+        &buf,
+        .after(io, .fromMilliseconds(30)),
+    ));
+    var writer_buf: [16]u8 = undefined;
+    var writer = peer.writer(io, &writer_buf);
+    try writer.interface.writeAll("hello");
+    try writer.interface.flush();
+    const count = try connection.readDeadline(&buf, .after(io, .fromSeconds(1)));
+    try testing.expectEqualStrings("hello", buf[0..count]);
+    try testing.expectError(error.Timeout, connection.writeDeadline("x", .after(io, .zero)));
+    try testing.expectEqual(@as(usize, 2), try connection.writeDeadline("ok", .after(io, .fromSeconds(1))));
+    var peer_buf: [16]u8 = undefined;
+    var reader = peer.reader(io, &peer_buf);
+    try reader.interface.fillMore();
+    try testing.expectEqualStrings("ok", reader.interface.buffered());
+    const large_payload = try testing.allocator.alloc(u8, 32 * 1024 * 1024);
+    defer testing.allocator.free(large_payload);
+    @memset(large_payload, 'x');
+    try testing.expectError(error.Timeout, connection.writeDeadline(
+        large_payload,
+        .after(io, .fromMilliseconds(50)),
+    ));
 }
 
 // -------------------------------------------------------------------------
@@ -333,10 +382,18 @@ const PipeQueue = struct {
     closed: bool = false,
     mutex: Mutex = .{},
 
-    fn write(self: *PipeQueue, data: []const u8) anyerror!usize {
+    fn write(self: *PipeQueue, io: std.Io, data: []const u8, deadline: io_mod.Deadline) anyerror!usize {
+        try deadline.check(io);
+        try io.checkCancel();
         var written: usize = 0;
         while (written < data.len) {
+            try deadline.check(io);
+            try io.checkCancel();
             self.mutex.lock();
+            deadline.check(io) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
             if (self.closed) {
                 self.mutex.unlock();
                 return error.BrokenPipe;
@@ -359,10 +416,18 @@ const PipeQueue = struct {
         return written;
     }
 
-    fn read(self: *PipeQueue, out: []u8) anyerror!usize {
+    fn read(self: *PipeQueue, io: std.Io, out: []u8, deadline: io_mod.Deadline) anyerror!usize {
+        try deadline.check(io);
+        try io.checkCancel();
         if (out.len == 0) return 0;
         while (true) {
+            try deadline.check(io);
+            try io.checkCancel();
             self.mutex.lock();
+            deadline.check(io) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
             if (self.count > 0) {
                 const chunk = @min(out.len, self.count);
                 for (0..chunk) |i| {
@@ -391,6 +456,7 @@ const PipeQueue = struct {
 
 const PipeState = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     q12: PipeQueue = .{},
     q21: PipeQueue = .{},
     refcount: usize = 2,
@@ -420,13 +486,21 @@ const PipeEndpoint = struct {
     }
 
     fn readImpl(ctx: *anyopaque, buf: []u8) anyerror!usize {
+        return readDeadlineImpl(ctx, buf, .none);
+    }
+
+    fn readDeadlineImpl(ctx: *anyopaque, buf: []u8, deadline: io_mod.Deadline) anyerror!usize {
         const self: *PipeEndpoint = @ptrCast(@alignCast(ctx));
-        return self.in_q.read(buf);
+        return self.in_q.read(self.state.io, buf, deadline);
     }
 
     fn writeImpl(ctx: *anyopaque, data: []const u8) anyerror!usize {
+        return writeDeadlineImpl(ctx, data, .none);
+    }
+
+    fn writeDeadlineImpl(ctx: *anyopaque, data: []const u8, deadline: io_mod.Deadline) anyerror!usize {
         const self: *PipeEndpoint = @ptrCast(@alignCast(ctx));
-        return self.out_q.write(data);
+        return self.out_q.write(self.state.io, data, deadline);
     }
 
     fn closeImpl(ctx: *anyopaque) void {
@@ -442,6 +516,8 @@ const PipeEndpoint = struct {
     const endpoint_vtable: Conn.VTable = .{
         .read = readImpl,
         .write = writeImpl,
+        .readDeadline = readDeadlineImpl,
+        .writeDeadline = writeDeadlineImpl,
         .close = closeImpl,
     };
 };
@@ -454,11 +530,13 @@ pub const PipePair = struct {
 /// Pipe creates a synchronous, in-memory full-duplex network connection;
 /// both ends implement the Conn interface.
 /// Reads on one end are matched with writes on the other.
-pub fn pipe(allocator: std.mem.Allocator) !PipePair {
+/// The injected io must outlive both endpoints.
+pub fn pipe(allocator: std.mem.Allocator, io: std.Io) !PipePair {
     const st = try allocator.create(PipeState);
     errdefer allocator.destroy(st);
     st.* = .{
         .allocator = allocator,
+        .io = io,
     };
 
     const ep1 = try allocator.create(PipeEndpoint);
@@ -481,4 +559,22 @@ pub fn pipe(allocator: std.mem.Allocator) !PipePair {
         .conn1 = ep1.conn(),
         .conn2 = ep2.conn(),
     };
+}
+
+test "pipe deadlines interrupt blocked reads and writes" {
+    const testing = std.testing;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pair = try pipe(testing.allocator, io);
+    defer pair.conn1.close();
+    defer pair.conn2.close();
+    var buffer: [4096]u8 = @splat(1);
+    try testing.expectError(error.Timeout, pair.conn1.readDeadline(&buffer, .after(io, .fromMilliseconds(20))));
+    try testing.expectEqual(buffer.len, try pair.conn1.write(&buffer));
+    try testing.expectError(error.Timeout, pair.conn1.writeDeadline("x", .after(io, .fromMilliseconds(20))));
+    try testing.expectEqual(buffer.len, try pair.conn2.read(&buffer));
+    try testing.expectEqual(@as(usize, 1), try pair.conn1.writeDeadline("x", .after(io, .fromSeconds(1))));
+    try testing.expectEqual(@as(usize, 1), try pair.conn2.readDeadline(&buffer, .after(io, .fromSeconds(1))));
+    try testing.expectEqual(@as(u8, 'x'), buffer[0]);
 }
