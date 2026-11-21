@@ -171,8 +171,7 @@ Every single module in `stdgo` is accompanied by a dedicated, runnable example i
 | `zig build run-tabwriter` | [`examples/tabwriter.zig`](examples/tabwriter.zig) | Elastic Tabstops column alignment for terminal tables |
 | `zig build run-template` | [`examples/template.zig`](examples/template.zig) | Data-driven template engine (`Template`), pipelines, conditions, range loops |
 | `zig build run-html-template` | [`examples/html_template.zig`](examples/html_template.zig) | Context-aware auto-escaping against XSS, HTML/JS/CSS/URL sanitization |
-| `zig build run-database-sql` | [`examples/database_sql.zig`](examples/database_sql.zig) | Generic SQL connection pool (`DB`), transactions (`Tx`), statements, and mock driver |
-| `zig build run-sqlite -Dsqlite=true` | [`examples/sqlite.zig`](examples/sqlite.zig) | Optional real SQLite driver (`zig-sqlite`), in-memory/file DB, CRUD, transactions |
+| `zig build run-sql` | [`examples/sql.zig`](examples/sql.zig) | SQL connection pool (`DB`), transactions (`Tx`), prepared statements, comptime struct scanning, and SQLite (`-Dsqlite=true`) |
 | `zig build run-time` | [`examples/time.zig`](examples/time.zig) | Duration parsing (`parseDuration`), timestamp arithmetic, cooperative sleep |
 | `zig build run-time-formatting` | [`examples/time_formatting.zig`](examples/time_formatting.zig) | Go layout formatting & parsing (`RFC3339`, `RFC1123`, `DateTime`), civil calendar breakdown |
 | `zig build run-rate-limiter` | [`examples/rate_limiter.zig`](examples/rate_limiter.zig) | `x/time/rate` token bucket rate limiter, burst capacity, paced requests with `wait(ctx, io)` |

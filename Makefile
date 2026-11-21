@@ -7,12 +7,15 @@ build:
 
 test:
 	zig build test --summary all
+	zig build test -Dsqlite=true --summary all
 
 test-tsan:
-	zig build test-tsan --summary all
+	zig build test -Dtsan=true --summary all
+	zig build test -Dsqlite=true -Dtsan=true --summary all
 
 run-examples:
 	zig build run-examples
+	zig build run-sql -Dsqlite=true
 
 fmt:
 	zig fmt src examples build.zig

@@ -30,6 +30,64 @@ pub const DBStats = struct {
     max_lifetime_closed: u64,
 };
 
+/// Decodes a driver Value into the destination field type at compile time.
+pub fn valueToField(comptime T: type, val: Value) !T {
+    const info = @typeInfo(T);
+    if (info == .optional) {
+        if (val == .null) return null;
+        return try valueToField(info.optional.child, val);
+    }
+    switch (val) {
+        .null => return error.UnexpectedNull,
+        .int => |i| {
+            switch (info) {
+                .int => return std.math.cast(T, i) orelse error.IntegerOverflow,
+                .float => return @floatFromInt(i),
+                .bool => return i != 0,
+                else => return error.ColumnTypeMismatch,
+            }
+        },
+        .float => |f| {
+            switch (info) {
+                .float => return @floatCast(f),
+                else => return error.ColumnTypeMismatch,
+            }
+        },
+        .bool => |b| {
+            switch (info) {
+                .bool => return b,
+                .int => return if (b) @as(T, 1) else @as(T, 0),
+                else => return error.ColumnTypeMismatch,
+            }
+        },
+        .string => |s| {
+            if (T == []const u8) return s;
+            return error.ColumnTypeMismatch;
+        },
+        .bytes => |b| {
+            if (T == []const u8) return b;
+            return error.ColumnTypeMismatch;
+        },
+    }
+}
+
+/// Decodes a slice of driver Values into a destination struct at compile time.
+pub fn valuesToStruct(comptime T: type, values: []const Value) !T {
+    const type_info = @typeInfo(T);
+    if (type_info != .@"struct") {
+        @compileError("expected a struct type, found " ++ @typeName(T));
+    }
+    const s_info = type_info.@"struct";
+    if (values.len != s_info.field_names.len) {
+        return error.ColumnCountMismatch;
+    }
+    var result: T = undefined;
+    inline for (s_info.field_names, s_info.field_types, 0..) |name, FieldType, i| {
+        @field(result, name) = try valueToField(FieldType, values[i]);
+    }
+    return result;
+}
+
 /// Row is the result of calling QueryRow to select a single row.
 pub const Row = struct {
     rows: ?Rows = null,
@@ -54,6 +112,18 @@ pub const Row = struct {
             self.close();
             return error.ErrNoRows;
         }
+    }
+
+    /// ScanStruct copies the matched row's columns directly into a strongly-typed struct.
+    /// If more than one row matches the query, ScanStruct uses the first row and discards the rest.
+    /// If no rows match the query, ScanStruct returns error.ErrNoRows.
+    /// Note: Any string/bytes in the returned struct point into driver memory while the row is open;
+    /// use `defer row.close()` to release the connection after using the scanned values.
+    pub fn scanStruct(self: *Row, comptime T: type, deadline: Deadline) !T {
+        const field_count = comptime @typeInfo(T).@"struct".field_names.len;
+        var dest: [field_count]Value = undefined;
+        try self.scan(&dest, deadline);
+        return valuesToStruct(T, &dest);
     }
 
     /// Close closes the underlying query and releases the pooled connection back to the pool.
@@ -569,20 +639,43 @@ pub const DB = struct {
     pub fn begin(self: *DB, deadline: Deadline) !Tx {
         return self.beginTx(.{}, deadline);
     }
+
+    /// Prepare creates a prepared statement for later queries or executions.
+    /// The caller must call stmt.close() when done.
+    pub fn prepare(self: *DB, query_str: []const u8, deadline: Deadline) !Stmt {
+        try self.checkOperation(deadline);
+        const pc = try self.conn(deadline);
+        errdefer pc.release();
+        var raw_stmt = try pc.raw.prepare(self.io, query_str, deadline);
+        errdefer raw_stmt.close();
+
+        const state = try self.allocator.create(StmtState);
+        state.* = .{
+            .allocator = self.allocator,
+            .raw_stmt = raw_stmt,
+            .pooled_conn = pc,
+            .tx = null,
+            .ref_count = 1,
+        };
+        return Stmt{
+            .state = state,
+            .io = self.io,
+        };
+    }
 };
 
 /// Rows is the result of a query. Its cursor starts before the first row of the result set.
 /// Use Next to advance through the rows.
 pub const Rows = struct {
     pooled_conn: ?*PooledConn,
-    stmt: driver.Stmt,
+    stmt: ?driver.Stmt = null,
     raw_rows: driver.Rows,
     io: std.Io,
     closed: bool = false,
     last_err: ?anyerror = null,
     last_error_msg: ?[]const u8 = null,
 
-    pub fn columns(self: *Rows) []const []const u8 {
+    pub fn columns(self: *Rows) anyerror![]const []const u8 {
         return self.raw_rows.columns();
     }
 
@@ -611,6 +704,16 @@ pub const Rows = struct {
         return has_more;
     }
 
+    /// NextStruct decodes the next row directly into a strongly-typed struct at compile time.
+    /// Returns null when iteration finishes cleanly.
+    pub fn nextStruct(self: *Rows, comptime T: type, deadline: Deadline) !?T {
+        const field_count = comptime @typeInfo(T).@"struct".field_names.len;
+        var dest: [field_count]Value = undefined;
+        const has_row = try self.next(&dest, deadline);
+        if (!has_row) return null;
+        return try valuesToStruct(T, &dest);
+    }
+
     /// Err returns the error, if any, that was encountered during iteration.
     /// Returns null if iteration finished cleanly.
     pub fn err(self: *Rows) ?anyerror {
@@ -630,10 +733,32 @@ pub const Rows = struct {
         if (self.closed) return;
         self.closed = true;
         self.raw_rows.close();
-        self.stmt.close();
+        if (self.stmt) |*s| {
+            s.close();
+        }
         if (self.pooled_conn) |pc| {
             pc.release();
             self.pooled_conn = null;
+        }
+    }
+};
+
+/// Internal tracked state for prepared statements, supporting automatic lifetime
+/// management and invalidation when bound to a transaction.
+pub const StmtState = struct {
+    allocator: Allocator,
+    raw_stmt: driver.Stmt,
+    pooled_conn: ?*PooledConn = null,
+    tx: ?*Tx = null,
+    closed: bool = false,
+    ref_count: usize = 1,
+    next: ?*StmtState = null,
+    prev: ?*StmtState = null,
+
+    fn release(self: *StmtState) void {
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
+            self.allocator.destroy(self);
         }
     }
 };
@@ -646,6 +771,23 @@ pub const Tx = struct {
     pooled_conn: ?*PooledConn,
     raw_tx: driver.Tx,
     done: bool = false,
+    stmts_head: ?*StmtState = null,
+
+    fn closeStmts(self: *Tx) void {
+        var cur = self.stmts_head;
+        self.stmts_head = null;
+        while (cur) |state| {
+            const next = state.next;
+            state.next = null;
+            state.prev = null;
+            if (!state.closed) {
+                state.closed = true;
+                state.raw_stmt.close();
+            }
+            state.release(); // release Tx's reference
+            cur = next;
+        }
+    }
 
     /// Commits the transaction and returns the connection to the pool.
     pub fn commit(self: *Tx, deadline: Deadline) !void {
@@ -654,6 +796,7 @@ pub const Tx = struct {
         const io = connection.db.io;
         try driver_pkg.checkDeadlineSupport(io, deadline, self.raw_tx.vtable.supports_deadline);
         self.done = true;
+        self.closeStmts();
         self.pooled_conn = null;
         self.raw_tx.vtable.commit(self.raw_tx.ptr, io, deadline) catch |err| {
             connection.db.discardConn(connection);
@@ -672,6 +815,7 @@ pub const Tx = struct {
             try driver_pkg.checkDeadlineSupport(io, deadline, self.raw_tx.vtable.supports_deadline);
         }
         self.done = true;
+        self.closeStmts();
         self.pooled_conn = null;
         self.raw_tx.vtable.rollback(self.raw_tx.ptr, io, deadline) catch |err| {
             connection.db.discardConn(connection);
@@ -702,6 +846,122 @@ pub const Tx = struct {
             return Row{ .err_state = err };
         };
         return Row{ .rows = r };
+    }
+
+    /// Prepare creates a prepared statement for use within a transaction.
+    /// The returned Stmt operates on the transaction's connection and will be
+    /// closed when the transaction commits or rolls back, or when stmt.close() is called.
+    pub fn prepare(self: *Tx, query_str: []const u8, deadline: Deadline) !Stmt {
+        if (self.done) return error.TxDone;
+        const pc = self.pooled_conn orelse return error.TxDone;
+        const io = pc.db.io;
+        try pc.db.checkOperation(deadline);
+        var raw_stmt = try pc.raw.prepare(io, query_str, deadline);
+        errdefer raw_stmt.close();
+
+        const state = try pc.db.allocator.create(StmtState);
+        state.* = .{
+            .allocator = pc.db.allocator,
+            .raw_stmt = raw_stmt,
+            .pooled_conn = null,
+            .tx = self,
+            .ref_count = 2,
+            .next = self.stmts_head,
+            .prev = null,
+        };
+        if (self.stmts_head) |head| {
+            head.prev = state;
+        }
+        self.stmts_head = state;
+
+        return Stmt{
+            .state = state,
+            .io = io,
+        };
+    }
+};
+
+/// Stmt is a prepared statement bound to a database connection.
+/// It is safe for concurrent use if callers coordinate deadlines.
+/// The caller must call close() when the statement is no longer needed.
+pub const Stmt = struct {
+    state: *StmtState,
+    io: std.Io,
+    closed: bool = false,
+
+    /// Exec executes a prepared statement with the given arguments and
+    /// returns a Result summarizing the effect of the statement.
+    pub fn exec(self: *Stmt, args: []const Value, deadline: Deadline) !Result {
+        if (self.closed or self.state.closed) {
+            if (self.state.tx != null) return error.TxDone;
+            return error.DBClosed;
+        }
+        if (self.state.tx) |tx| {
+            if (tx.done) return error.TxDone;
+        }
+        if (self.state.pooled_conn) |pc| {
+            try pc.db.checkOperation(deadline);
+        }
+        return self.state.raw_stmt.exec(self.io, args, deadline);
+    }
+
+    /// Query executes a prepared query statement with the given arguments
+    /// and returns the query results as Rows.
+    pub fn query(self: *Stmt, args: []const Value, deadline: Deadline) !Rows {
+        if (self.closed or self.state.closed) {
+            if (self.state.tx != null) return error.TxDone;
+            return error.DBClosed;
+        }
+        if (self.state.tx) |tx| {
+            if (tx.done) return error.TxDone;
+        }
+        if (self.state.pooled_conn) |pc| {
+            try pc.db.checkOperation(deadline);
+        }
+        const raw_rows = try self.state.raw_stmt.query(self.io, args, deadline);
+        return Rows{
+            .pooled_conn = null, // Connection remains held by Stmt or Tx
+            .stmt = null,
+            .raw_rows = raw_rows,
+            .io = self.io,
+        };
+    }
+
+    /// QueryRow executes a prepared query statement that is expected to return at most one row.
+    pub fn queryRow(self: *Stmt, args: []const Value, deadline: Deadline) Row {
+        const r = self.query(args, deadline) catch |err| {
+            return Row{ .err_state = err };
+        };
+        return Row{ .rows = r };
+    }
+
+    /// Close closes the statement and releases its connection back to the pool.
+    pub fn close(self: *Stmt) void {
+        if (self.closed) return;
+        self.closed = true;
+        const state = self.state;
+        if (!state.closed) {
+            state.closed = true;
+            state.raw_stmt.close();
+            if (state.pooled_conn) |pc| {
+                pc.release();
+                state.pooled_conn = null;
+            }
+            if (state.tx) |tx| {
+                if (state.prev) |prev| {
+                    prev.next = state.next;
+                } else if (tx.stmts_head == state) {
+                    tx.stmts_head = state.next;
+                }
+                if (state.next) |next| {
+                    next.prev = state.prev;
+                }
+                state.next = null;
+                state.prev = null;
+                state.release(); // release Tx's reference
+            }
+        }
+        state.release(); // release Stmt's reference
     }
 };
 
@@ -904,7 +1164,7 @@ pub const MockDriver = struct {
 
         const cols = [_][]const u8{ "id", "name", "role" };
 
-        fn columns(_: *anyopaque) []const []const u8 {
+        fn columns(_: *anyopaque) anyerror![]const []const u8 {
             return &cols;
         }
 
@@ -912,6 +1172,7 @@ pub const MockDriver = struct {
             try driver_pkg.checkOperation(io, deadline);
             const self: *MockRows = @ptrCast(@alignCast(ctx));
             if (self.cursor >= 2) return false;
+            if (dest.len != cols.len) return error.ColumnCountMismatch;
 
             if (self.cursor == 0) {
                 dest[0] = Value{ .int = 1 };
@@ -975,14 +1236,14 @@ test "database.sql: basic open, ping, exec, query and close" {
 
     // 2. Exec
     const res = try db.exec("INSERT INTO users (name) VALUES (?)", &.{Value{ .string = "charlie" }}, .none);
-    try testing.expectEqual(@as(i64, 1001), res.lastInsertId());
-    try testing.expectEqual(@as(i64, 1), res.rowsAffected());
+    try testing.expectEqual(@as(i64, 1001), try res.lastInsertId());
+    try testing.expectEqual(@as(i64, 1), try res.rowsAffected());
 
     // 3. Query
     var rows = try db.query("SELECT id, name, role FROM users", &.{}, .none);
     defer rows.close();
 
-    const cols = rows.columns();
+    const cols = try rows.columns();
     try testing.expectEqual(@as(usize, 3), cols.len);
     try testing.expectEqualStrings("id", cols[0]);
 
@@ -1464,7 +1725,7 @@ test "database.sql: Rows.next returns driver iteration errors" {
     defer threaded.deinit();
     const io = threaded.io();
     const Fake = struct {
-        fn columns(_: *anyopaque) []const []const u8 {
+        fn columns(_: *anyopaque) anyerror![]const []const u8 {
             return &.{};
         }
         fn next(_: *anyopaque, _: std.Io, _: []Value, _: Deadline) anyerror!bool {
@@ -1553,6 +1814,134 @@ test "database.sql: transaction rows reject unsupported deadline" {
     const deadline = @import("../io/deadline.zig").Deadline.after(io, .fromSeconds(1));
     try testing.expectError(error.DeadlineUnsupported, rows.next(&dest, deadline));
     try testing.expect(!rows.closed);
+}
+
+test "database.sql: DB.prepare and Stmt execution on mock driver" {
+    const testing = std.testing;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+
+    // 1. Prepared Exec
+    var stmt = try db.prepare("INSERT INTO users (name) VALUES (?)", .none);
+    defer stmt.close();
+
+    const res = try stmt.exec(&.{Value{ .string = "dave" }}, .none);
+    try testing.expectEqual(@as(i64, 1001), try res.lastInsertId());
+    try testing.expectEqual(@as(i64, 1), try res.rowsAffected());
+
+    // 2. Prepared Query with nextStruct
+    const UserRow = struct {
+        id: i64,
+        name: []const u8,
+        role: []const u8,
+    };
+    var rows = try stmt.query(&.{}, .none);
+    defer rows.close();
+
+    const user1 = (try rows.nextStruct(UserRow, .none)).?;
+    try testing.expectEqual(@as(i64, 1), user1.id);
+    try testing.expectEqualStrings("alice", user1.name);
+    try testing.expectEqualStrings("admin", user1.role);
+
+    // 3. Result returns error.UnsupportedResult when fields are null
+    const unsupported_res = Result{};
+    try testing.expectError(error.UnsupportedResult, unsupported_res.lastInsertId());
+    try testing.expectError(error.UnsupportedResult, unsupported_res.rowsAffected());
+
+    // 4. valuesToStruct verifies ColumnCountMismatch on slice length mismatch
+    const ShortRecord = struct {
+        id: i64,
+        name: []const u8,
+    };
+    const vals = [_]Value{
+        Value{ .int = 1 },
+        Value{ .string = "alice" },
+        Value{ .string = "admin" },
+    };
+    try testing.expectError(error.ColumnCountMismatch, valuesToStruct(ShortRecord, &vals));
+    const FullRecord = struct {
+        id: i64,
+        name: []const u8,
+        role: []const u8,
+    };
+    const decoded = try valuesToStruct(FullRecord, &vals);
+    try testing.expectEqual(@as(i64, 1), decoded.id);
+    try testing.expectEqualStrings("alice", decoded.name);
+    try testing.expectEqualStrings("admin", decoded.role);
+}
+
+test "database.sql: Tx.prepare statements are closed and invalidated on commit and rollback" {
+    const testing = std.testing;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+
+    // 1. Tx.prepare followed by commit
+    {
+        var tx = try db.begin(.none);
+        var tx_stmt = try tx.prepare("INSERT INTO users (name) VALUES (?)", .none);
+        defer tx_stmt.close();
+
+        // Valid execution within transaction
+        _ = try tx_stmt.exec(&.{Value{ .string = "test" }}, .none);
+
+        try tx.commit(.none);
+
+        // Executing after commit must return error.TxDone without race or reuse
+        try testing.expectError(error.TxDone, tx_stmt.exec(&.{Value{ .string = "fail" }}, .none));
+        try testing.expectError(error.TxDone, tx_stmt.query(&.{}, .none));
+
+        // tx_stmt.close() can be called safely
+        tx_stmt.close();
+    }
+
+    // 2. Tx.prepare followed by rollback
+    {
+        var tx = try db.begin(.none);
+        var tx_stmt = try tx.prepare("INSERT INTO users (name) VALUES (?)", .none);
+        defer tx_stmt.close();
+
+        _ = try tx_stmt.exec(&.{Value{ .string = "rollback_test" }}, .none);
+
+        try tx.rollback(.none);
+
+        // Executing after rollback must return error.TxDone
+        try testing.expectError(error.TxDone, tx_stmt.exec(&.{Value{ .string = "fail" }}, .none));
+        try testing.expectError(error.TxDone, tx_stmt.query(&.{}, .none));
+
+        // tx_stmt.close() called again in defer is safe
+    }
+
+    // 3. Early stmt.close() before tx.commit()
+    {
+        var tx = try db.begin(.none);
+        var tx_stmt = try tx.prepare("INSERT INTO users (name) VALUES (?)", .none);
+        _ = try tx_stmt.exec(&.{Value{ .string = "early_close" }}, .none);
+        tx_stmt.close();
+
+        // Already closed statement
+        try testing.expectError(error.TxDone, tx_stmt.exec(&.{Value{ .string = "fail" }}, .none));
+
+        // Commit should succeed cleanly even when statement was closed early
+        try tx.commit(.none);
+    }
 }
 
 test {

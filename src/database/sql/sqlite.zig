@@ -140,14 +140,20 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             if (rc != c.SQLITE_OK) {
                 return progress.failure orelse error.SQLitePrepareFailed;
             }
-            errdefer _ = c.sqlite3_finalize(stmt);
+
+            // Per SQLite C API specification: when the input query contains no executable VDBE
+            // bytecode (e.g. empty string, whitespace only, pure comments, or trailing/isolated
+            // semicolons), sqlite3_prepare_v2 returns SQLITE_OK (0) but sets *ppStmt to NULL.
+            // Guard against null explicitly to eliminate unsafe unwrap (.?) panics.
+            const non_null_stmt = stmt orelse return error.SQLiteEmptyStatement;
+            errdefer _ = c.sqlite3_finalize(non_null_stmt);
             try driver_pkg.checkOperation(io, deadline);
 
             const s = try self.allocator.create(SQLiteStmt);
             s.* = .{
                 .allocator = self.allocator,
                 .db = self.db,
-                .stmt = stmt.?,
+                .stmt = non_null_stmt,
             };
 
             return driver_pkg.Stmt{
@@ -218,8 +224,9 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             if (c.sqlite3_prepare_v2(self.db, "SELECT 1", -1, &stmt, null) != c.SQLITE_OK) {
                 return progress.failure orelse error.SQLitePingFailed;
             }
-            defer _ = c.sqlite3_finalize(stmt);
-            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            const non_null_stmt = stmt orelse return error.SQLitePingFailed;
+            defer _ = c.sqlite3_finalize(non_null_stmt);
+            if (c.sqlite3_step(non_null_stmt) != c.SQLITE_ROW) {
                 return progress.failure orelse error.SQLitePingFailed;
             }
             try driver_pkg.checkOperation(io, deadline);
@@ -352,12 +359,12 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         last_step_err: ?anyerror = null,
 
         /// Retrieves and caches column names from the current result set.
-        fn columns(ctx: *anyopaque) []const []const u8 {
+        fn columns(ctx: *anyopaque) anyerror![]const []const u8 {
             const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
             if (self.cols_cached) |cols| return cols;
 
             const count: usize = @intCast(c.sqlite3_column_count(self.stmt));
-            var col_list = self.allocator.alloc([]const u8, count) catch return &.{};
+            var col_list = try self.allocator.alloc([]const u8, count);
             for (0..count) |i| {
                 const name_ptr = c.sqlite3_column_name(self.stmt, @intCast(i));
                 col_list[i] = if (name_ptr != null) std.mem.span(name_ptr) else "";
@@ -377,9 +384,12 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             const rc = c.sqlite3_step(self.stmt);
             if (rc == c.SQLITE_ROW) {
                 const col_count: usize = @intCast(c.sqlite3_column_count(self.stmt));
-                const limit = @min(dest.len, col_count);
+                if (dest.len != col_count) {
+                    self.last_step_err = error.ColumnCountMismatch;
+                    return error.ColumnCountMismatch;
+                }
 
-                for (0..limit) |i| {
+                for (0..col_count) |i| {
                     const col_idx: c_int = @intCast(i);
                     const col_type = c.sqlite3_column_type(self.stmt, col_idx);
                     dest[i] = switch (col_type) {
@@ -530,7 +540,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
 
     var sq_driver = SQLiteDriver.init(testing.allocator);
     const sql_db = @import("../sql.zig");
-    const db = try sql_db.DB.open(testing.allocator, io, sq_driver.driver(), ":memory:");
+    const db = try sql_db.DB.open(testing.allocator, io, sq_driver.driver(), "file:test_inmem_crud?mode=memory&cache=shared");
     defer db.close();
 
     try db.ping(.none);
@@ -560,7 +570,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         var rows = try db.query("SELECT id, name, age, balance FROM users ORDER BY id ASC", &.{}, .none);
         defer rows.close();
 
-        const cols = rows.columns();
+        const cols = try rows.columns();
         try testing.expectEqual(@as(usize, 4), cols.len);
         try testing.expectEqualStrings("id", cols[0]);
         try testing.expectEqualStrings("name", cols[1]);
@@ -646,6 +656,13 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         const err_msg = conn.lastError();
         try testing.expect(err_msg != null);
         try testing.expect(std.mem.indexOf(u8, err_msg.?, "syntax error") != null);
+
+        // Verify empty query, pure comment, and lonely semicolon return error.SQLiteEmptyStatement without panic
+        try testing.expectError(error.SQLiteEmptyStatement, conn.exec("", &.{}, .none));
+        try testing.expectError(error.SQLiteEmptyStatement, conn.exec("   \t\n", &.{}, .none));
+        try testing.expectError(error.SQLiteEmptyStatement, conn.exec("-- only a single line comment", &.{}, .none));
+        try testing.expectError(error.SQLiteEmptyStatement, conn.exec("/* multi-line comment */", &.{}, .none));
+        try testing.expectError(error.SQLiteEmptyStatement, conn.exec(";;;", &.{}, .none));
     }
 
     // Verify rows.err() is null on clean completion
@@ -696,5 +713,79 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         try testing.expectEqual(@as(f64, 300.0), dave_dest[0].float);
 
         try tx.commit(.none);
+    }
+
+    // Verify ColumnCountMismatch on buffer length mismatch
+    {
+        var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", &.{}, .none);
+        defer rows.close();
+        var short_dest: [2]Value = undefined;
+        try testing.expectError(error.ColumnCountMismatch, rows.next(&short_dest, .none));
+    }
+
+    // Verify nextStruct comptime struct scanning
+    {
+        const UserRecord = struct {
+            id: i64,
+            name: []const u8,
+            age: i64,
+            balance: f64,
+        };
+
+        var rows = try db.query("SELECT id, name, age, balance FROM users ORDER BY id ASC", &.{}, .none);
+        defer rows.close();
+
+        const user1 = (try rows.nextStruct(UserRecord, .none)).?;
+        try testing.expectEqual(@as(i64, 1), user1.id);
+        try testing.expectEqualStrings("Alice", user1.name);
+        try testing.expectEqual(@as(i64, 30), user1.age);
+        try testing.expectEqual(@as(f64, 110.50), user1.balance);
+    }
+
+    // Verify scanStruct on Row
+    {
+        const BalanceOnly = struct { balance: f64 };
+        var row = db.queryRow("SELECT balance FROM users WHERE name = ?", &.{Value{ .string = "Alice" }}, .none);
+        defer row.close();
+        const b = try row.scanStruct(BalanceOnly, .none);
+        try testing.expectEqual(@as(f64, 110.50), b.balance);
+    }
+
+    // Verify top-level db.prepare and Stmt execution
+    {
+        var stmt = try db.prepare("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", .none);
+        defer stmt.close();
+
+        const ins_res = try stmt.exec(&.{
+            Value{ .string = "Eve" },
+            Value{ .int = 22 },
+            Value{ .float = 99.0 },
+        }, .none);
+        try testing.expect((try ins_res.lastInsertId()) > 0);
+        try testing.expectEqual(@as(i64, 1), try ins_res.rowsAffected());
+
+        var q_stmt = try db.prepare("SELECT balance FROM users WHERE name = ?", .none);
+        defer q_stmt.close();
+
+        var q_row = q_stmt.queryRow(&.{Value{ .string = "Eve" }}, .none);
+        defer q_row.close();
+        const EveBal = struct { balance: f64 };
+        const eb = try q_row.scanStruct(EveBal, .none);
+        try testing.expectEqual(@as(f64, 99.0), eb.balance);
+    }
+
+    // Verify Tx.prepare in SQLite: statement is automatically closed before commit
+    {
+        var tx = try db.begin(.none);
+        var tx_stmt = try tx.prepare("UPDATE users SET balance = balance + 10 WHERE name = ?", .none);
+        defer tx_stmt.close();
+
+        _ = try tx_stmt.exec(&.{Value{ .string = "Alice" }}, .none);
+
+        // Commit should cleanly succeed (statement is auto-closed before sqlite3_step("COMMIT"))
+        try tx.commit(.none);
+
+        // Subsequent exec must return error.TxDone
+        try testing.expectError(error.TxDone, tx_stmt.exec(&.{Value{ .string = "Alice" }}, .none));
     }
 }
