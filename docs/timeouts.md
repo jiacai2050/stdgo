@@ -56,6 +56,11 @@ TCP、UDP 和 HTTP 操作均使用注入的 `std.Io`。带有期限的网络操�
 
 独立 `Resolver` 的 A 和 AAAA 记录查询共享同一份预算。若 A 记录查询成功但后续 AAAA 查询超时，`lookupIP` 会返回超时错误，放弃已取得的 A 记录。HTTP 客户端拨号使用的是注入 I/O 后端的主机名解析，不读取该 `Resolver.timeout` 配置。
 
+### 平台限制（Windows / Zig 0.17.0）
+
+- **Linux / macOS**：底层基于 epoll/io_uring/kqueue 的 `std.Io.Threaded` 引擎完整支持套接字 deadline 中断与请求超时取消，全部通过竞态与集成测试。
+- **Windows**：Zig 0.17.0 标准库中 `lib/std/Io/Threaded.zig` 的 `batchDrainSubmittedWindows` 在处理套接字读写超时取消时存在 upstream bug（尝试从已置为 `.unused` 的联合体读取 `.submission` 触发 safety panic）。因此在 Windows 平台上，带期限的 Socket 读取/写入以及 HTTP 客户端超时中断机制暂不稳定，等待 Zig 上游修复。
+
 相关实现：[TCP 和 pipe](../src/net/conn.zig)、[UDP](../src/net/udp.zig)、[DNS](../src/net/dns.zig)、[拨号](../src/net/connect.zig)、[socket 等待](../src/net/io_util.zig)。
 
 ## HTTP

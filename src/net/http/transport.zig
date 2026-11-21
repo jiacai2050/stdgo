@@ -50,6 +50,7 @@ pub const TransportOptions = struct {
     /// Custom environment lookup function. If set, takes precedence over environ_map.
     env_lookup: ?*const fn (key: []const u8) ?[]const u8 = null,
     /// Total round-trip and body-read budget.
+    /// Note: On Windows (Zig 0.17.0), socket deadline cancellation may encounter an upstream panic in std.Io.Threaded.
     timeout_ns: ?u64 = null,
     timeout: ?time_mod.Duration = null,
     tls_handshake_timeout: ?time_mod.Duration = null,

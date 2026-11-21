@@ -1,5 +1,6 @@
 //! HTTP Client providing high-level Get, Post, PostForm, and Do APIs.
 const std = @import("std");
+const builtin = @import("builtin");
 const Request = @import("request.zig").Request;
 const newRequest = @import("request.zig").newRequest;
 const newRequestWithReader = @import("request.zig").newRequestWithReader;
@@ -26,12 +27,22 @@ pub const ClientOptions = struct {
     jar: ?*CookieJar = null,
     /// Total request budget, including redirects and response body reads.
     /// Custom round trippers and request body readers must cooperate with cancellation.
+    ///
+    /// Platform Limitation (Windows / Zig 0.17.0):
+    /// On Windows, socket deadline cancellation in `std.Io.Threaded` currently has an upstream
+    /// tagged union panic in `batchDrainSubmittedWindows`. Request timeout cancellation is fully
+    /// supported and verified on Linux and macOS.
     timeout_ns: ?u64 = null,
     timeout: ?time_mod.Duration = null,
     check_redirect: ?*const fn (ctx_ptr: ?*anyopaque, req: *Request, via: []const *const Request) anyerror!void = null,
     check_redirect_ctx: ?*anyopaque = null,
 };
 
+/// Client is a high-level HTTP client conforming to Go's net/http Client API.
+///
+/// Platform Limitation (Windows / Zig 0.17.0):
+/// On Windows, socket timeout and deadline cancellations in `std.Io.Threaded` may trigger an
+/// upstream panic in `batchDrainSubmittedWindows`. Fully supported and stable on Linux and macOS.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -370,6 +381,9 @@ pub fn postForm(allocator: std.mem.Allocator, io: std.Io, url: []const u8, data:
 }
 
 test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
+    // Zig 0.17.0 std.Io.Threaded has an upstream union panic on Windows when socket operations cancel/timeout.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -942,6 +956,8 @@ test "Client: Transparent response gzip decompression" {
 }
 
 test "Client: timeout interrupts socket reads and writes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1046,6 +1062,8 @@ test "Client: timeout interrupts socket reads and writes" {
 }
 
 test "Client: timeout budget spans redirects" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1089,6 +1107,8 @@ test "Client: timeout budget spans redirects" {
 }
 
 test "Client: body deadline remains active after headers arrive" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1132,6 +1152,8 @@ test "Client: body deadline remains active after headers arrive" {
 }
 
 test "Client: Expect 100-continue handles interim responses and early rejection" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1286,6 +1308,8 @@ test "Client: cancellation interrupts a timed socket read" {
 }
 
 test "Client: pooled connections receive a fresh request deadline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
