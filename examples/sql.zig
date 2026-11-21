@@ -167,11 +167,19 @@ fn runDatabaseDemo(
         var rows = try db.query("SELECT id, name, price, in_stock FROM products ORDER BY id ASC", &.{}, .none);
         defer rows.close();
 
-        const cols = try rows.columns();
         std.debug.print("   Columns: [", .{});
-        for (cols, 0..) |col, i| {
+        for (0..rows.columnCount()) |i| {
             if (i > 0) std.debug.print(", ", .{});
-            std.debug.print("{s}", .{col});
+            std.debug.print("{s}", .{rows.columnName(i)});
+        }
+        std.debug.print("]\n", .{});
+
+        const col_types = try rows.columnTypes(allocator);
+        defer allocator.free(col_types);
+        std.debug.print("   Schema Column Types: [", .{});
+        for (col_types, 0..) |ct, i| {
+            if (i > 0) std.debug.print(", ", .{});
+            std.debug.print("{s}: {s}", .{ ct.name(), ct.databaseTypeName() orelse "UNKNOWN" });
         }
         std.debug.print("]\n", .{});
 
@@ -190,11 +198,19 @@ fn runDatabaseDemo(
         var rows = try db.query("SELECT id, name, role FROM users", &.{}, .none);
         defer rows.close();
 
-        const cols = try rows.columns();
         std.debug.print("   Columns: [", .{});
-        for (cols, 0..) |col, i| {
+        for (0..rows.columnCount()) |i| {
             if (i > 0) std.debug.print(", ", .{});
-            std.debug.print("{s}", .{col});
+            std.debug.print("{s}", .{rows.columnName(i)});
+        }
+        std.debug.print("]\n", .{});
+
+        const col_types = try rows.columnTypes(allocator);
+        defer allocator.free(col_types);
+        std.debug.print("   Schema Column Types: [", .{});
+        for (col_types, 0..) |ct, i| {
+            if (i > 0) std.debug.print(", ", .{});
+            std.debug.print("{s}: {s}", .{ ct.name(), ct.databaseTypeName() orelse "UNKNOWN" });
         }
         std.debug.print("]\n", .{});
 

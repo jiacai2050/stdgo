@@ -5,17 +5,14 @@ const std = @import("std");
 const deadlines = @import("../../io/deadline.zig");
 const Deadline = deadlines.Deadline;
 
+/// Validates cancellation and deadline before invoking a driver operation.
+///
+/// Note: Methods in this package accept an optional Deadline parameter.
+/// Whether in-flight backend operations can be interrupted before completion
+/// depends on the underlying driver implementation.
 pub fn checkOperation(io: std.Io, deadline: Deadline) !void {
     try io.checkCancel();
     try deadline.check(io);
-}
-
-/// Drivers opting in must check the deadline throughout the operation and
-/// return only after any work borrowing the operation's resources has stopped.
-/// An uninterruptible backend call can delay return past the deadline.
-pub fn checkDeadlineSupport(io: std.Io, deadline: Deadline, supported: bool) !void {
-    try checkOperation(io, deadline);
-    if (!deadline.isNone() and !supported) return error.DeadlineUnsupported;
 }
 
 /// Driver value representation.
@@ -80,27 +77,90 @@ pub const Result = struct {
     }
 };
 
+/// ColumnType represents metadata about a column in a result set,
+/// corresponding to Go's database/sql.ColumnType.
+pub const ColumnType = struct {
+    col_name: []const u8,
+    raw_type_name: ?[]const u8 = null,
+    has_nullable: bool = false,
+    nullable_val: bool = false,
+    has_length: bool = false,
+    length_val: i64 = 0,
+    has_precision_scale: bool = false,
+    precision_val: i64 = 0,
+    scale_val: i64 = 0,
+
+    /// Name returns the name or alias of the column.
+    pub fn name(self: ColumnType) []const u8 {
+        return self.col_name;
+    }
+
+    /// DatabaseTypeName returns the database system type name of the column,
+    /// such as "VARCHAR", "INTEGER", "REAL", "BLOB", or null if not provided by driver.
+    pub fn databaseTypeName(self: ColumnType) ?[]const u8 {
+        return self.raw_type_name;
+    }
+
+    /// Nullable returns whether the column may be null, or null if unknown.
+    pub fn nullable(self: ColumnType) ?bool {
+        if (self.has_nullable) return self.nullable_val;
+        return null;
+    }
+
+    /// Length returns the column type length for variable length column types,
+    /// or null if unknown / not applicable.
+    pub fn length(self: ColumnType) ?i64 {
+        if (self.has_length) return self.length_val;
+        return null;
+    }
+
+    /// DecimalSize returns the scale and precision of a decimal type,
+    /// or null if unknown / not applicable.
+    pub fn decimalSize(self: ColumnType) ?struct { precision: i64, scale: i64 } {
+        if (self.has_precision_scale) {
+            return .{ .precision = self.precision_val, .scale = self.scale_val };
+        }
+        return null;
+    }
+};
+
 /// Rows is an iterator over an executed query's results.
 pub const Rows = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Opt in only when all deadline-bearing methods honor the deadline.
-        supports_deadline: bool = false,
-        columns: *const fn (ctx: *anyopaque) anyerror![]const []const u8,
+        /// Returns the number of columns in the result set.
+        columnCount: *const fn (ctx: *anyopaque) usize,
+        /// Returns the column name at the given 0-based index.
+        columnName: *const fn (ctx: *anyopaque, index: usize) []const u8,
+        /// Advances to the next row. Whether deadline is checked during iteration depends on the driver.
         next: *const fn (ctx: *anyopaque, io: std.Io, dest: []Value, deadline: Deadline) anyerror!bool,
         close: *const fn (ctx: *anyopaque) void,
         /// Optional: returns the error, if any, that occurred while iterating.
         err: ?*const fn (ctx: *anyopaque) ?anyerror = null,
+        /// Optional: returns the database system type name for the column at index (e.g. "INTEGER", "VARCHAR").
+        columnTypeDatabaseTypeName: ?*const fn (ctx: *anyopaque, index: usize) ?[]const u8 = null,
+        /// Optional: returns whether the column at index is nullable.
+        columnTypeNullable: ?*const fn (ctx: *anyopaque, index: usize) ?bool = null,
+        /// Optional: returns the column type length for variable-length types.
+        columnTypeLength: ?*const fn (ctx: *anyopaque, index: usize) ?i64 = null,
+        /// Optional: returns precision and scale for decimal/numeric types.
+        columnTypePrecisionScale: ?*const fn (ctx: *anyopaque, index: usize) ?struct { precision: i64, scale: i64 } = null,
     };
 
-    pub fn columns(self: *Rows) anyerror![]const []const u8 {
-        return self.vtable.columns(self.ptr);
+    /// ColumnCount returns the number of columns in the result set.
+    pub fn columnCount(self: *Rows) usize {
+        return self.vtable.columnCount(self.ptr);
+    }
+
+    /// ColumnName returns the name of the column at the given 0-based index.
+    pub fn columnName(self: *Rows, index: usize) []const u8 {
+        return self.vtable.columnName(self.ptr, index);
     }
 
     pub fn next(self: *Rows, io: std.Io, dest: []Value, deadline: Deadline) !bool {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.next(self.ptr, io, dest, deadline);
     }
 
@@ -124,11 +184,11 @@ pub const Stmt = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Opt in only when all deadline-bearing methods honor the deadline.
-        supports_deadline: bool = false,
         close: *const fn (ctx: *anyopaque) void,
         numInput: *const fn (ctx: *anyopaque) i64,
+        /// Executes a prepared statement. Whether deadline is checked during execution depends on the driver.
         exec: *const fn (ctx: *anyopaque, io: std.Io, args: []const Value, deadline: Deadline) anyerror!Result,
+        /// Executes a prepared query. Whether deadline is checked during execution depends on the driver.
         query: *const fn (ctx: *anyopaque, io: std.Io, args: []const Value, deadline: Deadline) anyerror!Rows,
     };
 
@@ -141,12 +201,12 @@ pub const Stmt = struct {
     }
 
     pub fn exec(self: *Stmt, io: std.Io, args: []const Value, deadline: Deadline) !Result {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.exec(self.ptr, io, args, deadline);
     }
 
     pub fn query(self: *Stmt, io: std.Io, args: []const Value, deadline: Deadline) !Rows {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.query(self.ptr, io, args, deadline);
     }
 };
@@ -158,20 +218,19 @@ pub const Tx = struct {
 
     pub const VTable = struct {
         /// Both callbacks consume the transaction even when the driver returns an error.
-        supports_deadline: bool = false,
         commit: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
         rollback: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
     };
 
     pub fn commit(self: *Tx, io: std.Io, deadline: Deadline) !void {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.commit(self.ptr, io, deadline);
     }
 
     pub fn rollback(self: *Tx, io: std.Io, deadline: Deadline) !void {
         try deadline.validate();
         if (!deadline.isNone()) {
-            try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+            try checkOperation(io, deadline);
         }
         return self.vtable.rollback(self.ptr, io, deadline);
     }
@@ -183,8 +242,6 @@ pub const Conn = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Opt in only when all deadline-bearing methods honor the deadline.
-        supports_deadline: bool = false,
         prepare: *const fn (ctx: *anyopaque, io: std.Io, query: []const u8, deadline: Deadline) anyerror!Stmt,
         close: *const fn (ctx: *anyopaque) void,
         begin: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!Tx,
@@ -202,7 +259,7 @@ pub const Conn = struct {
     };
 
     pub fn prepare(self: *Conn, io: std.Io, query: []const u8, deadline: Deadline) !Stmt {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.prepare(self.ptr, io, query, deadline);
     }
 
@@ -211,7 +268,7 @@ pub const Conn = struct {
     }
 
     pub fn begin(self: *Conn, io: std.Io, deadline: Deadline) !Tx {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.begin(self.ptr, io, deadline);
     }
 
@@ -220,7 +277,7 @@ pub const Conn = struct {
     /// it falls back to begin(). If non-default options are requested and unsupported,
     /// it returns error.TxOptionsNotSupported.
     pub fn beginTx(self: *Conn, io: std.Io, opts: TxOptions, deadline: Deadline) !Tx {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         if (self.vtable.beginTx) |f| {
             return f(self.ptr, io, opts, deadline);
         }
@@ -231,7 +288,7 @@ pub const Conn = struct {
     }
 
     pub fn ping(self: *Conn, io: std.Io, deadline: Deadline) !void {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.ping(self.ptr, io, deadline);
     }
 
@@ -262,13 +319,11 @@ pub const Driver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Opt in only when opening honors the deadline.
-        supports_deadline: bool = false,
         open: *const fn (ctx: *anyopaque, io: std.Io, dsn: []const u8, deadline: Deadline) anyerror!Conn,
     };
 
     pub fn open(self: Driver, io: std.Io, dsn: []const u8, deadline: Deadline) !Conn {
-        try checkDeadlineSupport(io, deadline, self.vtable.supports_deadline);
+        try checkOperation(io, deadline);
         return self.vtable.open(self.ptr, io, dsn, deadline);
     }
 };

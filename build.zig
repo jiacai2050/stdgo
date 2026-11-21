@@ -9,11 +9,14 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "have_sqlite", enable_sqlite);
 
+    // ThreadSanitizer is supported by Clang/LLVM on POSIX platforms (Linux, macOS, BSDs), but unsupported on Windows.
+    const sanitize_thread = enable_tsan and target.result.os.tag != .windows;
+
     const mod = b.addModule("stdgo", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .sanitize_thread = enable_tsan,
+        .sanitize_thread = sanitize_thread,
     });
     mod.addOptions("build_options", build_options);
 

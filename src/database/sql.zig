@@ -18,6 +18,7 @@ pub const IsolationLevel = driver.IsolationLevel;
 pub const TxOptions = driver.TxOptions;
 pub const ErrBadConn = driver.ErrBadConn;
 pub const ErrNoRows = error.ErrNoRows;
+pub const ColumnType = driver.ColumnType;
 
 pub const DBStats = struct {
     max_open_connections: usize,
@@ -277,7 +278,7 @@ pub const DB = struct {
     }
 
     fn checkOperation(self: *DB, deadline: Deadline) !void {
-        try driver_pkg.checkDeadlineSupport(self.io, deadline, self.driver_instance.vtable.supports_deadline);
+        try driver_pkg.checkOperation(self.io, deadline);
     }
 
     /// Close closes the database and prevents new queries from starting.
@@ -675,15 +676,59 @@ pub const Rows = struct {
     last_err: ?anyerror = null,
     last_error_msg: ?[]const u8 = null,
 
-    pub fn columns(self: *Rows) anyerror![]const []const u8 {
-        return self.raw_rows.columns();
+    /// ColumnCount returns the number of columns in the result set.
+    pub fn columnCount(self: *Rows) usize {
+        return self.raw_rows.columnCount();
+    }
+
+    /// ColumnName returns the name of the column at the given 0-based index.
+    pub fn columnName(self: *Rows, index: usize) []const u8 {
+        return self.raw_rows.columnName(index);
+    }
+
+    /// ColumnTypes returns column information such as column type, length,
+    /// and nullability. The returned slice is allocated with the provided allocator.
+    pub fn columnTypes(self: *Rows, allocator: Allocator) ![]ColumnType {
+        const count = self.columnCount();
+        const list = try allocator.alloc(ColumnType, count);
+        errdefer allocator.free(list);
+
+        for (0..count) |i| {
+            var ct = ColumnType{
+                .col_name = self.columnName(i),
+            };
+            if (self.raw_rows.vtable.columnTypeDatabaseTypeName) |f| {
+                ct.raw_type_name = f(self.raw_rows.ptr, i);
+            }
+            if (self.raw_rows.vtable.columnTypeNullable) |f| {
+                if (f(self.raw_rows.ptr, i)) |null_val| {
+                    ct.has_nullable = true;
+                    ct.nullable_val = null_val;
+                }
+            }
+            if (self.raw_rows.vtable.columnTypeLength) |f| {
+                if (f(self.raw_rows.ptr, i)) |len_val| {
+                    ct.has_length = true;
+                    ct.length_val = len_val;
+                }
+            }
+            if (self.raw_rows.vtable.columnTypePrecisionScale) |f| {
+                if (f(self.raw_rows.ptr, i)) |ps| {
+                    ct.has_precision_scale = true;
+                    ct.precision_val = ps.precision;
+                    ct.scale_val = ps.scale;
+                }
+            }
+            list[i] = ct;
+        }
+        return list;
     }
 
     pub fn next(self: *Rows, dest: []Value, deadline: Deadline) !bool {
         if (self.closed) return false;
         try driver_pkg.checkOperation(self.io, deadline);
         const has_more = self.raw_rows.next(self.io, dest, deadline) catch |next_error| {
-            if (next_error == error.Canceled or next_error == error.DeadlineUnsupported or next_error == error.InvalidDeadline) {
+            if (next_error == error.Canceled or next_error == error.InvalidDeadline) {
                 return next_error;
             }
             self.last_err = next_error;
@@ -794,7 +839,7 @@ pub const Tx = struct {
         if (self.done) return error.TxDone;
         const connection = self.pooled_conn orelse return error.TxDone;
         const io = connection.db.io;
-        try driver_pkg.checkDeadlineSupport(io, deadline, self.raw_tx.vtable.supports_deadline);
+        try driver_pkg.checkOperation(io, deadline);
         self.done = true;
         self.closeStmts();
         self.pooled_conn = null;
@@ -812,7 +857,7 @@ pub const Tx = struct {
         const io = connection.db.io;
         try deadline.validate();
         if (!deadline.isNone()) {
-            try driver_pkg.checkDeadlineSupport(io, deadline, self.raw_tx.vtable.supports_deadline);
+            try driver_pkg.checkOperation(io, deadline);
         }
         self.done = true;
         self.closeStmts();
@@ -1150,9 +1195,12 @@ pub const MockDriver = struct {
             return driver_pkg.Rows{
                 .ptr = rows_ctx,
                 .vtable = &.{
-                    .columns = MockRows.columns,
+                    .columnCount = MockRows.columnCount,
+                    .columnName = MockRows.columnName,
                     .next = MockRows.next,
                     .close = MockRows.close,
+                    .columnTypeDatabaseTypeName = MockRows.columnTypeDatabaseTypeName,
+                    .columnTypeNullable = MockRows.columnTypeNullable,
                 },
             };
         }
@@ -1163,9 +1211,25 @@ pub const MockDriver = struct {
         cursor: usize = 0,
 
         const cols = [_][]const u8{ "id", "name", "role" };
+        const col_types = [_][]const u8{ "BIGINT", "VARCHAR(255)", "VARCHAR(64)" };
 
-        fn columns(_: *anyopaque) anyerror![]const []const u8 {
-            return &cols;
+        fn columnCount(_: *anyopaque) usize {
+            return cols.len;
+        }
+
+        fn columnName(_: *anyopaque, index: usize) []const u8 {
+            if (index < cols.len) return cols[index];
+            return "";
+        }
+
+        fn columnTypeDatabaseTypeName(_: *anyopaque, index: usize) ?[]const u8 {
+            if (index < col_types.len) return col_types[index];
+            return null;
+        }
+
+        fn columnTypeNullable(_: *anyopaque, index: usize) ?bool {
+            if (index == 0) return false;
+            return true;
         }
 
         fn next(ctx: *anyopaque, io: std.Io, dest: []Value, deadline: Deadline) anyerror!bool {
@@ -1243,9 +1307,8 @@ test "database.sql: basic open, ping, exec, query and close" {
     var rows = try db.query("SELECT id, name, role FROM users", &.{}, .none);
     defer rows.close();
 
-    const cols = try rows.columns();
-    try testing.expectEqual(@as(usize, 3), cols.len);
-    try testing.expectEqualStrings("id", cols[0]);
+    try testing.expectEqual(@as(usize, 3), rows.columnCount());
+    try testing.expectEqualStrings("id", rows.columnName(0));
 
     var record: [3]Value = undefined;
     var count: usize = 0;
@@ -1573,16 +1636,17 @@ test "database.sql: interrupt and unsupported deadline" {
         try testing.expectEqual(@as(usize, 3), state.interrupt_count);
     }
 
-    // 3. Deadline is rejected before the driver is invoked.
+    // 3. In compatibility mode, valid deadlines are accepted, expired/invalid deadlines fail properly.
     {
         const deadline = @import("../io/deadline.zig").Deadline.after(io, .fromSeconds(1));
         const invalid: Deadline = .{ .timestamp = .now(io, .real) };
-        const open_count = state.open_count;
-        try testing.expectError(error.DeadlineUnsupported, db.ping(deadline));
-        try testing.expectError(error.DeadlineUnsupported, db.exec("SELECT 1", &.{}, deadline));
-        try testing.expectError(error.DeadlineUnsupported, db.query("SELECT 1", &.{}, deadline));
+        const expired = @import("../io/deadline.zig").Deadline.after(io, .zero);
+        try db.ping(deadline);
+        _ = try db.exec("SELECT 1", &.{}, deadline);
+        var q_rows = try db.query("SELECT 1", &.{}, deadline);
+        q_rows.close();
+        try testing.expectError(error.Timeout, db.ping(expired));
         try testing.expectError(error.InvalidDeadline, db.ping(invalid));
-        try testing.expectEqual(open_count, state.open_count);
     }
 }
 
@@ -1645,15 +1709,15 @@ test "database.sql: beginTx options and deadline" {
         try testing.expect(state.last_tx_opts.?.read_only);
     }
 
-    // 2. Deadlines other than .none are rejected before invoking the driver.
+    // 2. In compatibility mode, deadlines are accepted by transactions.
     {
         var tx = try db.begin(.none);
         defer tx.rollback(.none) catch {};
         const deadline = @import("../io/deadline.zig").Deadline.after(io, .fromSeconds(1));
-        try testing.expectError(error.DeadlineUnsupported, tx.exec("UPDATE users SET age = 30", &.{}, deadline));
-        try testing.expectError(error.DeadlineUnsupported, tx.query("SELECT 1", &.{}, deadline));
-        try testing.expectError(error.DeadlineUnsupported, tx.commit(deadline));
-        try testing.expectError(error.DeadlineUnsupported, tx.rollback(deadline));
+        _ = try tx.exec("UPDATE users SET age = 30", &.{}, deadline);
+        var q_rows = try tx.query("SELECT 1", &.{}, deadline);
+        q_rows.close();
+        try tx.commit(deadline);
     }
 }
 
@@ -1725,8 +1789,11 @@ test "database.sql: Rows.next returns driver iteration errors" {
     defer threaded.deinit();
     const io = threaded.io();
     const Fake = struct {
-        fn columns(_: *anyopaque) anyerror![]const []const u8 {
-            return &.{};
+        fn columnCount(_: *anyopaque) usize {
+            return 0;
+        }
+        fn columnName(_: *anyopaque, _: usize) []const u8 {
+            return "";
         }
         fn next(_: *anyopaque, _: std.Io, _: []Value, _: Deadline) anyerror!bool {
             return false;
@@ -1755,7 +1822,8 @@ test "database.sql: Rows.next returns driver iteration errors" {
             .query = Fake.query,
         } },
         .raw_rows = .{ .ptr = &anchor, .vtable = &.{
-            .columns = Fake.columns,
+            .columnCount = Fake.columnCount,
+            .columnName = Fake.columnName,
             .next = Fake.next,
             .close = Fake.close,
             .err = Fake.rowError,
@@ -1812,8 +1880,12 @@ test "database.sql: transaction rows reject unsupported deadline" {
     defer rows.close();
     var dest: [3]Value = undefined;
     const deadline = @import("../io/deadline.zig").Deadline.after(io, .fromSeconds(1));
-    try testing.expectError(error.DeadlineUnsupported, rows.next(&dest, deadline));
+    const has_row = try rows.next(&dest, deadline);
+    try testing.expect(has_row);
     try testing.expect(!rows.closed);
+
+    const expired = @import("../io/deadline.zig").Deadline.after(io, .zero);
+    try testing.expectError(error.Timeout, rows.next(&dest, expired));
 }
 
 test "database.sql: DB.prepare and Stmt execution on mock driver" {
@@ -1942,6 +2014,45 @@ test "database.sql: Tx.prepare statements are closed and invalidated on commit a
         // Commit should succeed cleanly even when statement was closed early
         try tx.commit(.none);
     }
+}
+
+test "database.sql: Rows.columnTypes metadata" {
+    const testing = std.testing;
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+
+    var rows = try db.query("SELECT id, name, role FROM users", &.{}, .none);
+    defer rows.close();
+
+    const types = try rows.columnTypes(testing.allocator);
+    defer testing.allocator.free(types);
+
+    try testing.expectEqual(@as(usize, 3), types.len);
+
+    // Column 0: id
+    try testing.expectEqualStrings("id", types[0].name());
+    try testing.expectEqualStrings("BIGINT", types[0].databaseTypeName().?);
+    try testing.expectEqual(@as(?bool, false), types[0].nullable());
+    try testing.expectEqual(@as(?i64, null), types[0].length());
+
+    // Column 1: name
+    try testing.expectEqualStrings("name", types[1].name());
+    try testing.expectEqualStrings("VARCHAR(255)", types[1].databaseTypeName().?);
+    try testing.expectEqual(@as(?bool, true), types[1].nullable());
+
+    // Column 2: role
+    try testing.expectEqualStrings("role", types[2].name());
+    try testing.expectEqualStrings("VARCHAR(64)", types[2].databaseTypeName().?);
+    try testing.expectEqual(@as(?bool, true), types[2].nullable());
 }
 
 test {

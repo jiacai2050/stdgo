@@ -58,7 +58,6 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         return .{
             .ptr = self,
             .vtable = &.{
-                .supports_deadline = true,
                 .open = SQLiteDriver.open,
             },
         };
@@ -110,7 +109,6 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         return driver_pkg.Conn{
             .ptr = conn,
             .vtable = &.{
-                .supports_deadline = true,
                 .prepare = SQLiteConn.prepare,
                 .close = SQLiteConn.close,
                 .begin = SQLiteConn.begin,
@@ -159,7 +157,6 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return driver_pkg.Stmt{
                 .ptr = s,
                 .vtable = &.{
-                    .supports_deadline = true,
                     .close = SQLiteStmt.close,
                     .numInput = SQLiteStmt.numInput,
                     .exec = SQLiteStmt.exec,
@@ -206,7 +203,6 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return driver_pkg.Tx{
                 .ptr = tx,
                 .vtable = &.{
-                    .supports_deadline = true,
                     .commit = SQLiteTx.commit,
                     .rollback = SQLiteTx.rollback,
                 },
@@ -340,11 +336,12 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return driver_pkg.Rows{
                 .ptr = rows,
                 .vtable = &.{
-                    .supports_deadline = true,
-                    .columns = SQLiteRows.columns,
+                    .columnCount = SQLiteRows.columnCount,
+                    .columnName = SQLiteRows.columnName,
                     .next = SQLiteRows.next,
                     .close = SQLiteRows.close,
                     .err = SQLiteRows.err,
+                    .columnTypeDatabaseTypeName = SQLiteRows.columnTypeDatabaseTypeName,
                 },
             };
         }
@@ -355,22 +352,32 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         allocator: Allocator,
         db: *c.sqlite3,
         stmt: *c.sqlite3_stmt,
-        cols_cached: ?[]const []const u8 = null,
         last_step_err: ?anyerror = null,
 
-        /// Retrieves and caches column names from the current result set.
-        fn columns(ctx: *anyopaque) anyerror![]const []const u8 {
+        /// Returns the number of columns in the SQLite result set.
+        fn columnCount(ctx: *anyopaque) usize {
             const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
-            if (self.cols_cached) |cols| return cols;
+            return @intCast(c.sqlite3_column_count(self.stmt));
+        }
 
-            const count: usize = @intCast(c.sqlite3_column_count(self.stmt));
-            var col_list = try self.allocator.alloc([]const u8, count);
-            for (0..count) |i| {
-                const name_ptr = c.sqlite3_column_name(self.stmt, @intCast(i));
-                col_list[i] = if (name_ptr != null) std.mem.span(name_ptr) else "";
+        /// Returns the column name at the given 0-based index.
+        fn columnName(ctx: *anyopaque, index: usize) []const u8 {
+            const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
+            const name_ptr = c.sqlite3_column_name(self.stmt, @intCast(index));
+            if (name_ptr != null) {
+                return std.mem.span(name_ptr);
             }
-            self.cols_cached = col_list;
-            return col_list;
+            return "";
+        }
+
+        /// Returns the declared column type name from SQLite schema (e.g. "INTEGER", "TEXT").
+        fn columnTypeDatabaseTypeName(ctx: *anyopaque, index: usize) ?[]const u8 {
+            const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
+            const decl_ptr = c.sqlite3_column_decltype(self.stmt, @intCast(index));
+            if (decl_ptr != null) {
+                return std.mem.span(decl_ptr);
+            }
+            return null;
         }
 
         /// Advances the cursor to the next row, decoding SQLite column types into dest.
@@ -433,13 +440,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return self.last_step_err;
         }
 
-        /// Resets statement cursor, frees cached column names, and releases row memory.
+        /// Resets statement cursor and releases row memory.
         fn close(ctx: *anyopaque) void {
             const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
             _ = c.sqlite3_reset(self.stmt);
-            if (self.cols_cached) |cols| {
-                self.allocator.free(cols);
-            }
             self.allocator.destroy(self);
         }
     };
@@ -570,12 +574,11 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         var rows = try db.query("SELECT id, name, age, balance FROM users ORDER BY id ASC", &.{}, .none);
         defer rows.close();
 
-        const cols = try rows.columns();
-        try testing.expectEqual(@as(usize, 4), cols.len);
-        try testing.expectEqualStrings("id", cols[0]);
-        try testing.expectEqualStrings("name", cols[1]);
-        try testing.expectEqualStrings("age", cols[2]);
-        try testing.expectEqualStrings("balance", cols[3]);
+        try testing.expectEqual(@as(usize, 4), rows.columnCount());
+        try testing.expectEqualStrings("id", rows.columnName(0));
+        try testing.expectEqualStrings("name", rows.columnName(1));
+        try testing.expectEqualStrings("age", rows.columnName(2));
+        try testing.expectEqualStrings("balance", rows.columnName(3));
 
         var dest: [4]Value = undefined;
 
@@ -787,5 +790,27 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
 
         // Subsequent exec must return error.TxDone
         try testing.expectError(error.TxDone, tx_stmt.exec(&.{Value{ .string = "Alice" }}, .none));
+    }
+
+    // Verify Rows.columnTypes in SQLite schema inspection
+    {
+        var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", &.{}, .none);
+        defer rows.close();
+
+        const types = try rows.columnTypes(testing.allocator);
+        defer testing.allocator.free(types);
+
+        try testing.expectEqual(@as(usize, 4), types.len);
+        try testing.expectEqualStrings("id", types[0].name());
+        try testing.expectEqualStrings("INTEGER", types[0].databaseTypeName().?);
+
+        try testing.expectEqualStrings("name", types[1].name());
+        try testing.expectEqualStrings("TEXT", types[1].databaseTypeName().?);
+
+        try testing.expectEqualStrings("age", types[2].name());
+        try testing.expectEqualStrings("INTEGER", types[2].databaseTypeName().?);
+
+        try testing.expectEqualStrings("balance", types[3].name());
+        try testing.expectEqualStrings("REAL", types[3].databaseTypeName().?);
     }
 }

@@ -118,12 +118,12 @@ requires an injected `std.Io`. HTTP client timeouts share one budget across
 redirects and response body reads; transport options also support TLS handshake,
 response-header, `100-continue`, and idle-connection timeouts.
 
-SQL drivers must opt in to deadline support; other drivers return
-`error.DeadlineUnsupported`. SQLite checks deadlines during VM execution and pool
-waits, but an uninterruptible SQLite or filesystem call may delay return.
-Completed writes can have side effects even when a timeout is reported.
-Transaction `commit` and `rollback` also take a deadline; `rollback(.none)` remains
-available for cleanup after cancellation.
+SQL operations accept an optional `Deadline`. Whether an in-flight operation
+can be interrupted before completion depends on the underlying driver implementation.
+SQLite checks deadlines during VM execution and pool waits, but an uninterruptible
+SQLite or filesystem call may delay return. Completed writes can have side effects
+even when a timeout is reported. Transaction `commit` and `rollback` also take a deadline;
+`rollback(.none)` remains available for cleanup after cancellation.
 
 Timed network operations require a concurrent, cancelable `std.Io` backend.
 Cancellation waits for the underlying operation to exit, so an uncooperative backend

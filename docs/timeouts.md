@@ -43,7 +43,7 @@
 | 独立 DNS 查询 | `Resolver.timeout` 控制单次查询的预算 | `net.Resolver` 查询方法接收 `context.Context` | stdgo 查询方法无显式 deadline 参数；`lookupIP` 依次查询 A 与 AAAA 记录，共用同一份超时预算。 |
 | HTTP 请求总期限 | `Client.timeout` / `timeout_ns` 与 `Client.do` 的 deadline 取较早值，覆盖重定向及 body 读取 | `http.Client.Timeout`、请求级 context | 两者均取决于具体 transport 实现；stdgo 无法强制打断自定义 RoundTripper 或非协作式 body reader。 |
 | HTTP 阶段期限 | 支持 TLS 握手、响应头等待、`100-continue` 等待和空闲连接回收期限 | `http.Transport` 提供对应配置；支持通过 `DialContext` 定制拨号 | stdgo 没有 transport 级的自定义 dialer 或独立的 DNS/connect 期限；各阶段期限均受请求总期限约束。 |
-| SQL 查询与池等待 | `DB`、`Conn`、`Stmt`、`Rows` 接收 deadline；SQLite 驱动与连接池支持期限检查 | `database/sql` 的 `*Context` 方法接收 context | 驱动需声明 `supports_deadline`，否则返回 `DeadlineUnsupported`；SQLite 阻塞的底层调用不保证即时退出。Go 在执行过程中的取消能力同样取决于具体驱动。 |
+| SQL 查询与池等待 | `DB`、`Conn`、`Stmt`、`Rows` 接收 deadline；SQLite 驱动与连接池支持期限检查 | `database/sql` 的 `*Context` 方法接收 context | 执行前会检查任务取消与期限是否超期；执行中是否支持打断取决于具体 driver 实现（如 SQLite 支持虚拟机执行中断）。与 Go 一致，驱动若未实现中断机制则尽力而为执行。 |
 | SQL 事务 | `begin`、单次操作、`commit` 和 `rollback` 分别接收期限 | `BeginTx` 传入的 context 贯穿整个事务；取消后自动回滚 | stdgo 不继承 `begin` 的期限，也不会自动回滚；调用前超时的事务仍由调用方持有，须显式清理。 |
 | semaphore / rate | `Weighted.acquire` 和 `Limiter.waitN` 接收 deadline | 对应 Go 扩展包的等待方法接收 context | stdgo 的等待包含锁竞争与退出清理，不能作为严格的完成时间上限；rate limiter 取消预约时不保证始终能退还全部 token。 |
 | 子进程 | `Cmd.run(io)` 等待进程退出；等待期间推迟处理任务取消 | `exec.CommandContext` 默认在 context 结束时向进程发送 Kill 信号 | stdgo 目前不提供等价的执行超时强制终止；等待过程中的取消需等待子进程退出后处理。 |

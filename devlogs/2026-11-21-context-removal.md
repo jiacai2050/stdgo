@@ -344,7 +344,7 @@ while (true) {
 
 ### 5.4 数据库驱动与 SQLite VM 指令级超时
 
-- 驱动能力声明：在 `src/database/sql/driver.zig` 的 VTable 中引入 `supports_deadline: bool = false`。未实现超时支持的驱动在收到非空 Deadline 时返回 `error.DeadlineUnsupported`。
+- 兼容超时模式：在 `src/database/sql/driver.zig` 中采用与 Go 一致的尽力而为（best-effort）模式，操作前统一校验任务取消与截止期。执行中是否支持超时打断取决于具体驱动实现（如 SQLite 支持虚拟机执行中断）。
 - SQLite 虚拟机中断：`src/database/sql/sqlite.zig` 接入 `sqlite3_progress_handler(db, 1000, callback, self)`。每执行 1000 条虚拟机字节码，检查一次 `io.checkCancel()` 与 `deadline`；若已超时或被取消，返回 1 促使 SQLite 退出并返回 `SQLITE_INTERRUPT`。
 - 连接池条件变量：连接池等待使用 `std.Io.Condition`，在连接归还、丢弃、扩容或关闭时唤醒等待者，替代了此前的 sleep 轮询。
 
