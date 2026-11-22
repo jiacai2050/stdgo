@@ -57,13 +57,12 @@ pub fn operate(
     operation: std.Io.Operation,
     deadline: Deadline,
 ) !std.Io.Operation.Result {
-    if (operation == .net_read) return read(io, operation, deadline);
     if (deadline.isNone()) return io.operate(operation);
     try deadline.check(io);
 
-    // A writable socket can still block on a large write after poll reports readiness.
+    // Sockets can block on reads/writes; drive with a background task and check deadlines.
     var ready: std.Io.Event = .unset;
-    var future = try io.concurrent(write, .{ io, operation, &ready });
+    var future = try io.concurrent(runOperation, .{ io, operation, &ready });
     var pending = true;
     defer if (pending) {
         if (future.cancel(io)) |_| {} else |_| {}
@@ -85,45 +84,13 @@ pub fn operate(
     }
 }
 
-fn write(
+fn runOperation(
     io: std.Io,
     operation: std.Io.Operation,
     ready: *std.Io.Event,
 ) std.Io.Cancelable!std.Io.Operation.Result {
     defer ready.set(io);
     return io.operate(operation);
-}
-
-fn read(io: std.Io, operation: std.Io.Operation, deadline: Deadline) !std.Io.Operation.Result {
-    if (deadline.isNone()) return io.operate(operation);
-    try deadline.check(io);
-    var storage: [1]std.Io.Operation.Storage = undefined;
-    var batch: std.Io.Batch = .init(&storage);
-    defer batch.cancel(io);
-    batch.addAt(0, operation);
-    while (true) {
-        batch.awaitConcurrent(io, deadline.timeout()) catch |err| switch (err) {
-            error.Timeout => {
-                deadline.check(io) catch |deadline_err| {
-                    batch.cancel(io);
-                    if (batch.next()) |completion| return completion.result;
-                    return deadline_err;
-                };
-                continue;
-            },
-            error.Canceled => {
-                batch.cancel(io);
-                if (batch.next()) |completion| {
-                    io.recancel();
-                    return completion.result;
-                }
-                return error.Canceled;
-            },
-            else => return err,
-        };
-        const completion = batch.next().?;
-        return completion.result;
-    }
 }
 
 pub const SocketReader = struct {
