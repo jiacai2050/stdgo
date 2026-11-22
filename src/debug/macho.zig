@@ -221,7 +221,10 @@ pub const File = struct {
                     const nsects = mem.readInt(u32, cmd_data[48..52], endian);
                     const segflags = mem.readInt(u32, cmd_data[52..56], endian);
 
-                    const seg_data = if (fileoff + filesize <= data.len) data[fileoff .. fileoff + filesize] else &.{};
+                    const seg_data = if (fileoff + filesize <= data.len)
+                        data[fileoff .. fileoff + filesize]
+                    else
+                        &.{};
 
                     try segments_list.append(allocator, .{
                         .header = .{
@@ -255,7 +258,10 @@ pub const File = struct {
                         const nreloc = mem.readInt(u32, sec_bytes[52..56], endian);
                         const s_flags = mem.readInt(u32, sec_bytes[56..60], endian);
 
-                        const sec_data = if (s_off + size <= data.len) data[s_off .. s_off + size] else &.{};
+                        const sec_data = if (s_off + size <= data.len)
+                            data[s_off .. s_off + size]
+                        else
+                            &.{};
                         try sections_list.append(allocator, .{
                             .header = .{
                                 .name = secname,
@@ -286,7 +292,10 @@ pub const File = struct {
                     const nsects = mem.readInt(u32, cmd_data[64..68], endian);
                     const segflags = mem.readInt(u32, cmd_data[68..72], endian);
 
-                    const seg_data = if (fileoff + filesize <= data.len) data[fileoff .. fileoff + filesize] else &.{};
+                    const seg_data = if (fileoff + filesize <= data.len)
+                        data[fileoff .. fileoff + filesize]
+                    else
+                        &.{};
 
                     try segments_list.append(allocator, .{
                         .header = .{
@@ -320,7 +329,10 @@ pub const File = struct {
                         const nreloc = mem.readInt(u32, sec_bytes[60..64], endian);
                         const s_flags = mem.readInt(u32, sec_bytes[64..68], endian);
 
-                        const sec_data = if (s_off + size <= data.len) data[s_off .. s_off + size] else &.{};
+                        const sec_data = if (s_off + size <= data.len)
+                            data[s_off .. s_off + size]
+                        else
+                            &.{};
                         try sections_list.append(allocator, .{
                             .header = .{
                                 .name = secname,
@@ -399,21 +411,35 @@ pub const File = struct {
         const is64 = (self.header.magic == Magic64);
         const entsize: usize = if (is64) 16 else 12;
 
-        const total_size = std.math.mul(usize, self.symtab_num, entsize) catch return FormatError.UnexpectedEOF;
-        if (self.symtab_off > self.raw_data.len or self.raw_data.len - self.symtab_off < total_size) return FormatError.UnexpectedEOF;
-        if (self.strtab_off > self.raw_data.len or self.raw_data.len - self.strtab_off < self.strtab_size) return FormatError.UnexpectedEOF;
+        const total_size = std.math.mul(usize, self.symtab_num, entsize) catch {
+            return FormatError.UnexpectedEOF;
+        };
+        if (self.symtab_off > self.raw_data.len or
+            self.raw_data.len - self.symtab_off < total_size)
+        {
+            return FormatError.UnexpectedEOF;
+        }
+        if (self.strtab_off > self.raw_data.len or
+            self.raw_data.len - self.strtab_off < self.strtab_size)
+        {
+            return FormatError.UnexpectedEOF;
+        }
 
         const strtab = self.raw_data[self.strtab_off .. self.strtab_off + self.strtab_size];
         var syms = try alloc.alloc(Symbol, self.symtab_num);
         errdefer alloc.free(syms);
 
         for (0..self.symtab_num) |i| {
-            const raw = self.raw_data[self.symtab_off + i * entsize .. self.symtab_off + (i + 1) * entsize];
+            const entry_start = self.symtab_off + i * entsize;
+            const raw = self.raw_data[entry_start .. entry_start + entsize];
             const strx = mem.readInt(u32, raw[0..4], endian);
             const n_type = raw[4];
             const n_sect = raw[5];
             const n_desc = mem.readInt(u16, raw[6..8], endian);
-            const n_value = if (is64) mem.readInt(u64, raw[8..16], endian) else mem.readInt(u32, raw[8..12], endian);
+            const n_value = if (is64)
+                mem.readInt(u64, raw[8..16], endian)
+            else
+                mem.readInt(u32, raw[8..12], endian);
 
             const name = if (strx < strtab.len) mem.sliceTo(strtab[strx..], 0) else "";
             syms[i] = .{
@@ -534,7 +560,8 @@ test "parse minimal synthetic 64-bit Mach-O file" {
     const dylib_name = "/usr/lib/libSystem.B.dylib\x00";
     @memcpy(dylib_cmd[16 .. 16 + dylib_name.len], dylib_name);
 
-    // Symtab entry at 300 (16 bytes): strx = 1 ("_main"), type = 0x0f (N_SECT | N_EXT), sect = 1, desc = 0, val = 0x100000f00
+    // Symtab entry at 300 (16 bytes): strx = 1 ("_main"), type = 0x0f (N_SECT | N_EXT),
+    // sect = 1, desc = 0, val = 0x100000f00
     const sym_entry = buf[300..316];
     mem.writeInt(u32, sym_entry[0..4], 1, .little);
     sym_entry[4] = 0x0f;

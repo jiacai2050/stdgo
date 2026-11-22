@@ -34,7 +34,10 @@ pub const Hmac = struct {
         if (key.len > b_size) {
             // Key is longer than block size: key = hash(key)
             inner_h.reset();
-            _ = inner_h.write(key) catch unreachable;
+            const written = inner_h.write(key) catch |err| {
+                std.debug.panic("hmac: inner_h.write key failed: {s}", .{@errorName(err)});
+            };
+            std.debug.assert(written == key.len);
             const sum_slice = inner_h.sum(key_buf[0..h_size]);
             _ = sum_slice;
             inner_h.reset();
@@ -54,7 +57,10 @@ pub const Hmac = struct {
     /// Reset resets the HMAC state to start processing a new message with the same key.
     pub fn reset(self: *Hmac) void {
         self.inner_hash.reset();
-        _ = self.inner_hash.write(self.ipad[0..self.block_size]) catch unreachable;
+        const written = self.inner_hash.write(self.ipad[0..self.block_size]) catch |err| {
+            std.debug.panic("hmac: inner_hash.write ipad failed: {s}", .{@errorName(err)});
+        };
+        std.debug.assert(written == self.block_size);
     }
 
     /// Write writes message data to the HMAC.
@@ -69,8 +75,16 @@ pub const Hmac = struct {
         const inner_digest = self.inner_hash.sum(inner_sum_buf[0..self.hash_size]);
 
         self.outer_hash.reset();
-        _ = self.outer_hash.write(self.opad[0..self.block_size]) catch unreachable;
-        _ = self.outer_hash.write(inner_digest) catch unreachable;
+        const opad_written = self.outer_hash.write(self.opad[0..self.block_size]) catch |err| {
+            std.debug.panic("hmac: outer_hash.write opad failed: {s}", .{@errorName(err)});
+        };
+        std.debug.assert(opad_written == self.block_size);
+
+        const digest_written = self.outer_hash.write(inner_digest) catch |err| {
+            std.debug.panic("hmac: outer_hash.write digest failed: {s}", .{@errorName(err)});
+        };
+        std.debug.assert(digest_written == inner_digest.len);
+
         return self.outer_hash.sum(out);
     }
 
@@ -100,7 +114,11 @@ pub const Hmac = struct {
         return &self.writer_inst;
     }
 
-    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drainImpl(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *Hmac = @alignCast(@fieldParentPtr("writer_inst", w));
         var total: usize = 0;
         for (data[0 .. data.len - 1]) |slice| {
@@ -150,7 +168,10 @@ pub fn sha256(key: []const u8, message: []const u8, out: *[32]u8) void {
     var inner_d = sha256_mod.New();
     var outer_d = sha256_mod.New();
     var h = Hmac.init(inner_d.hash(), outer_d.hash(), key);
-    _ = h.write(message) catch unreachable;
+    const written = h.write(message) catch |err| {
+        std.debug.panic("hmac: write message failed: {s}", .{@errorName(err)});
+    };
+    std.debug.assert(written == message.len);
     _ = h.sum(out);
 }
 
@@ -160,7 +181,10 @@ pub fn md5(key: []const u8, message: []const u8, out: *[16]u8) void {
     var inner_d = md5_mod.New();
     var outer_d = md5_mod.New();
     var h = Hmac.init(inner_d.hash(), outer_d.hash(), key);
-    _ = h.write(message) catch unreachable;
+    const written = h.write(message) catch |err| {
+        std.debug.panic("hmac: write message failed: {s}", .{@errorName(err)});
+    };
+    std.debug.assert(written == message.len);
     _ = h.sum(out);
 }
 

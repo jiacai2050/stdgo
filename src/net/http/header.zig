@@ -96,7 +96,11 @@ pub const Header = struct {
     }
 
     /// values returns all values associated with the given key.
-    pub fn values(self: *const Header, allocator: std.mem.Allocator, name: []const u8) ![][]const u8 {
+    pub fn values(
+        self: *const Header,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+    ) ![][]const u8 {
         var list = std.ArrayListUnmanaged([]const u8).empty;
         errdefer list.deinit(allocator);
 

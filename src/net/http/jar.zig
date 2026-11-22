@@ -37,7 +37,11 @@ pub const CookieJar = struct {
         self.entries.deinit(self.allocator);
     }
 
-    pub fn setCookiesFromHeader(self: *CookieJar, host: []const u8, set_cookie_raw: []const u8) !void {
+    pub fn setCookiesFromHeader(
+        self: *CookieJar,
+        host: []const u8,
+        set_cookie_raw: []const u8,
+    ) !void {
         if (parseSetCookie(set_cookie_raw)) |c| {
             try self.setCookie(host, c);
         }
@@ -47,7 +51,9 @@ pub const CookieJar = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.entries.items) |*existing| {
-            if (std.ascii.eqlIgnoreCase(existing.host, host) and std.mem.eql(u8, existing.name, c.name)) {
+            if (std.ascii.eqlIgnoreCase(existing.host, host) and
+                std.mem.eql(u8, existing.name, c.name))
+            {
                 self.allocator.free(existing.value);
                 existing.value = try self.allocator.dupe(u8, c.value);
                 return;
@@ -71,7 +77,11 @@ pub const CookieJar = struct {
         });
     }
 
-    pub fn formatCookieHeader(self: *CookieJar, allocator: std.mem.Allocator, host: []const u8) !?[]u8 {
+    pub fn formatCookieHeader(
+        self: *CookieJar,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+    ) !?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         var list = std.ArrayListUnmanaged(u8).empty;

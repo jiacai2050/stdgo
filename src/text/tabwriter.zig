@@ -164,7 +164,11 @@ pub const Writer = struct {
         return &self.writer_inst;
     }
 
-    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drainImpl(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *Writer = @alignCast(@fieldParentPtr("writer_inst", w));
         var total: usize = 0;
         for (data[0 .. data.len - 1]) |slice| {

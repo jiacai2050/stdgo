@@ -18,6 +18,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      STDGO_HTTP_PROXY_PORT: 38888
+      STDGO_SOCKS_PROXY_PORT: 31080
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +45,39 @@ jobs:
 
       - name: Build executable
         run: make build
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Start HTTP & SOCKS proxy
+        if: runner.os != 'Windows'
+        run: |
+          go run tests/proxy.go -http-addr :${STDGO_HTTP_PROXY_PORT} -socks-addr :${STDGO_SOCKS_PROXY_PORT} > proxy.log 2>&1 &
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:${STDGO_HTTP_PROXY_PORT}/healthz >/dev/null; then
+              echo "Proxy server is up (HTTP: ${STDGO_HTTP_PROXY_PORT}, SOCKS5: ${STDGO_SOCKS_PROXY_PORT})"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start HTTP & SOCKS proxy (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Start-Process go -ArgumentList "run tests/proxy.go -http-addr :$env:STDGO_HTTP_PROXY_PORT -socks-addr :$env:STDGO_SOCKS_PROXY_PORT"
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$env:STDGO_HTTP_PROXY_PORT/healthz" -UseBasicParsing -TimeoutSec 1
+              if ($resp.StatusCode -eq 200) {
+                Write-Host "Proxy server is up on 127.0.0.1:$env:STDGO_HTTP_PROXY_PORT"
+                break
+              }
+            } catch {
+              Start-Sleep -Seconds 1
+            }
+          }
 
       - name: Run all tests
         run: make test

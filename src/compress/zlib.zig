@@ -40,7 +40,11 @@ pub const Writer = struct {
         .flush = outFlush,
     };
 
-    fn outDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn outDrain(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *Writer = @alignCast(@fieldParentPtr("out_writer", w));
         if (w.end > 0) {
             self.underlying.writeAll(w.buffer[0..w.end]) catch return error.WriteFailed;
@@ -66,7 +70,8 @@ pub const Writer = struct {
 
     fn outFlushInternal(self: *Writer) std.Io.Writer.Error!void {
         if (self.out_writer.end > 0) {
-            self.underlying.writeAll(self.out_writer.buffer[0..self.out_writer.end]) catch return error.WriteFailed;
+            const buf = self.out_writer.buffer[0..self.out_writer.end];
+            self.underlying.writeAll(buf) catch return error.WriteFailed;
             self.out_writer.end = 0;
         }
         self.underlying.flush() catch return error.WriteFailed;
@@ -131,7 +136,8 @@ pub fn newWriter(allocator: Allocator, w: *io.Writer) Error!*Writer {
     return newWriterLevel(allocator, w, DefaultCompression);
 }
 
-/// NewWriterLevel is like NewWriter but specifies the compression level instead of assuming DefaultCompression.
+/// NewWriterLevel is like NewWriter but specifies the compression level instead of assuming
+/// DefaultCompression.
 pub fn newWriterLevel(allocator: Allocator, w: *io.Writer, level: i32) Error!*Writer {
     const self = try allocator.create(Writer);
     errdefer allocator.destroy(self);
@@ -158,7 +164,8 @@ pub fn newWriterLevel(allocator: Allocator, w: *io.Writer, level: i32) Error!*Wr
     if (level == NoCompression) {
         self.mode = .{ .raw = try flate.Compress.Raw.init(&self.out_writer, window_buf, .zlib) };
     } else if (level == HuffmanOnly) {
-        self.mode = .{ .huffman = try flate.Compress.Huffman.init(&self.out_writer, window_buf, .zlib) };
+        const h = try flate.Compress.Huffman.init(&self.out_writer, window_buf, .zlib);
+        self.mode = .{ .huffman = h };
     } else {
         const opts: flate.Compress.Options = switch (level) {
             1 => flate.Compress.Options.level_1,
@@ -172,7 +179,8 @@ pub fn newWriterLevel(allocator: Allocator, w: *io.Writer, level: i32) Error!*Wr
             9 => flate.Compress.Options.level_9,
             else => return Error.InvalidCompressionLevel,
         };
-        self.mode = .{ .normal = try flate.Compress.init(&self.out_writer, window_buf, .zlib, opts) };
+        const comp = try flate.Compress.init(&self.out_writer, window_buf, .zlib, opts);
+        self.mode = .{ .normal = comp };
     }
 
     return self;
@@ -198,7 +206,9 @@ test "compress.zlib: round-trip compression and decompression" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    const original_text = "ZLIB (RFC 1950) compression support for stdgo in Zig 0.17! Repeat data: 1234567890 1234567890 1234567890";
+    const original_text =
+        "ZLIB (RFC 1950) compression support for stdgo in Zig 0.17! Repeat data: " ++
+        "1234567890 1234567890 1234567890";
 
     var compressed_buf = bytes.Buffer.init(testing.allocator);
     defer compressed_buf.deinit();
@@ -231,9 +241,12 @@ test "compress.zlib: multiple compression levels" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    const original_text = "The quick brown fox jumps over the lazy dog. Repetition for better compression ratio.";
+    const original_text =
+        "The quick brown fox jumps over the lazy dog. Repetition for better compression ratio.";
 
-    const levels = [_]i32{ BestSpeed, DefaultCompression, BestCompression, NoCompression, HuffmanOnly };
+    const levels = [_]i32{
+        BestSpeed, DefaultCompression, BestCompression, NoCompression, HuffmanOnly,
+    };
 
     for (levels) |lvl| {
         var comp_buf = bytes.Buffer.init(testing.allocator);

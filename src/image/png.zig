@@ -116,14 +116,21 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !*RGBAImage {
     const decompressed = decomp_buf.items;
 
     if (hdr.width > 10000 or hdr.height > 10000) return error.InvalidDimensions;
-    const stride = std.math.mul(usize, @as(usize, hdr.width), bpp) catch return error.InvalidDimensions;
+    const stride = std.math.mul(usize, @as(usize, hdr.width), bpp) catch {
+        return error.InvalidDimensions;
+    };
     const scanline_len = stride + 1;
-    const total_scanline_bytes = std.math.mul(usize, @as(usize, hdr.height), scanline_len) catch return error.InvalidDimensions;
+    const total_scanline_bytes = std.math.mul(
+        usize,
+        @as(usize, hdr.height),
+        scanline_len,
+    ) catch return error.InvalidDimensions;
     if (decompressed.len < total_scanline_bytes) {
         return error.UnexpectedEof;
     }
 
-    var img = try RGBAImage.init(allocator, Rectangle.rect(0, 0, @intCast(hdr.width), @intCast(hdr.height)));
+    const bounds = Rectangle.rect(0, 0, @intCast(hdr.width), @intCast(hdr.height));
+    var img = try RGBAImage.init(allocator, bounds);
     errdefer img.deinit();
 
     const prior_line = try allocator.alloc(u8, stride);

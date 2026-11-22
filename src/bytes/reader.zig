@@ -109,5 +109,6 @@ test "bytes.Reader basic reading and seeking" {
 
     const written = try r.writeTo(&out_alloc.writer);
     try std.testing.expectEqual(@as(u64, 11), written);
-    try std.testing.expectEqualStrings("hello world", out_alloc.writer.buffer[0..out_alloc.writer.end]);
+    const out_slice = out_alloc.writer.buffer[0..out_alloc.writer.end];
+    try std.testing.expectEqualStrings("hello world", out_slice);
 }

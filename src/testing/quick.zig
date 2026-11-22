@@ -12,7 +12,8 @@ pub const Config = struct {
     seed: u64 = 42,
 };
 
-/// ValueGenerator provides automatic pseudo-random generation of arbitrary Zig values for property testing.
+/// ValueGenerator provides automatic pseudo-random generation of arbitrary Zig values
+/// for property testing.
 pub const Generator = struct {
     rand: std.Random,
 
@@ -22,7 +23,11 @@ pub const Generator = struct {
 
     pub fn gen(self: Generator, comptime T: type) T {
         // If type has a custom generate function, delegate to it
-        if (@typeInfo(T) == .@"struct" or @typeInfo(T) == .@"union" or @typeInfo(T) == .@"enum" or @typeInfo(T) == .@"opaque") {
+        const is_custom = @typeInfo(T) == .@"struct" or
+            @typeInfo(T) == .@"union" or
+            @typeInfo(T) == .@"enum" or
+            @typeInfo(T) == .@"opaque";
+        if (is_custom) {
             if (@hasDecl(T, "generate")) {
                 return T.generate(self.rand);
             }

@@ -13,7 +13,9 @@ pub const IP = union(enum) {
     pub const ipv4_zero: IP = .{ .v4 = [_]u8{ 0, 0, 0, 0 } };
     pub const ipv6_zero: IP = .{ .v6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
     pub const ipv4_loopback: IP = .{ .v4 = [_]u8{ 127, 0, 0, 1 } };
-    pub const ipv6_loopback: IP = .{ .v6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    pub const ipv6_loopback: IP = .{
+        .v6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+    };
 
     /// Returns true if ip is a loopback address.
     pub fn isLoopback(self: IP) bool {
@@ -99,11 +101,19 @@ pub const IP = union(enum) {
     pub fn stringBuf(self: IP, buf: []u8) []const u8 {
         switch (self) {
             .v4 => |b| {
-                return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch "";
+                return std.fmt.bufPrint(
+                    buf,
+                    "{d}.{d}.{d}.{d}",
+                    .{ b[0], b[1], b[2], b[3] },
+                ) catch "";
             },
             .v6 => |b| {
                 if (isV4InV6(b)) {
-                    return std.fmt.bufPrint(buf, "::ffff:{d}.{d}.{d}.{d}", .{ b[12], b[13], b[14], b[15] }) catch "";
+                    return std.fmt.bufPrint(
+                        buf,
+                        "::ffff:{d}.{d}.{d}.{d}",
+                        .{ b[12], b[13], b[14], b[15] },
+                    ) catch "";
                 }
                 var pos: usize = 0;
                 var i: usize = 0;
@@ -156,7 +166,8 @@ pub fn ipv4Mask(a: u8, b: u8, c: u8, d: u8) IPMask {
     return m;
 }
 
-/// CIDRMask returns an IPMask consisting of `ones` 1 bits followed by 0s up to a total of `bits` bits.
+/// CIDRMask returns an IPMask consisting of `ones` 1 bits followed by 0s
+/// up to a total of `bits` bits.
 pub fn cidrMask(ones: usize, bits: usize) ?IPMask {
     if (bits != 32 and bits != 128) return null;
     if (ones > bits) return null;
@@ -335,7 +346,8 @@ pub const CidrResult = struct {
     ipnet: IPNet,
 };
 
-/// ParseCIDR parses s as a CIDR notation IP address and prefix length, like "192.0.2.0/24" or "2001:db8::/32".
+/// ParseCIDR parses s as a CIDR notation IP address and prefix length,
+/// like "192.0.2.0/24" or "2001:db8::/32".
 pub fn parseCidr(s: []const u8) !CidrResult {
     const slash_pos = std.mem.indexOfScalar(u8, s, '/') orelse return error.InvalidCidr;
     const ip_part = s[0..slash_pos];
@@ -415,7 +427,10 @@ test "net.ip: IP format matches stringBuf" {
     var str_buf: [64]u8 = undefined;
     const v4_in_v6: IP = .{ .v6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 } };
     for ([_]IP{ parseIp("192.168.1.1").?, v4_in_v6, parseIp("2001:db8::1").? }) |ip| {
-        try testing.expectEqualStrings(ip.stringBuf(&str_buf), try std.fmt.bufPrint(&fmt_buf, "{f}", .{ip}));
+        const expected = ip.stringBuf(&str_buf);
+        const actual = try std.fmt.bufPrint(&fmt_buf, "{f}", .{ip});
+        try testing.expectEqualStrings(expected, actual);
     }
-    try testing.expectEqualStrings("::ffff:10.0.0.1", try std.fmt.bufPrint(&fmt_buf, "{f}", .{v4_in_v6}));
+    const v4_v6_fmt = try std.fmt.bufPrint(&fmt_buf, "{f}", .{v4_in_v6});
+    try testing.expectEqualStrings("::ffff:10.0.0.1", v4_v6_fmt);
 }

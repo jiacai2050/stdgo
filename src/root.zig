@@ -263,7 +263,7 @@ test "stdgo integration: sync.Pool + math.rand" {
     const b = (try pool.get()).?;
     _ = try b.write("random number: ");
     var num_buf: [32]u8 = undefined;
-    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{r.intn(1000)}) catch unreachable;
+    const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{r.intn(1000)});
     _ = try b.write(num_str);
 
     try testing.expect(b.len() > 15);
@@ -274,7 +274,12 @@ test "stdgo integration: sync.Pool + math.rand" {
 test "stdgo integration: net.http Request and Header" {
     const testing = std.testing;
 
-    var req = try net.http.newRequest(testing.allocator, .POST, "http://127.0.0.1:8080/api/login", "{\"user\":\"admin\"}");
+    var req = try net.http.newRequest(
+        testing.allocator,
+        .POST,
+        "http://127.0.0.1:8080/api/login",
+        "{\"user\":\"admin\"}",
+    );
     defer req.deinit();
 
     try req.setHeader("Content-Type", "application/json");
@@ -321,9 +326,7 @@ fn mockHttpServerThread(std_io: std.Io, server: *std.Io.net.Server) void {
 test "stdgo integration: net.http real TCP loopback round-trip" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const std_io = threaded.io();
+    const std_io = testing.io;
 
     const bind_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try bind_addr.listen(std_io, .{ .reuse_address = true });

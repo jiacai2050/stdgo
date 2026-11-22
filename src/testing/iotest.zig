@@ -30,7 +30,11 @@ pub const ErrReader = struct {
         return &self.reader_inst;
     }
 
-    fn streamImpl(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        _: *std.Io.Reader,
+        _: *std.Io.Writer,
+        _: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         return error.ReadFailed;
     }
 };
@@ -59,7 +63,11 @@ pub const OneByteReader = struct {
         return &self.reader_inst;
     }
 
-    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        _: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *OneByteReader = @alignCast(@fieldParentPtr("reader_inst", r));
         return try self.r.stream(w, .limited(1));
     }
@@ -88,7 +96,11 @@ pub const HalfReader = struct {
         return &self.reader_inst;
     }
 
-    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *HalfReader = @alignCast(@fieldParentPtr("reader_inst", r));
         const max_bytes = @backingInt(limit);
         const half = if (max_bytes <= 1) 1 else max_bytes / 2;
@@ -122,7 +134,11 @@ pub const TimeoutReader = struct {
         return &self.reader_inst;
     }
 
-    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *TimeoutReader = @alignCast(@fieldParentPtr("reader_inst", r));
         self.count += 1;
         if (self.count >= 2) {
@@ -133,7 +149,8 @@ pub const TimeoutReader = struct {
     }
 };
 
-/// TruncateWriter returns a Writer that writes at most n bytes to w before silently discarding the rest.
+/// TruncateWriter returns a Writer that writes at most n bytes to w before silently
+/// discarding the rest.
 pub const TruncateWriter = struct {
     w: *Writer,
     remaining: usize,
@@ -156,7 +173,11 @@ pub const TruncateWriter = struct {
         return &self.writer_inst;
     }
 
-    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drainImpl(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         _ = splat;
         const self: *TruncateWriter = @alignCast(@fieldParentPtr("writer_inst", w));
         var written: usize = 0;

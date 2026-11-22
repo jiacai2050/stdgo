@@ -214,7 +214,9 @@ pub const Escaper = struct {
                         self.in_tag_name = false;
                     } else {
                         if (self.in_tag_name) {
-                            if (self.tag_len < self.tag_name.len and (std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) {
+                            const is_tag_char = std.ascii.isAlphanumeric(c) or
+                                c == '-' or c == '_';
+                            if (self.tag_len < self.tag_name.len and is_tag_char) {
                                 self.tag_name[self.tag_len] = c;
                                 self.tag_len += 1;
                             }
@@ -222,7 +224,8 @@ pub const Escaper = struct {
                             if (self.has_space_after_attr) {
                                 self.resetAttr();
                             }
-                            if (self.attr_len < self.attr_name.len and c != '<' and c != '"' and c != '\'') {
+                            const is_valid_attr_char = c != '<' and c != '"' and c != '\'';
+                            if (self.attr_len < self.attr_name.len and is_valid_attr_char) {
                                 self.attr_name[self.attr_len] = c;
                                 self.attr_len += 1;
                             }
@@ -304,7 +307,9 @@ pub const Filters = struct {
     pub fn attrEscaper(allocator: Allocator, args: []const Value) anyerror!Value {
         if (args.len == 0) return Value{ .string = "" };
         const arg = args[0];
-        if (arg == .safe_string and (arg.safe_string.kind == .attr or arg.safe_string.kind == .html)) {
+        const is_safe_attr = arg == .safe_string and
+            (arg.safe_string.kind == .attr or arg.safe_string.kind == .html);
+        if (is_safe_attr) {
             return Value{ .string = arg.safe_string.data };
         }
         const s = try valueToString(allocator, arg);
@@ -335,7 +340,9 @@ pub const Filters = struct {
     pub fn unquotedAttrEscaper(allocator: Allocator, args: []const Value) anyerror!Value {
         if (args.len == 0) return Value{ .string = "" };
         const arg = args[0];
-        if (arg == .safe_string and (arg.safe_string.kind == .attr or arg.safe_string.kind == .html)) {
+        const is_safe_attr = arg == .safe_string and
+            (arg.safe_string.kind == .attr or arg.safe_string.kind == .html);
+        if (is_safe_attr) {
             return Value{ .string = arg.safe_string.data };
         }
         const s = try valueToString(allocator, arg);
@@ -509,7 +516,11 @@ fn valueToString(allocator: Allocator, val: Value) anyerror![]const u8 {
 // AST Contextual Auto-Escape Rewriter
 // -------------------------------------------------------------------------
 
-pub fn escapeNodes(allocator: Allocator, nodes: []const Node, escaper: *Escaper) anyerror![]const Node {
+pub fn escapeNodes(
+    allocator: Allocator,
+    nodes: []const Node,
+    escaper: *Escaper,
+) anyerror![]const Node {
     var out = std.ArrayList(Node).empty;
 
     for (nodes) |node| {
@@ -523,9 +534,18 @@ pub fn escapeNodes(allocator: Allocator, nodes: []const Node, escaper: *Escaper)
                 const filter_name: []const u8 = switch (escaper.state) {
                     .text => "_html_esc",
                     .attr_value_unquoted => "_unquoted_attr_esc",
-                    .attr_value_single_quoted, .attr_value_double_quoted, .tag => "_attr_esc",
-                    .url_attr_unquoted, .url_attr_single_quoted, .url_attr_double_quoted => "_url_esc",
-                    .script_data, .js_attr_single_quoted, .js_attr_double_quoted => "_js_esc",
+                    .attr_value_single_quoted,
+                    .attr_value_double_quoted,
+                    .tag,
+                    => "_attr_esc",
+                    .url_attr_unquoted,
+                    .url_attr_single_quoted,
+                    .url_attr_double_quoted,
+                    => "_url_esc",
+                    .script_data,
+                    .js_attr_single_quoted,
+                    .js_attr_double_quoted,
+                    => "_js_esc",
                     .style_data => "_css_esc",
                     .comment => "_comment_esc",
                 };
@@ -598,18 +618,20 @@ pub const Template = struct {
     allocator: Allocator,
     inner: *text_pkg.Template,
 
-    pub fn new(allocator: Allocator, name: []const u8) *Template {
-        const tmpl = allocator.create(Template) catch unreachable;
-        const inner = text_pkg.Template.new(allocator, name);
+    pub fn new(allocator: Allocator, name: []const u8) !*Template {
+        const tmpl = try allocator.create(Template);
+        errdefer allocator.destroy(tmpl);
+        const inner = try text_pkg.Template.new(allocator, name);
+        errdefer inner.deinit();
 
         // Register internal escape filters
-        inner.funcs.put("_html_esc", Filters.htmlEscaper) catch unreachable;
-        inner.funcs.put("_attr_esc", Filters.attrEscaper) catch unreachable;
-        inner.funcs.put("_unquoted_attr_esc", Filters.unquotedAttrEscaper) catch unreachable;
-        inner.funcs.put("_url_esc", Filters.urlEscaper) catch unreachable;
-        inner.funcs.put("_js_esc", Filters.jsEscaper) catch unreachable;
-        inner.funcs.put("_css_esc", Filters.cssEscaper) catch unreachable;
-        inner.funcs.put("_comment_esc", Filters.commentEscaper) catch unreachable;
+        try inner.funcs.put("_html_esc", Filters.htmlEscaper);
+        try inner.funcs.put("_attr_esc", Filters.attrEscaper);
+        try inner.funcs.put("_unquoted_attr_esc", Filters.unquotedAttrEscaper);
+        try inner.funcs.put("_url_esc", Filters.urlEscaper);
+        try inner.funcs.put("_js_esc", Filters.jsEscaper);
+        try inner.funcs.put("_css_esc", Filters.cssEscaper);
+        try inner.funcs.put("_comment_esc", Filters.commentEscaper);
 
         tmpl.* = .{
             .allocator = allocator,
@@ -642,14 +664,22 @@ pub const Template = struct {
 
         // Escape root nodes
         var escaper = Escaper{};
-        const escaped_roots = try escapeNodes(self.inner.arena.allocator(), self.inner.root_nodes, &escaper);
+        const escaped_roots = try escapeNodes(
+            self.inner.arena.allocator(),
+            self.inner.root_nodes,
+            &escaper,
+        );
         self.inner.root_nodes = escaped_roots;
 
         // Also escape all registered sub-templates (defined via {{ define "..." }})
         var it = self.inner.templates.iterator();
         while (it.next()) |entry| {
             var sub_escaper = Escaper{};
-            const escaped_sub = try escapeNodes(self.inner.arena.allocator(), entry.value_ptr.*, &sub_escaper);
+            const escaped_sub = try escapeNodes(
+                self.inner.arena.allocator(),
+                entry.value_ptr.*,
+                &sub_escaper,
+            );
             entry.value_ptr.* = escaped_sub;
         }
 
@@ -677,7 +707,7 @@ test "html.template: basic HTML entity escaping" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "xss_test");
+    var tmpl = try Template.new(testing.allocator, "xss_test");
     defer tmpl.deinit();
 
     _ = try tmpl.parse("<div>Hello, {{ .Name }}!</div>");
@@ -689,7 +719,8 @@ test "html.template: basic HTML entity escaping" {
         .Name = "<script>alert('xss & pwned')</script>",
     });
 
-    const expected = "<div>Hello, &lt;script&gt;alert(&#39;xss &amp; pwned&#39;)&lt;/script&gt;!</div>";
+    const expected = "<div>Hello, &lt;script&gt;alert(" ++
+        "&#39;xss &amp; pwned&#39;)&lt;/script&gt;!</div>";
     try testing.expectEqualStrings(expected, buf.string());
 }
 
@@ -697,7 +728,7 @@ test "html.template: attribute context escaping" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "attr_test");
+    var tmpl = try Template.new(testing.allocator, "attr_test");
     defer tmpl.deinit();
 
     _ = try tmpl.parse("<input type=\"text\" value=\"{{ .Input }}\" title='{{ .Title }}'>");
@@ -710,7 +741,8 @@ test "html.template: attribute context escaping" {
         .Title = "bar' onmouseover='alert(2)",
     });
 
-    const expected = "<input type=\"text\" value=\"foo&#34; onfocus=&#34;alert(1)\" title='bar&#39; onmouseover=&#39;alert(2)'>";
+    const expected = "<input type=\"text\" value=\"foo&#34; onfocus=&#34;alert(1)\" " ++
+        "title='bar&#39; onmouseover=&#39;alert(2)'>";
     try testing.expectEqualStrings(expected, buf.string());
 }
 
@@ -718,7 +750,7 @@ test "html.template: URL context protocol sanitization" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "url_test");
+    var tmpl = try Template.new(testing.allocator, "url_test");
     defer tmpl.deinit();
 
     _ = try tmpl.parse("<a href=\"{{ .BadURL }}\">Bad</a> | <a href=\"{{ .GoodURL }}\">Good</a>");
@@ -731,7 +763,8 @@ test "html.template: URL context protocol sanitization" {
         .GoodURL = "https://example.com/search?q=zig lang",
     });
 
-    const expected = "<a href=\"#ZgotmplZ\">Bad</a> | <a href=\"https://example.com/search?q=zig%20lang\">Good</a>";
+    const expected = "<a href=\"#ZgotmplZ\">Bad</a> | " ++
+        "<a href=\"https://example.com/search?q=zig%20lang\">Good</a>";
     try testing.expectEqualStrings(expected, buf.string());
 }
 
@@ -739,7 +772,7 @@ test "html.template: script context JavaScript string escaping" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "js_test");
+    var tmpl = try Template.new(testing.allocator, "js_test");
     defer tmpl.deinit();
 
     _ = try tmpl.parse("<script>var msg = {{ .Msg }};</script>");
@@ -751,7 +784,8 @@ test "html.template: script context JavaScript string escaping" {
         .Msg = "Hello </script><script>alert('pwn')</script>",
     });
 
-    const expected = "<script>var msg = \"Hello \\x3c/script\\x3e<script\\x3ealert(\\'pwn\\')\\x3c/script\\x3e\";</script>";
+    const expected = "<script>var msg = \"Hello \\x3c/script\\x3e" ++
+        "<script\\x3ealert(\\'pwn\\')\\x3c/script\\x3e\";</script>";
     try testing.expectEqualStrings(expected, buf.string());
 }
 
@@ -759,10 +793,13 @@ test "html.template: safe types bypass escaping" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "safe_types_test");
+    var tmpl = try Template.new(testing.allocator, "safe_types_test");
     defer tmpl.deinit();
 
-    _ = try tmpl.parse("<div>{{ .TrustedHTML }}</div><script>var x = {{ .TrustedJS }};</script><a href=\"{{ .TrustedURL }}\">Link</a>");
+    const tmpl_src = "<div>{{ .TrustedHTML }}</div>" ++
+        "<script>var x = {{ .TrustedJS }};</script>" ++
+        "<a href=\"{{ .TrustedURL }}\">Link</a>";
+    _ = try tmpl.parse(tmpl_src);
 
     var buf = bytes.Buffer.init(testing.allocator);
     defer buf.deinit();
@@ -773,7 +810,9 @@ test "html.template: safe types bypass escaping" {
         .TrustedURL = URL{ .data = "javascript:void(0)" },
     });
 
-    const expected = "<div><b>Bold & Beautiful</b></div><script>var x = { count: 42, active: true };</script><a href=\"javascript:void(0)\">Link</a>";
+    const expected = "<div><b>Bold & Beautiful</b></div>" ++
+        "<script>var x = { count: 42, active: true };</script>" ++
+        "<a href=\"javascript:void(0)\">Link</a>";
     try testing.expectEqualStrings(expected, buf.string());
 }
 
@@ -792,7 +831,7 @@ test "html.template: sub-templates and composition with escaping" {
         \\</ul>
     ;
 
-    var tmpl = Template.new(testing.allocator, "list_tmpl");
+    var tmpl = try Template.new(testing.allocator, "list_tmpl");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(src);
@@ -821,7 +860,7 @@ test "html.template: unquoted attribute escaping and multi-attribute parsing" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "unquoted_test");
+    var tmpl = try Template.new(testing.allocator, "unquoted_test");
     defer tmpl.deinit();
 
     _ = try tmpl.parse("<div id={{ .ID }} disabled class=\"{{ .Class }}\"></div>");

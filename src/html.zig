@@ -89,7 +89,10 @@ pub fn unescapeString(allocator: Allocator, s: []const u8) ![]u8 {
                     if (hex_digits.len > 0 and hex_digits.len <= 8) {
                         if (std.fmt.parseInt(u32, hex_digits, 16)) |code_point| {
                             var utf8_buf: [4]u8 = undefined;
-                            const valid_cp: u21 = if (code_point <= 0x10FFFF) @intCast(code_point) else 0xFFFD;
+                            const valid_cp: u21 = if (code_point <= 0x10FFFF)
+                                @intCast(code_point)
+                            else
+                                0xFFFD;
                             const n = std.unicode.utf8Encode(valid_cp, &utf8_buf) catch 0;
                             if (n > 0) {
                                 try out.appendSlice(allocator, utf8_buf[0..n]);
@@ -106,7 +109,10 @@ pub fn unescapeString(allocator: Allocator, s: []const u8) ![]u8 {
                     if (dec_digits.len > 0 and dec_digits.len <= 10) {
                         if (std.fmt.parseInt(u32, dec_digits, 10)) |code_point| {
                             var utf8_buf: [4]u8 = undefined;
-                            const valid_cp: u21 = if (code_point <= 0x10FFFF) @intCast(code_point) else 0xFFFD;
+                            const valid_cp: u21 = if (code_point <= 0x10FFFF)
+                                @intCast(code_point)
+                            else
+                                0xFFFD;
                             const n = std.unicode.utf8Encode(valid_cp, &utf8_buf) catch 0;
                             if (n > 0) {
                                 try out.appendSlice(allocator, utf8_buf[0..n]);
@@ -152,7 +158,8 @@ test "html escapeString basic" {
     const escaped = try escapeString(allocator, raw);
     defer allocator.free(escaped);
 
-    try testing.expectEqualStrings("&lt;b&gt;Hello &amp; &#39;World&#39; &#34;123&#34;&lt;/b&gt;", escaped);
+    const expected = "&lt;b&gt;Hello &amp; &#39;World&#39; &#34;123&#34;&lt;/b&gt;";
+    try testing.expectEqualStrings(expected, escaped);
 }
 
 test "html unescapeString basic and numeric entities" {

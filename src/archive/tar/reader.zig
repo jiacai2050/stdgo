@@ -32,7 +32,11 @@ pub const Reader = struct {
         return &self.reader_inst;
     }
 
-    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *Reader = @alignCast(@fieldParentPtr("reader_inst", r));
         var total: usize = 0;
         var buf: [512]u8 = undefined;

@@ -174,9 +174,7 @@ pub const Weighted = struct {
 test "Weighted: tryAcquire and release" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var sem = Weighted.init(3);
 
     try testing.expect(sem.tryAcquire(io, 2));
@@ -192,9 +190,7 @@ test "Weighted: tryAcquire and release" {
 test "Weighted: acquire and deadline" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var sem = Weighted.init(2);
 
@@ -210,9 +206,7 @@ test "Weighted: acquire and deadline" {
 test "Weighted: cancel a waiting task" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var sem = Weighted.init(1);
     try sem.acquire(io, 1, .none);
 
@@ -230,16 +224,20 @@ test "Weighted: cancel a waiting task" {
 
 test "Weighted: queued waiters are served in FIFO order" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var sem = Weighted.init(3);
     try sem.acquire(io, 2, .none);
     var held: i64 = 2;
     defer if (held > 0) sem.release(io, held);
 
     const Worker = struct {
-        fn run(s: *Weighted, task_io: std.Io, weight: i64, acquired: *std.Io.Event, gate: *std.Io.Event) !void {
+        fn run(
+            s: *Weighted,
+            task_io: std.Io,
+            weight: i64,
+            acquired: *std.Io.Event,
+            gate: *std.Io.Event,
+        ) !void {
             try s.acquire(task_io, weight, .none);
             defer s.release(task_io, weight);
             acquired.set(task_io);
@@ -293,22 +291,30 @@ test "Weighted: queued waiters are served in FIFO order" {
 test "Weighted: concurrent worker rate limiting" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var sem = Weighted.init(2);
     var active_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
     var max_observed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
     const Worker = struct {
-        fn run(s: *Weighted, task_io: std.Io, active: *std.atomic.Value(usize), max_obs: *std.atomic.Value(usize)) void {
+        fn run(
+            s: *Weighted,
+            task_io: std.Io,
+            active: *std.atomic.Value(usize),
+            max_obs: *std.atomic.Value(usize),
+        ) void {
             for (0..10) |_| {
                 s.acquire(task_io, 1, .none) catch return;
                 const cur = active.fetchAdd(1, .monotonic) + 1;
 
                 var old_max = max_obs.load(.monotonic);
                 while (cur > old_max) {
-                    old_max = max_obs.cmpxchgWeak(old_max, cur, .monotonic, .monotonic) orelse break;
+                    old_max = max_obs.cmpxchgWeak(
+                        old_max,
+                        cur,
+                        .monotonic,
+                        .monotonic,
+                    ) orelse break;
                 }
 
                 var dummy: u64 = 0;

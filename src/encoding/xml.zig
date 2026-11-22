@@ -1,3 +1,7 @@
+fn isSpace(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
+}
+
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -200,7 +204,9 @@ pub const Decoder = struct {
                         return SyntaxError.MismatchedClosingTag;
                     }
                     const top = self.open_tags.pop().?;
-                    if (!mem.eql(u8, top.local, name.local) or !mem.eql(u8, top.space, name.space)) {
+                    if (!mem.eql(u8, top.local, name.local) or
+                        !mem.eql(u8, top.space, name.space))
+                    {
                         return SyntaxError.MismatchedClosingTag;
                     }
 
@@ -399,20 +405,20 @@ fn parseAttributes(arena: Allocator, raw: []const u8) ![]const Attr {
 
     while (i < s.len) {
         // Skip spaces
-        while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n')) : (i += 1) {}
+        while (i < s.len and isSpace(s[i])) : (i += 1) {}
         if (i >= s.len) break;
 
         // Read attr name
         const key_start = i;
-        while (i < s.len and s[i] != '=' and s[i] != ' ' and s[i] != '\t' and s[i] != '\r' and s[i] != '\n') : (i += 1) {}
+        while (i < s.len and s[i] != '=' and !isSpace(s[i])) : (i += 1) {}
         const key = s[key_start..i];
 
         // Skip spaces around '='
-        while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n')) : (i += 1) {}
+        while (i < s.len and isSpace(s[i])) : (i += 1) {}
         if (i >= s.len or s[i] != '=') return SyntaxError.InvalidAttribute;
         i += 1; // skip '='
 
-        while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n')) : (i += 1) {}
+        while (i < s.len and isSpace(s[i])) : (i += 1) {}
         if (i >= s.len) return SyntaxError.InvalidAttribute;
 
         const quote = s[i];
@@ -519,7 +525,8 @@ test "xml escape and unescape" {
     defer buf.deinit();
 
     try escapeText(buf.writer(), "Rock & Roll <5 > 2 'quotes' \"double\"");
-    try testing.expectEqualStrings("Rock &amp; Roll &lt;5 &gt; 2 &#39;quotes&#39; &#34;double&#34;", buf.string());
+    const expected = "Rock &amp; Roll &lt;5 &gt; 2 &#39;quotes&#39; &#34;double&#34;";
+    try testing.expectEqualStrings(expected, buf.string());
 
     const unescaped = try unescapeText(alloc, buf.string());
     defer alloc.free(unescaped);
@@ -593,7 +600,8 @@ test "xml decoder and encoder roundtrip" {
     try enc.encodeToken(Token{ .end_element = .{ .name = .{ .space = "ns", .local = "root" } } });
     try enc.flush();
 
-    try testing.expectEqualStrings("<ns:root version=\"1.0\">Hello &lt;World&gt; &amp; Friends</ns:root>", out_buf.string());
+    const expected = "<ns:root version=\"1.0\">Hello &lt;World&gt; &amp; Friends</ns:root>";
+    try testing.expectEqualStrings(expected, out_buf.string());
 }
 
 test "xml self-closing tag handling" {

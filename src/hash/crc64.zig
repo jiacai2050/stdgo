@@ -94,7 +94,11 @@ pub const Digest = struct {
         return &self.writer_inst;
     }
 
-    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drainImpl(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         _ = splat;
         const self: *Digest = @alignCast(@fieldParentPtr("writer_inst", w));
         var total: usize = 0;

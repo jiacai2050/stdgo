@@ -61,7 +61,8 @@ pub const Encoding = struct {
         };
     }
 
-    /// Returns the maximum length in bytes of the decoded data corresponding to n bytes of base32-encoded input.
+    /// Returns the maximum length in bytes of the decoded data corresponding to n bytes
+    /// of base32-encoded input.
     pub fn decodedLen(self: Encoding, n: usize) usize {
         if (self.pad_char != null) {
             return n / 8 * 5;

@@ -50,7 +50,10 @@ pub const VM = struct {
                 // Check if any thread is at match
                 for (cur_threads.items) |t| {
                     if (self.prog.insts.items[t.pc].op == .match) {
-                        if (best_match == null or (pos - t.start_pos > best_match.?.end - best_match.?.start)) {
+                        const len = pos - t.start_pos;
+                        const is_better = best_match == null or
+                            (len > best_match.?.end - best_match.?.start);
+                        if (is_better) {
                             best_match = .{ .start = t.start_pos, .end = pos };
                         }
                     }
@@ -86,7 +89,14 @@ pub const VM = struct {
                     }
 
                     if (matched) {
-                        try self.addThread(&next_threads, inst.out, pos + 1, text, visited, t.start_pos);
+                        try self.addThread(
+                            &next_threads,
+                            inst.out,
+                            pos + 1,
+                            text,
+                            visited,
+                            t.start_pos,
+                        );
                     }
                 }
 

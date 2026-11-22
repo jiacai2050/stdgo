@@ -57,7 +57,9 @@ pub const Encoding = struct {
         const n = (src.len / 3) * 3;
 
         while (si < n) : (si += 3) {
-            const val = (@as(u32, src[si]) << 16) | (@as(u32, src[si + 1]) << 8) | @as(u32, src[si + 2]);
+            const val = (@as(u32, src[si]) << 16) |
+                (@as(u32, src[si + 1]) << 8) |
+                @as(u32, src[si + 2]);
             dst[di + 0] = self.encode_table[(val >> 18) & 0x3F];
             dst[di + 1] = self.encode_table[(val >> 12) & 0x3F];
             dst[di + 2] = self.encode_table[(val >> 6) & 0x3F];
@@ -93,7 +95,11 @@ pub const Encoding = struct {
         }
     }
 
-    pub fn encodeToString(self: Encoding, allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
+    pub fn encodeToString(
+        self: Encoding,
+        allocator: Allocator,
+        src: []const u8,
+    ) Allocator.Error![]u8 {
         const out_len = self.encodedLen(src.len);
         const buf = try allocator.alloc(u8, out_len);
         self.encode(buf, src);
@@ -121,7 +127,10 @@ pub const Encoding = struct {
                 return Error.CorruptInput;
             }
 
-            const val = (@as(u32, d0) << 18) | (@as(u32, d1) << 12) | (@as(u32, d2) << 6) | @as(u32, d3);
+            const val = (@as(u32, d0) << 18) |
+                (@as(u32, d1) << 12) |
+                (@as(u32, d2) << 6) |
+                @as(u32, d3);
             if (di + 3 > dst.len) return Error.ShortBuffer;
             dst[di + 0] = @intCast((val >> 16) & 0xFF);
             dst[di + 1] = @intCast((val >> 8) & 0xFF);
@@ -155,7 +164,11 @@ pub const Encoding = struct {
         return di;
     }
 
-    pub fn decodeString(self: Encoding, allocator: Allocator, src: []const u8) (Allocator.Error || Error)![]u8 {
+    pub fn decodeString(
+        self: Encoding,
+        allocator: Allocator,
+        src: []const u8,
+    ) (Allocator.Error || Error)![]u8 {
         const max_len = self.decodedLen(src.len);
         const buf = try allocator.alloc(u8, max_len);
         errdefer allocator.free(buf);

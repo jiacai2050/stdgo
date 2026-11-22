@@ -118,8 +118,8 @@ pub const Row = struct {
     /// ScanStruct copies the matched row's columns directly into a strongly-typed struct.
     /// If more than one row matches the query, ScanStruct uses the first row and discards the rest.
     /// If no rows match the query, ScanStruct returns error.ErrNoRows.
-    /// Note: Any string/bytes in the returned struct point into driver memory while the row is open;
-    /// use `defer row.close()` to release the connection after using the scanned values.
+    /// Note: Any string/bytes in the returned struct point into driver memory
+    /// while the row is open; use `defer row.close()` to release after use.
     pub fn scanStruct(self: *Row, comptime T: type, deadline: Deadline) !T {
         const field_count = comptime @typeInfo(T).@"struct".field_names.len;
         var dest: [field_count]Value = undefined;
@@ -167,7 +167,12 @@ pub const PooledConn = struct {
     }
 
     /// Exec executes a query on this specific connection.
-    pub fn exec(self: *PooledConn, query_str: []const u8, args: []const Value, deadline: Deadline) !Result {
+    pub fn exec(
+        self: *PooledConn,
+        query_str: []const u8,
+        args: []const Value,
+        deadline: Deadline,
+    ) !Result {
         const io = self.db.io;
         try self.db.checkOperation(deadline);
         var stmt = try self.raw.prepare(io, query_str, deadline);
@@ -177,7 +182,12 @@ pub const PooledConn = struct {
     }
 
     /// Query executes a query returning rows on this connection.
-    pub fn query(self: *PooledConn, query_str: []const u8, args: []const Value, deadline: Deadline) !Rows {
+    pub fn query(
+        self: *PooledConn,
+        query_str: []const u8,
+        args: []const Value,
+        deadline: Deadline,
+    ) !Rows {
         const io = self.db.io;
         try self.db.checkOperation(deadline);
         var stmt = try self.raw.prepare(io, query_str, deadline);
@@ -193,7 +203,12 @@ pub const PooledConn = struct {
     }
 
     /// QueryRow executes a query that is expected to return at most one row.
-    pub fn queryRow(self: *PooledConn, query_str: []const u8, args: []const Value, deadline: Deadline) Row {
+    pub fn queryRow(
+        self: *PooledConn,
+        query_str: []const u8,
+        args: []const Value,
+        deadline: Deadline,
+    ) Row {
         const r = self.query(query_str, args, deadline) catch |err| {
             return Row{ .err_state = err };
         };
@@ -368,7 +383,8 @@ pub const DB = struct {
         };
     }
 
-    /// Ping verifies a connection to the database is still alive, establishing a connection if necessary.
+    /// Ping verifies a connection to the database is still alive, establishing a
+    /// connection if necessary.
     pub fn ping(self: *DB, deadline: Deadline) !void {
         const pc = try self.conn(deadline);
         defer pc.release();
@@ -420,7 +436,8 @@ pub const DB = struct {
             // 2. Open a new connection if under max_open_conns
             if (self.max_open_conns == 0 or self.num_open < self.max_open_conns) {
                 self.num_open += 1;
-                // Temporarily release mutex while opening connection to avoid blocking other threads
+                // Temporarily release mutex while opening connection to avoid
+                // blocking other threads.
                 self.mutex.unlock(self.io);
                 var raw_conn = self.driver_instance.open(self.io, self.dsn, deadline) catch |err| {
                     self.mutex.lockUncancelable(self.io);
@@ -466,7 +483,11 @@ pub const DB = struct {
             // 3. Wait until capacity changes or the task is canceled.
             self.wait_count += 1;
             const wait_started = std.Io.Clock.awake.now(self.io).nanoseconds;
-            const wait_result = self.pool_changed.waitTimeout(self.io, &self.mutex, deadline.timeout());
+            const wait_result = self.pool_changed.waitTimeout(
+                self.io,
+                &self.mutex,
+                deadline.timeout(),
+            );
             const waited = std.Io.Clock.awake.now(self.io).nanoseconds - wait_started;
             if (waited > 0) {
                 self.wait_duration_ns +|= std.math.cast(u64, waited) orelse std.math.maxInt(u64);
@@ -556,8 +577,8 @@ pub const DB = struct {
         self.decrementRef();
     }
 
-    /// Exec executes a query without returning any rows.
-    /// If an idle connection from the pool fails with ErrBadConn, it retries once with a fresh connection.
+    /// Exec executes a query without returning any rows. If an idle connection
+    /// from the pool fails with ErrBadConn, it retries once with a fresh connection.
     pub fn exec(self: *DB, query_str: []const u8, args: []const Value, deadline: Deadline) !Result {
         try self.checkOperation(deadline);
         var retry: usize = 0;
@@ -576,8 +597,8 @@ pub const DB = struct {
         }
     }
 
-    /// Query executes a query that returns rows, typically a SELECT.
-    /// If an idle connection from the pool fails with ErrBadConn, it retries once with a fresh connection.
+    /// Query executes a query that returns rows, typically a SELECT. If an idle
+    /// connection from the pool fails with ErrBadConn, it retries once with fresh conn.
     pub fn query(self: *DB, query_str: []const u8, args: []const Value, deadline: Deadline) !Rows {
         try self.checkOperation(deadline);
         var retry: usize = 0;
@@ -604,7 +625,7 @@ pub const DB = struct {
         return Row{ .rows = r };
     }
 
-    /// InterruptAll signals all currently active/in-flight queries across the pool to abort out-of-band.
+    /// InterruptAll signals all active/in-flight queries across the pool to abort out-of-band.
     /// Returns the number of connections that were successfully signaled.
     pub fn interruptAll(self: *DB) usize {
         self.mutex.lockUncancelable(self.io);
@@ -1056,7 +1077,12 @@ pub const MockDriver = struct {
         };
     }
 
-    fn open(ctx: *anyopaque, io: std.Io, _: []const u8, deadline: Deadline) anyerror!driver_pkg.Conn {
+    fn open(
+        ctx: *anyopaque,
+        io: std.Io,
+        _: []const u8,
+        deadline: Deadline,
+    ) anyerror!driver_pkg.Conn {
         try driver_pkg.checkOperation(io, deadline);
         const self: *MockDriver = @ptrCast(@alignCast(ctx));
         {
@@ -1088,7 +1114,12 @@ pub const MockDriver = struct {
         driver: *MockDriver,
         state: *State,
 
-        fn prepare(ctx: *anyopaque, io: std.Io, query_str: []const u8, deadline: Deadline) anyerror!driver_pkg.Stmt {
+        fn prepare(
+            ctx: *anyopaque,
+            io: std.Io,
+            query_str: []const u8,
+            deadline: Deadline,
+        ) anyerror!driver_pkg.Stmt {
             try driver_pkg.checkOperation(io, deadline);
             const self: *MockConn = @ptrCast(@alignCast(ctx));
             {
@@ -1133,7 +1164,12 @@ pub const MockDriver = struct {
             return beginTx(ctx, io, .{}, deadline);
         }
 
-        fn beginTx(ctx: *anyopaque, io: std.Io, opts: driver_pkg.TxOptions, deadline: Deadline) anyerror!driver_pkg.Tx {
+        fn beginTx(
+            ctx: *anyopaque,
+            io: std.Io,
+            opts: driver_pkg.TxOptions,
+            deadline: Deadline,
+        ) anyerror!driver_pkg.Tx {
             try driver_pkg.checkOperation(io, deadline);
             const self: *MockConn = @ptrCast(@alignCast(ctx));
             {
@@ -1184,7 +1220,12 @@ pub const MockDriver = struct {
             };
         }
 
-        fn query(ctx: *anyopaque, io: std.Io, _: []const Value, deadline: Deadline) anyerror!driver_pkg.Rows {
+        fn query(
+            ctx: *anyopaque,
+            io: std.Io,
+            _: []const Value,
+            deadline: Deadline,
+        ) anyerror!driver_pkg.Rows {
             try driver_pkg.checkOperation(io, deadline);
             const self: *MockStmt = @ptrCast(@alignCast(ctx));
             const rows_ctx = try self.conn.state.allocator.create(MockRows);
@@ -1281,9 +1322,7 @@ pub const MockDriver = struct {
 test "database.sql: basic open, ping, exec, query and close" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1299,7 +1338,8 @@ test "database.sql: basic open, ping, exec, query and close" {
     try testing.expectEqual(@as(usize, 1), s.idle);
 
     // 2. Exec
-    const res = try db.exec("INSERT INTO users (name) VALUES (?)", &.{Value{ .string = "charlie" }}, .none);
+    const ins_query = "INSERT INTO users (name) VALUES (?)";
+    const res = try db.exec(ins_query, &.{Value{ .string = "charlie" }}, .none);
     try testing.expectEqual(@as(i64, 1001), try res.lastInsertId());
     try testing.expectEqual(@as(i64, 1), try res.rowsAffected());
 
@@ -1329,9 +1369,7 @@ test "database.sql: basic open, ping, exec, query and close" {
 test "database.sql: transaction commit and rollback" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1363,9 +1401,7 @@ test "database.sql: transaction commit and rollback" {
 test "database.sql: max open and idle connections pool limit" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1403,9 +1439,7 @@ test "database.sql: max open and idle connections pool limit" {
 test "database.sql: concurrent connection pool contention" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1451,9 +1485,7 @@ test "database.sql: concurrent connection pool contention" {
 
 test "database.sql: blocked pool waiter is cancelable and release wakes another waiter" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
     var mock = MockDriver{ .state = &state };
@@ -1505,9 +1537,7 @@ test "database.sql: blocked pool waiter is cancelable and release wakes another 
 
 test "database.sql: close wakes blocked pool waiter" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
     var mock = MockDriver{ .state = &state };
@@ -1541,9 +1571,7 @@ test "database.sql: close wakes blocked pool waiter" {
 
 test "database.sql: failed connection open wakes a pool waiter" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
     var mock = MockDriver{ .state = &state };
@@ -1553,7 +1581,12 @@ test "database.sql: failed connection open wakes a pool waiter" {
         gate: std.Io.Event = .unset,
         attempts: std.atomic.Value(usize) = .init(0),
 
-        fn open(ptr: *anyopaque, task_io: std.Io, dsn: []const u8, deadline: Deadline) anyerror!driver.Conn {
+        fn open(
+            ptr: *anyopaque,
+            task_io: std.Io,
+            dsn: []const u8,
+            deadline: Deadline,
+        ) anyerror!driver.Conn {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.attempts.fetchAdd(1, .acq_rel) == 0) {
                 self.started.set(task_io);
@@ -1604,9 +1637,7 @@ test "database.sql: failed connection open wakes a pool waiter" {
 test "database.sql: interrupt and unsupported deadline" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1636,7 +1667,8 @@ test "database.sql: interrupt and unsupported deadline" {
         try testing.expectEqual(@as(usize, 3), state.interrupt_count);
     }
 
-    // 3. In compatibility mode, valid deadlines are accepted, expired/invalid deadlines fail properly.
+    // 3. In compatibility mode, valid deadlines are accepted, expired/invalid
+    // deadlines fail properly.
     {
         const deadline = @import("../io/deadline.zig").Deadline.after(io, .fromSeconds(1));
         const invalid: Deadline = .{ .timestamp = .now(io, .real) };
@@ -1653,9 +1685,7 @@ test "database.sql: interrupt and unsupported deadline" {
 test "database.sql: QueryRow and ErrNoRows" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1685,9 +1715,7 @@ test "database.sql: QueryRow and ErrNoRows" {
 test "database.sql: beginTx options and deadline" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1724,9 +1752,7 @@ test "database.sql: beginTx options and deadline" {
 test "database.sql: ErrBadConn retry on idle connection" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1742,7 +1768,8 @@ test "database.sql: ErrBadConn retry on idle connection" {
     // Set mock to fail the idle connection on its next use with ErrBadConn
     state.fail_with_bad_conn_count = 1;
 
-    // db.exec should catch ErrBadConn on the idle connection, discard it, and retry on a fresh connection
+    // db.exec should catch ErrBadConn on the idle connection, discard it,
+    // and retry on a fresh connection
     const res = try db.exec("SELECT 2", &.{}, .none);
     try testing.expectEqual(@as(i64, 1), res.rows_affected);
 
@@ -1753,9 +1780,7 @@ test "database.sql: ErrBadConn retry on idle connection" {
 test "database.sql: Rows.next reports task cancellation" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1770,7 +1795,13 @@ test "database.sql: Rows.next reports task cancellation" {
     var ready: std.Io.Event = .unset;
     var gate: std.Io.Event = .unset;
     const Worker = struct {
-        fn run(task_io: std.Io, r: *Rows, values: []Value, entered: *std.Io.Event, wait_gate: *std.Io.Event) !bool {
+        fn run(
+            task_io: std.Io,
+            r: *Rows,
+            values: []Value,
+            entered: *std.Io.Event,
+            wait_gate: *std.Io.Event,
+        ) !bool {
             entered.set(task_io);
             wait_gate.wait(task_io) catch |err| switch (err) {
                 error.Canceled => task_io.recancel(),
@@ -1785,9 +1816,7 @@ test "database.sql: Rows.next reports task cancellation" {
 }
 
 test "database.sql: Rows.next returns driver iteration errors" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     const Fake = struct {
         fn columnCount(_: *anyopaque) usize {
             return 0;
@@ -1839,9 +1868,7 @@ test "database.sql: Rows.next returns driver iteration errors" {
 test "database.sql: Rows.close called AFTER DB.close is safe without UAF" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1862,9 +1889,7 @@ test "database.sql: Rows.close called AFTER DB.close is safe without UAF" {
 test "database.sql: transaction rows reject unsupported deadline" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1891,9 +1916,7 @@ test "database.sql: transaction rows reject unsupported deadline" {
 test "database.sql: DB.prepare and Stmt execution on mock driver" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -1954,9 +1977,7 @@ test "database.sql: DB.prepare and Stmt execution on mock driver" {
 test "database.sql: Tx.prepare statements are closed and invalidated on commit and rollback" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();
@@ -2019,9 +2040,7 @@ test "database.sql: Tx.prepare statements are closed and invalidated on commit a
 test "database.sql: Rows.columnTypes metadata" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var state = MockDriver.State.init(testing.allocator);
     defer state.deinit();

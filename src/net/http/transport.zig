@@ -27,11 +27,19 @@ pub const RoundTripper = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        roundTrip: *const fn (ctx: *anyopaque, req: *Request, deadline: deadline_mod.Deadline) anyerror!Response,
+        roundTrip: *const fn (
+            ctx: *anyopaque,
+            req: *Request,
+            deadline: deadline_mod.Deadline,
+        ) anyerror!Response,
         closeIdleConnections: ?*const fn (ctx: *anyopaque) void = null,
     };
 
-    pub fn roundTrip(self: RoundTripper, req: *Request, deadline: deadline_mod.Deadline) anyerror!Response {
+    pub fn roundTrip(
+        self: RoundTripper,
+        req: *Request,
+        deadline: deadline_mod.Deadline,
+    ) anyerror!Response {
         return self.vtable.roundTrip(self.ptr, req, deadline);
     }
 
@@ -50,7 +58,8 @@ pub const TransportOptions = struct {
     /// Custom environment lookup function. If set, takes precedence over environ_map.
     env_lookup: ?*const fn (key: []const u8) ?[]const u8 = null,
     /// Total round-trip and body-read budget.
-    /// Note: On Windows (Zig 0.17.0), socket deadline cancellation may encounter an upstream panic in std.Io.Threaded.
+    /// Note: On Windows (Zig 0.17.0), socket deadline cancellation may encounter
+    /// an upstream panic in std.Io.Threaded.
     timeout_ns: ?u64 = null,
     timeout: ?time_mod.Duration = null,
     tls_handshake_timeout: ?time_mod.Duration = null,
@@ -122,7 +131,11 @@ pub const Transport = struct {
         .closeIdleConnections = vtableCloseIdleConnections,
     };
 
-    fn vtableRoundTrip(ctx: *anyopaque, req: *Request, deadline: deadline_mod.Deadline) anyerror!Response {
+    fn vtableRoundTrip(
+        ctx: *anyopaque,
+        req: *Request,
+        deadline: deadline_mod.Deadline,
+    ) anyerror!Response {
         const self: *Transport = @ptrCast(@alignCast(ctx));
         return self.roundTrip(req, deadline);
     }
@@ -132,7 +145,12 @@ pub const Transport = struct {
         self.closeIdleConnections();
     }
 
-    fn connectStream(io: std.Io, host: []const u8, port: u16, deadline: deadline_mod.Deadline) !std.Io.net.Stream {
+    fn connectStream(
+        io: std.Io,
+        host: []const u8,
+        port: u16,
+        deadline: deadline_mod.Deadline,
+    ) !std.Io.net.Stream {
         return connect_mod.connectOrdered(io, host, port, deadline);
     }
 
@@ -162,12 +180,20 @@ pub const Transport = struct {
         const value = req.header.get("Expect") orelse return false;
         var tokens = std.mem.splitScalar(u8, value, ',');
         while (tokens.next()) |token| {
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "100-continue")) return true;
+            const trimmed = std.mem.trim(u8, token, " \t");
+            if (std.ascii.eqlIgnoreCase(trimmed, "100-continue")) return true;
         }
         return false;
     }
 
-    fn establishConnectTunnel(io: std.Io, stream: std.Io.net.Stream, host: []const u8, port: u16, auth: ?[]const u8, deadline: deadline_mod.Deadline) !void {
+    fn establishConnectTunnel(
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        host: []const u8,
+        port: u16,
+        auth: ?[]const u8,
+        deadline: deadline_mod.Deadline,
+    ) !void {
         var write_buf: [512]u8 = undefined;
         var stream_w: io_util.SocketWriter = .init(io, stream, &write_buf, deadline);
         const w = &stream_w.interface;
@@ -176,13 +202,16 @@ pub const Transport = struct {
         const req_str = if (auth) |a|
             try std.fmt.bufPrint(
                 &req_buf,
-                "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\nUser-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\nProxy-Authorization: {s}\r\n\r\n",
+                "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
+                    "User-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n" ++
+                    "Proxy-Authorization: {s}\r\n\r\n",
                 .{ host, port, host, port, a },
             )
         else
             try std.fmt.bufPrint(
                 &req_buf,
-                "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\nUser-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+                "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
+                    "User-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n\r\n",
                 .{ host, port, host, port },
             );
         w.writeAll(req_str) catch |err| return stream_w.err orelse err;
@@ -218,9 +247,16 @@ pub const Transport = struct {
         return self.roundTripWithBudget(req, deadline);
     }
 
-    pub fn roundTripWithBudget(self: *Transport, req: *Request, client_deadline: deadline_mod.Deadline) !Response {
+    pub fn roundTripWithBudget(
+        self: *Transport,
+        req: *Request,
+        client_deadline: deadline_mod.Deadline,
+    ) !Response {
         try client_deadline.validate();
-        const deadline = io_util.earlier(client_deadline, io_util.fromTimeout(self.io, self.options.timeout_ns));
+        const deadline = io_util.earlier(
+            client_deadline,
+            io_util.fromTimeout(self.io, self.options.timeout_ns),
+        );
         try deadline.check(self.io);
         try self.io.checkCancel();
         try self.pool.start(self.io);
@@ -233,17 +269,34 @@ pub const Transport = struct {
         var effective_proxy_url: ?[]const u8 = self.options.proxy_url;
         if (effective_proxy_url == null and self.options.proxy_from_env) {
             if (self.options.env_lookup) |lookup| {
-                if (try proxy_mod.proxyFromEnvWithLookup(self.allocator, target.scheme, target.host, lookup)) |p| {
+                const env_res = try proxy_mod.proxyFromEnvWithLookup(
+                    self.allocator,
+                    target.scheme,
+                    target.host,
+                    lookup,
+                );
+                if (env_res) |p| {
                     resolved_proxy_to_free = p;
                     effective_proxy_url = p;
                 }
             } else if (self.options.environ_map) |env_map| {
-                if (try proxy_mod.proxyFromEnvWithMap(self.allocator, target.scheme, target.host, env_map)) |p| {
+                const map_res = try proxy_mod.proxyFromEnvWithMap(
+                    self.allocator,
+                    target.scheme,
+                    target.host,
+                    env_map,
+                );
+                if (map_res) |p| {
                     resolved_proxy_to_free = p;
                     effective_proxy_url = p;
                 }
             } else {
-                if (try proxy_mod.proxyFromEnvironment(self.allocator, target.scheme, target.host)) |p| {
+                const sys_res = try proxy_mod.proxyFromEnvironment(
+                    self.allocator,
+                    target.scheme,
+                    target.host,
+                );
+                if (sys_res) |p| {
                     resolved_proxy_to_free = p;
                     effective_proxy_url = p;
                 }
@@ -274,21 +327,39 @@ pub const Transport = struct {
 
         var allow_pool = true;
         while (true) {
-            const pooled = if (!use_proxy and allow_pool) self.pool.acquire(target.host, target.port, target.is_tls) else null;
+            const pooled = if (!use_proxy and allow_pool)
+                self.pool.acquire(target.host, target.port, target.is_tls)
+            else
+                null;
             var conn: *HttpConn = if (pooled) |c|
                 c
             else blk: {
                 if (proxy_connect_url) |proxy_url| {
                     const proxy_target = try parseUrlTarget(proxy_url);
-                    var stream = try connectStream(self.io, proxy_target.host, proxy_target.port, deadline);
+                    var stream = try connectStream(
+                        self.io,
+                        proxy_target.host,
+                        proxy_target.port,
+                        deadline,
+                    );
                     errdefer stream.close(self.io);
                     try deadline.check(self.io);
 
                     if (is_socks_proxy) {
                         var read_buf: [512]u8 = undefined;
                         var write_buf: [512]u8 = undefined;
-                        var reader: io_util.SocketReader = .init(self.io, stream, &read_buf, deadline);
-                        var writer: io_util.SocketWriter = .init(self.io, stream, &write_buf, deadline);
+                        var reader: io_util.SocketReader = .init(
+                            self.io,
+                            stream,
+                            &read_buf,
+                            deadline,
+                        );
+                        var writer: io_util.SocketWriter = .init(
+                            self.io,
+                            stream,
+                            &write_buf,
+                            deadline,
+                        );
                         socks5.establishWithReaderWriter(
                             &reader.interface,
                             &writer.interface,
@@ -304,7 +375,11 @@ pub const Transport = struct {
                             return err;
                         };
                         if (target.is_tls) {
-                            const tls_deadline = deadline.earlier(durationDeadline(self.io, self.options.tls_handshake_timeout));
+                            const tls_limit = durationDeadline(
+                                self.io,
+                                self.options.tls_handshake_timeout,
+                            );
+                            const tls_deadline = deadline.earlier(tls_limit);
                             break :blk try HttpConn.initTls(
                                 self.allocator,
                                 self.io,
@@ -315,11 +390,27 @@ pub const Transport = struct {
                                 tls_deadline,
                             );
                         } else {
-                            break :blk try HttpConn.initPlain(self.allocator, self.io, stream, deadline);
+                            break :blk try HttpConn.initPlain(
+                                self.allocator,
+                                self.io,
+                                stream,
+                                deadline,
+                            );
                         }
                     } else if (target.is_tls) {
-                        try establishConnectTunnel(self.io, stream, target.host, target.port, proxy_auth_header, deadline);
-                        const tls_deadline = deadline.earlier(durationDeadline(self.io, self.options.tls_handshake_timeout));
+                        try establishConnectTunnel(
+                            self.io,
+                            stream,
+                            target.host,
+                            target.port,
+                            proxy_auth_header,
+                            deadline,
+                        );
+                        const tls_limit = durationDeadline(
+                            self.io,
+                            self.options.tls_handshake_timeout,
+                        );
+                        const tls_deadline = deadline.earlier(tls_limit);
                         break :blk try HttpConn.initTls(
                             self.allocator,
                             self.io,
@@ -330,7 +421,12 @@ pub const Transport = struct {
                             tls_deadline,
                         );
                     } else {
-                        break :blk try HttpConn.initPlain(self.allocator, self.io, stream, deadline);
+                        break :blk try HttpConn.initPlain(
+                            self.allocator,
+                            self.io,
+                            stream,
+                            deadline,
+                        );
                     }
                 } else {
                     var stream = try connectStream(self.io, target.host, target.port, deadline);
@@ -338,7 +434,11 @@ pub const Transport = struct {
                     try deadline.check(self.io);
 
                     if (target.is_tls) {
-                        const tls_deadline = deadline.earlier(durationDeadline(self.io, self.options.tls_handshake_timeout));
+                        const tls_limit = durationDeadline(
+                            self.io,
+                            self.options.tls_handshake_timeout,
+                        );
+                        const tls_deadline = deadline.earlier(tls_limit);
                         break :blk try HttpConn.initTls(
                             self.allocator,
                             self.io,
@@ -349,7 +449,12 @@ pub const Transport = struct {
                             tls_deadline,
                         );
                     } else {
-                        break :blk try HttpConn.initPlain(self.allocator, self.io, stream, deadline);
+                        break :blk try HttpConn.initPlain(
+                            self.allocator,
+                            self.io,
+                            stream,
+                            deadline,
+                        );
                     }
                 }
             };
@@ -368,7 +473,9 @@ pub const Transport = struct {
             try req_buf.append(self.allocator, ' ');
             if (use_proxy and !target.is_tls and !is_socks_proxy) {
                 // Forward proxy plain HTTP request uses absolute URI
-                if (std.mem.startsWith(u8, req.url, "http://") or std.mem.startsWith(u8, req.url, "https://")) {
+                const is_abs = std.mem.startsWith(u8, req.url, "http://") or
+                    std.mem.startsWith(u8, req.url, "https://");
+                if (is_abs) {
                     try req_buf.appendSlice(self.allocator, req.url);
                 } else {
                     try req_buf.appendSlice(self.allocator, "http://");
@@ -385,7 +492,8 @@ pub const Transport = struct {
             if (req.header.get("Host") == null) {
                 try req_buf.appendSlice(self.allocator, "Host: ");
                 try req_buf.appendSlice(self.allocator, target.host);
-                const is_default_port = (!target.is_tls and target.port == 80) or (target.is_tls and target.port == 443);
+                const is_default_port = (!target.is_tls and target.port == 80) or
+                    (target.is_tls and target.port == 443);
                 if (!is_default_port) {
                     var port_buf: [8]u8 = undefined;
                     const port_str = try std.fmt.bufPrint(&port_buf, ":{d}", .{target.port});
@@ -425,16 +533,28 @@ pub const Transport = struct {
             }
 
             if (req.body) |b| {
-                if (req.header.get("Content-Length") == null and req.header.get("Transfer-Encoding") == null) {
+                const has_len = req.header.get("Content-Length") != null or
+                    req.header.get("Transfer-Encoding") != null;
+                if (!has_len) {
                     var cl_buf: [32]u8 = undefined;
-                    const cl_str = try std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{b.len});
+                    const cl_str = try std.fmt.bufPrint(
+                        &cl_buf,
+                        "Content-Length: {d}\r\n",
+                        .{b.len},
+                    );
                     try req_buf.appendSlice(self.allocator, cl_str);
                 }
             } else if (req.body_reader != null) {
                 if (req.content_length) |len| {
-                    if (req.header.get("Content-Length") == null and req.header.get("Transfer-Encoding") == null) {
+                    const has_len = req.header.get("Content-Length") != null or
+                        req.header.get("Transfer-Encoding") != null;
+                    if (!has_len) {
                         var cl_buf: [32]u8 = undefined;
-                        const cl_str = try std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{len});
+                        const cl_str = try std.fmt.bufPrint(
+                            &cl_buf,
+                            "Content-Length: {d}\r\n",
+                            .{len},
+                        );
                         try req_buf.appendSlice(self.allocator, cl_str);
                     }
                 } else {
@@ -454,7 +574,8 @@ pub const Transport = struct {
 
             const write_res = conn.writeAll(req_buf.items);
             if (write_res) |_| {} else |err| {
-                if (pooled != null and req.body_reader == null and err != error.Timeout and err != error.Canceled) {
+                const retryable_err = err != error.Timeout and err != error.Canceled;
+                if (pooled != null and req.body_reader == null and retryable_err) {
                     conn.close(self.io);
                     self.allocator.destroy(conn);
                     allow_pool = false;
@@ -467,9 +588,12 @@ pub const Transport = struct {
             var informational_count: usize = 0;
             var continue_retry = false;
             const has_body = if (req.body) |body| body.len != 0 else req.body_reader != null;
-            const continue_deadline = durationDeadline(self.io, self.options.expect_continue_timeout);
-            if (has_body and expectsContinue(req) and !continue_deadline.isNone()) {
-                conn.setDeadline(deadline.earlier(continue_deadline));
+            const continue_limit = durationDeadline(
+                self.io,
+                self.options.expect_continue_timeout,
+            );
+            if (has_body and expectsContinue(req) and !continue_limit.isNone()) {
+                conn.setDeadline(deadline.earlier(continue_limit));
                 while (true) {
                     const raw = self.readResponseHeader(conn) catch |err| switch (err) {
                         error.Timeout => {
@@ -496,7 +620,10 @@ pub const Transport = struct {
                         self.allocator.free(raw);
                         break;
                     }
-                    if (interim.status_code >= 100 and interim.status_code < 200 and interim.status_code != 101) {
+                    const is_informational = interim.status_code >= 100 and
+                        interim.status_code < 200 and
+                        interim.status_code != 101;
+                    if (is_informational) {
                         informational_count += 1;
                         if (informational_count > 100) {
                             self.allocator.free(raw);
@@ -522,7 +649,8 @@ pub const Transport = struct {
             if (early_header == null) if (req.body) |b| {
                 const body_res = conn.writeAll(b);
                 if (body_res) |_| {} else |err| {
-                    if (pooled != null and req.body_reader == null and err != error.Timeout and err != error.Canceled) {
+                    const retryable_err = err != error.Timeout and err != error.Canceled;
+                    if (pooled != null and req.body_reader == null and retryable_err) {
                         conn.close(self.io);
                         self.allocator.destroy(conn);
                         allow_pool = false;
@@ -557,12 +685,14 @@ pub const Transport = struct {
             };
 
             if (early_header == null) {
-                conn.setDeadline(deadline.earlier(durationDeadline(self.io, self.options.response_header_timeout)));
+                const hdr_limit = durationDeadline(self.io, self.options.response_header_timeout);
+                conn.setDeadline(deadline.earlier(hdr_limit));
             }
             var header_retry = false;
             var raw_head: []u8 = undefined;
             while (true) {
-                raw_head = early_header orelse self.readResponseHeader(conn) catch |err| switch (err) {
+                const head_res = early_header orelse self.readResponseHeader(conn);
+                raw_head = head_res catch |err| switch (err) {
                     error.EmptyResponse => {
                         if (pooled != null and req.body_reader == null) {
                             header_retry = true;
@@ -579,7 +709,10 @@ pub const Transport = struct {
                 };
                 var headers = interim.headers;
                 headers.deinit();
-                if (interim.status_code >= 100 and interim.status_code < 200 and interim.status_code != 101) {
+                const is_informational = interim.status_code >= 100 and
+                    interim.status_code < 200 and
+                    interim.status_code != 101;
+                if (is_informational) {
                     informational_count += 1;
                     if (informational_count > 100) {
                         self.allocator.free(raw_head);
@@ -613,7 +746,9 @@ pub const Transport = struct {
                     mode = .chunked;
                 }
             } else if (head.headers.get("Content-Length")) |cl| {
-                content_length = std.fmt.parseInt(u64, cl, 10) catch return error.InvalidContentLength;
+                content_length = std.fmt.parseInt(u64, cl, 10) catch {
+                    return error.InvalidContentLength;
+                };
                 mode = .fixed;
             }
 

@@ -19,7 +19,8 @@ pub fn getpid() i32 {
     } else if (builtin.link_libc) {
         return @intCast(std.c.getpid());
     } else {
-        @compileError("stdgo.os.getpid: platform '" ++ @tagName(builtin.os.tag) ++ "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
+        @compileError("stdgo.os.getpid: platform '" ++ @tagName(builtin.os.tag) ++
+            "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
     }
 }
 
@@ -32,7 +33,8 @@ pub fn getppid() i32 {
     } else if (builtin.link_libc) {
         return @intCast(std.c.getppid());
     } else {
-        @compileError("stdgo.os.getppid: platform '" ++ @tagName(builtin.os.tag) ++ "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
+        @compileError("stdgo.os.getppid: platform '" ++ @tagName(builtin.os.tag) ++
+            "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
     }
 }
 
@@ -63,7 +65,8 @@ pub fn hostname(allocator: Allocator, env: ?*const EnvironMap) ![]u8 {
         const h = try std.posix.gethostname(&buf);
         return try allocator.dupe(u8, h);
     } else {
-        @compileError("stdgo.os.hostname: platform '" ++ @tagName(builtin.os.tag) ++ "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
+        @compileError("stdgo.os.hostname: platform '" ++ @tagName(builtin.os.tag) ++
+            "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
     }
 }
 

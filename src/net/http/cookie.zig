@@ -72,7 +72,9 @@ pub const CookieIterator = struct {
 
     pub fn next(self: *CookieIterator) ?Cookie {
         while (self.index < self.raw.len) {
-            while (self.index < self.raw.len and (self.raw[self.index] == ' ' or self.raw[self.index] == ';')) {
+            while (self.index < self.raw.len and
+                (self.raw[self.index] == ' ' or self.raw[self.index] == ';'))
+            {
                 self.index += 1;
             }
             if (self.index >= self.raw.len) return null;
@@ -109,7 +111,10 @@ pub fn parseSetCookie(raw_header: []const u8) ?Cookie {
         .value = std.mem.trim(u8, first[eq_idx + 1 ..], " \t"),
         .raw = raw_header,
     };
-    if (cookie.value.len >= 2 and cookie.value[0] == '"' and cookie.value[cookie.value.len - 1] == '"') {
+    if (cookie.value.len >= 2 and
+        cookie.value[0] == '"' and
+        cookie.value[cookie.value.len - 1] == '"')
+    {
         cookie.value = cookie.value[1 .. cookie.value.len - 1];
     }
 

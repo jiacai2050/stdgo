@@ -68,9 +68,7 @@ test "smtp client and mock server workflow with PLAIN auth" {
     const testing = std.testing;
     const net = @import("../net.zig");
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var listener = try net.listen(testing.allocator, io, "tcp", "127.0.0.1:0");
     defer listener.close();
@@ -89,7 +87,9 @@ test "smtp client and mock server workflow with PLAIN auth" {
             // 2. Expect EHLO
             var n = sc.read(&buf) catch return;
             if (n == 0) return;
-            _ = sc.write("250-mock.smtp.internal\r\n250-AUTH PLAIN CRAM-MD5\r\n250 8BITMIME\r\n") catch return;
+            _ = sc.write(
+                "250-mock.smtp.internal\r\n250-AUTH PLAIN CRAM-MD5\r\n250 8BITMIME\r\n",
+            ) catch return;
 
             // 3. Expect AUTH PLAIN
             n = sc.read(&buf) catch return;
@@ -132,7 +132,13 @@ test "smtp client and mock server workflow with PLAIN auth" {
     var addr_buf: [32]u8 = undefined;
     const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
 
-    const plain_a = try plainAuth(testing.allocator, "", "alice@example.com", "secret123", "127.0.0.1");
+    const plain_a = try plainAuth(
+        testing.allocator,
+        "",
+        "alice@example.com",
+        "secret123",
+        "127.0.0.1",
+    );
     defer plain_a.deinit();
 
     const recipients = [_][]const u8{"bob@example.com"};

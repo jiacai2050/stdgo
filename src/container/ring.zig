@@ -67,7 +67,8 @@ pub fn Ring(comptime T: type) type {
             return r;
         }
 
-        /// Link connects ring r with ring s such that r.next() becomes s and returns the original value for r.next().
+        /// Link connects ring r with ring s such that r.next() becomes s and returns the
+        /// original value for r.next().
         pub fn link(self: *Self, s: *Self) *Self {
             const n = self.next_ptr;
             const p = s.prev_ptr;

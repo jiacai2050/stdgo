@@ -161,7 +161,12 @@ const RawSym = struct {
     name: []const u8,
 };
 
-fn walksymtab(data: []const u8, ptr_size: u8, ctx: anytype, on_sym: fn (@TypeOf(ctx), RawSym) anyerror!void) !void {
+fn walksymtab(
+    data: []const u8,
+    ptr_size: u8,
+    ctx: anytype,
+    on_sym: fn (@TypeOf(ctx), RawSym) anyerror!void,
+) !void {
     var p = data;
     while (p.len >= 4) {
         if (p.len < ptr_size) return error.UnexpectedEof;

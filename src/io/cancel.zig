@@ -35,9 +35,7 @@ pub const CancelToken = struct {
 };
 
 test "cancel source broadcasts and remains canceled" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var source = CancelSource.init();
     var entered: std.Io.Event = .unset;
 
@@ -63,9 +61,7 @@ test "cancel source broadcasts and remains canceled" {
 }
 
 test "canceling a waiter leaves the source unset" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var source = CancelSource.init();
     var entered: std.Io.Event = .unset;
 

@@ -297,7 +297,9 @@ pub const File = struct {
         };
 
         // Parse section headers
-        const total_sh_size = std.math.mul(usize, shnum, shentsize) catch return FormatError.UnexpectedEOF;
+        const total_sh_size = std.math.mul(usize, shnum, shentsize) catch {
+            return FormatError.UnexpectedEOF;
+        };
         if (shoff > data.len or data.len - shoff < total_sh_size) return FormatError.UnexpectedEOF;
 
         const sections = try allocator.alloc(Section, shnum);
@@ -312,7 +314,8 @@ pub const File = struct {
                 if (off + 40 > data.len) return FormatError.InvalidSectionHeader;
                 const sh = data[off .. off + 40];
                 const name_off = mem.readInt(u32, sh[0..4], endian);
-                const shtype: SectionType = @fromBackingInt(@intCast(mem.readInt(u32, sh[4..8], endian)));
+                const raw_shtype = mem.readInt(u32, sh[4..8], endian);
+                const shtype: SectionType = @fromBackingInt(@intCast(raw_shtype));
                 const flags = mem.readInt(u32, sh[8..12], endian);
                 const addr = mem.readInt(u32, sh[12..16], endian);
                 const offset = mem.readInt(u32, sh[16..20], endian);
@@ -322,7 +325,10 @@ pub const File = struct {
                 const addralign = mem.readInt(u32, sh[32..36], endian);
                 const entsize = mem.readInt(u32, sh[36..40], endian);
 
-                const sec_data = if (shtype != .nobits and offset <= data.len and size <= data.len - offset)
+                const has_data = shtype != .nobits and
+                    offset <= data.len and
+                    size <= data.len - offset;
+                const sec_data = if (has_data)
                     data[offset .. offset + size]
                 else
                     &.{};
@@ -348,7 +354,8 @@ pub const File = struct {
                 if (off + 64 > data.len) return FormatError.InvalidSectionHeader;
                 const sh = data[off .. off + 64];
                 const name_off = mem.readInt(u32, sh[0..4], endian);
-                const shtype: SectionType = @fromBackingInt(@intCast(mem.readInt(u32, sh[4..8], endian)));
+                const raw_shtype = mem.readInt(u32, sh[4..8], endian);
+                const shtype: SectionType = @fromBackingInt(@intCast(raw_shtype));
                 const flags = mem.readInt(u64, sh[8..16], endian);
                 const addr = mem.readInt(u64, sh[16..24], endian);
                 const offset = mem.readInt(u64, sh[24..32], endian);
@@ -358,7 +365,10 @@ pub const File = struct {
                 const addralign = mem.readInt(u64, sh[48..56], endian);
                 const entsize = mem.readInt(u64, sh[56..64], endian);
 
-                const sec_data = if (shtype != .nobits and offset <= data.len and size <= data.len - offset)
+                const has_data = shtype != .nobits and
+                    offset <= data.len and
+                    size <= data.len - offset;
+                const sec_data = if (has_data)
                     data[offset .. offset + size]
                 else
                     &.{};
@@ -396,7 +406,9 @@ pub const File = struct {
         f.sections = sections;
 
         // Parse program headers
-        const total_ph_size = std.math.mul(usize, phnum, phentsize) catch return FormatError.UnexpectedEOF;
+        const total_ph_size = std.math.mul(usize, phnum, phentsize) catch {
+            return FormatError.UnexpectedEOF;
+        };
         if (phoff > data.len or data.len - phoff < total_ph_size) return FormatError.UnexpectedEOF;
 
         const progs = try allocator.alloc(Prog, phnum);
@@ -407,7 +419,8 @@ pub const File = struct {
             if (class == .elf32) {
                 if (off + 32 > data.len) return FormatError.InvalidProgramHeader;
                 const ph = data[off .. off + 32];
-                const ptype: ProgType = @fromBackingInt(@intCast(mem.readInt(u32, ph[0..4], endian)));
+                const raw_ptype = mem.readInt(u32, ph[0..4], endian);
+                const ptype: ProgType = @fromBackingInt(@intCast(raw_ptype));
                 const poffset = mem.readInt(u32, ph[4..8], endian);
                 const vaddr = mem.readInt(u32, ph[8..12], endian);
                 const paddr = mem.readInt(u32, ph[12..16], endian);
@@ -416,7 +429,10 @@ pub const File = struct {
                 const flags = mem.readInt(u32, ph[24..28], endian);
                 const palign = mem.readInt(u32, ph[28..32], endian);
 
-                const prog_data = if (poffset <= data.len and filesz <= data.len - poffset) data[poffset .. poffset + filesz] else &.{};
+                const prog_data = if (poffset <= data.len and filesz <= data.len - poffset)
+                    data[poffset .. poffset + filesz]
+                else
+                    &.{};
                 progs[i] = .{
                     .header = .{
                         .type = ptype,
@@ -434,7 +450,8 @@ pub const File = struct {
                 // elf64
                 if (off + 56 > data.len) return FormatError.InvalidProgramHeader;
                 const ph = data[off .. off + 56];
-                const ptype: ProgType = @fromBackingInt(@intCast(mem.readInt(u32, ph[0..4], endian)));
+                const raw_ptype = mem.readInt(u32, ph[0..4], endian);
+                const ptype: ProgType = @fromBackingInt(@intCast(raw_ptype));
                 const flags = mem.readInt(u32, ph[4..8], endian);
                 const poffset = mem.readInt(u64, ph[8..16], endian);
                 const vaddr = mem.readInt(u64, ph[16..24], endian);
@@ -443,7 +460,10 @@ pub const File = struct {
                 const memsz = mem.readInt(u64, ph[40..48], endian);
                 const palign = mem.readInt(u64, ph[48..56], endian);
 
-                const prog_data = if (poffset <= data.len and filesz <= data.len - poffset) data[poffset .. poffset + filesz] else &.{};
+                const prog_data = if (poffset <= data.len and filesz <= data.len - poffset)
+                    data[poffset .. poffset + filesz]
+                else
+                    &.{};
                 progs[i] = .{
                     .header = .{
                         .type = ptype,
@@ -591,7 +611,8 @@ test "parse minimal synthetic ELF64 file" {
     mem.writeInt(u64, s1[24..32], 320, .little); // offset = 320
     mem.writeInt(u64, s1[32..40], 32, .little); // size = 32
 
-    // Section 2: .symtab (offset 192..256) -> located at 360, size 48 (2 syms: null + main), link = 3 (.strtab)
+    // Section 2: .symtab (offset 192..256) -> located at 360, size 48 (2 syms: null + main),
+    // link = 3 (.strtab)
     const s2 = elf_buf[192..256];
     mem.writeInt(u32, s2[0..4], 11, .little); // name offset = 11 (".symtab")
     mem.writeInt(u32, s2[4..8], 2, .little); // SHT_SYMTAB = 2
@@ -613,7 +634,8 @@ test "parse minimal synthetic ELF64 file" {
 
     // .symtab content at offset 360:
     // Sym 0: null (24 bytes zero)
-    // Sym 1: name_off = 1 ("main"), info = 0x12 (STB_GLOBAL << 4 | STT_FUNC), shndx = 1, value = 0x401000, size = 64
+    // Sym 1: name_off = 1 ("main"), info = 0x12 (STB_GLOBAL << 4 | STT_FUNC),
+    // shndx = 1, value = 0x401000, size = 64
     const sym1 = elf_buf[384..408];
     mem.writeInt(u32, sym1[0..4], 1, .little); // name offset = 1
     sym1[4] = 0x12; // STB_GLOBAL (1) + STT_FUNC (2)

@@ -102,7 +102,12 @@ pub fn fields(allocator: Allocator, s: []const u8) Allocator.Error![][]const u8 
     return list.toOwnedSlice(allocator);
 }
 
-pub fn replaceAll(allocator: Allocator, s: []const u8, old: []const u8, new: []const u8) Allocator.Error![]u8 {
+pub fn replaceAll(
+    allocator: Allocator,
+    s: []const u8,
+    old: []const u8,
+    new: []const u8,
+) Allocator.Error![]u8 {
     if (old.len == 0 or s.len == 0) {
         return try allocator.dupe(u8, s);
     }

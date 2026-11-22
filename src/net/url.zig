@@ -92,7 +92,11 @@ pub fn pathUnescape(allocator: Allocator, s: []const u8) (Allocator.Error || Err
     return unescape(allocator, s, .path);
 }
 
-fn unescape(allocator: Allocator, s: []const u8, mode: enum { query, path }) (Allocator.Error || Error)![]u8 {
+fn unescape(
+    allocator: Allocator,
+    s: []const u8,
+    mode: enum { query, path },
+) (Allocator.Error || Error)![]u8 {
     var t = try allocator.alloc(u8, s.len);
     errdefer allocator.free(t);
 

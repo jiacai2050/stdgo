@@ -134,19 +134,32 @@ pub const Rows = struct {
         columnCount: *const fn (ctx: *anyopaque) usize,
         /// Returns the column name at the given 0-based index.
         columnName: *const fn (ctx: *anyopaque, index: usize) []const u8,
-        /// Advances to the next row. Whether deadline is checked during iteration depends on the driver.
-        next: *const fn (ctx: *anyopaque, io: std.Io, dest: []Value, deadline: Deadline) anyerror!bool,
+        /// Advances to the next row.
+        /// Whether deadline is checked during iteration depends on the driver.
+        next: *const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            dest: []Value,
+            deadline: Deadline,
+        ) anyerror!bool,
         close: *const fn (ctx: *anyopaque) void,
         /// Optional: returns the error, if any, that occurred while iterating.
         err: ?*const fn (ctx: *anyopaque) ?anyerror = null,
-        /// Optional: returns the database system type name for the column at index (e.g. "INTEGER", "VARCHAR").
-        columnTypeDatabaseTypeName: ?*const fn (ctx: *anyopaque, index: usize) ?[]const u8 = null,
+        /// Optional: returns the database system type name for the column at index
+        /// (e.g. "INTEGER", "VARCHAR").
+        columnTypeDatabaseTypeName: ?*const fn (
+            ctx: *anyopaque,
+            index: usize,
+        ) ?[]const u8 = null,
         /// Optional: returns whether the column at index is nullable.
         columnTypeNullable: ?*const fn (ctx: *anyopaque, index: usize) ?bool = null,
         /// Optional: returns the column type length for variable-length types.
         columnTypeLength: ?*const fn (ctx: *anyopaque, index: usize) ?i64 = null,
         /// Optional: returns precision and scale for decimal/numeric types.
-        columnTypePrecisionScale: ?*const fn (ctx: *anyopaque, index: usize) ?struct { precision: i64, scale: i64 } = null,
+        columnTypePrecisionScale: ?*const fn (
+            ctx: *anyopaque,
+            index: usize,
+        ) ?struct { precision: i64, scale: i64 } = null,
     };
 
     /// ColumnCount returns the number of columns in the result set.
@@ -186,10 +199,22 @@ pub const Stmt = struct {
     pub const VTable = struct {
         close: *const fn (ctx: *anyopaque) void,
         numInput: *const fn (ctx: *anyopaque) i64,
-        /// Executes a prepared statement. Whether deadline is checked during execution depends on the driver.
-        exec: *const fn (ctx: *anyopaque, io: std.Io, args: []const Value, deadline: Deadline) anyerror!Result,
-        /// Executes a prepared query. Whether deadline is checked during execution depends on the driver.
-        query: *const fn (ctx: *anyopaque, io: std.Io, args: []const Value, deadline: Deadline) anyerror!Rows,
+        /// Executes a prepared statement.
+        /// Whether deadline is checked during execution depends on the driver.
+        exec: *const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            args: []const Value,
+            deadline: Deadline,
+        ) anyerror!Result,
+        /// Executes a prepared query.
+        /// Whether deadline is checked during execution depends on the driver.
+        query: *const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            args: []const Value,
+            deadline: Deadline,
+        ) anyerror!Rows,
     };
 
     pub fn close(self: *Stmt) void {
@@ -242,12 +267,22 @@ pub const Conn = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        prepare: *const fn (ctx: *anyopaque, io: std.Io, query: []const u8, deadline: Deadline) anyerror!Stmt,
+        prepare: *const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            query: []const u8,
+            deadline: Deadline,
+        ) anyerror!Stmt,
         close: *const fn (ctx: *anyopaque) void,
         begin: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!Tx,
         ping: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
         /// Optional: starts a transaction with specific options (isolation level, read-only).
-        beginTx: ?*const fn (ctx: *anyopaque, io: std.Io, opts: TxOptions, deadline: Deadline) anyerror!Tx = null,
+        beginTx: ?*const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            opts: TxOptions,
+            deadline: Deadline,
+        ) anyerror!Tx = null,
         /// [Extension to standard Go driver.Conn]
         /// Optional: Interrupts any in-progress query on this connection (e.g. sqlite3_interrupt,
         /// PostgreSQL CancelRequest, MySQL KILL QUERY).
@@ -319,7 +354,12 @@ pub const Driver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        open: *const fn (ctx: *anyopaque, io: std.Io, dsn: []const u8, deadline: Deadline) anyerror!Conn,
+        open: *const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            dsn: []const u8,
+            deadline: Deadline,
+        ) anyerror!Conn,
     };
 
     pub fn open(self: Driver, io: std.Io, dsn: []const u8, deadline: Deadline) !Conn {

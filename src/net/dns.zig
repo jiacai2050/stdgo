@@ -40,7 +40,8 @@ pub const DnsError = error{
     NoRecordsFound,
 };
 
-/// Encodes a domain name like "api.example.com" into DNS wire label format: "\x03api\x07example\x03com\x00".
+/// Encodes a domain name like "api.example.com" into DNS wire label format:
+/// "\x03api\x07example\x03com\x00".
 pub fn encodeDomainName(name: []const u8, buf: []u8) !usize {
     if (name.len == 0 or name.len > 253) return error.InvalidDomainName;
 
@@ -79,7 +80,8 @@ pub fn encodeDomainName(name: []const u8, buf: []u8) !usize {
     return out_idx;
 }
 
-/// Decodes a DNS domain name from the wire packet at `offset`, handling RFC 1035 pointer compression.
+/// Decodes a DNS domain name from the wire packet at `offset`,
+/// handling RFC 1035 pointer compression.
 pub fn decodeDomainName(
     allocator: Allocator,
     packet: []const u8,
@@ -168,7 +170,12 @@ pub const Resolver = struct {
     timeout: ?Duration = null,
 
     /// Look up host IPv4 and IPv6 addresses as string slices.
-    pub fn lookupHost(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![][]const u8 {
+    pub fn lookupHost(
+        self: Resolver,
+        allocator: Allocator,
+        io: std.Io,
+        host: []const u8,
+    ) ![][]const u8 {
         std.debug.assert(host.len > 0);
         const ips = try self.lookupIP(allocator, io, host);
         defer allocator.free(ips);
@@ -198,7 +205,8 @@ pub const Resolver = struct {
         var last_err: ?anyerror = null;
 
         // First query IPv4 (A)
-        const a_records = self.queryRaw(allocator, io, host, .A, deadline_value) catch |err| switch (err) {
+        const a_query = self.queryRaw(allocator, io, host, .A, deadline_value);
+        const a_records = a_query catch |err| switch (err) {
             error.Timeout, error.Canceled => |e| return e,
             error.DnsNameError => null,
             else => |e| blk: {
@@ -219,7 +227,8 @@ pub const Resolver = struct {
         }
 
         // Then query IPv6 (AAAA)
-        const aaaa_records = self.queryRaw(allocator, io, host, .AAAA, deadline_value) catch |err| switch (err) {
+        const aaaa_query = self.queryRaw(allocator, io, host, .AAAA, deadline_value);
+        const aaaa_records = aaaa_query catch |err| switch (err) {
             error.Timeout, error.Canceled => |e| return e,
             error.DnsNameError => null,
             else => |e| blk: {
@@ -245,7 +254,12 @@ pub const Resolver = struct {
     }
 
     /// Look up CNAME record.
-    pub fn lookupCNAME(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![]const u8 {
+    pub fn lookupCNAME(
+        self: Resolver,
+        allocator: Allocator,
+        io: std.Io,
+        host: []const u8,
+    ) ![]const u8 {
         std.debug.assert(host.len > 0);
         const records = try self.queryRaw(allocator, io, host, .CNAME, self.deadline(io));
         defer {
@@ -263,7 +277,12 @@ pub const Resolver = struct {
     }
 
     /// Look up TXT records.
-    pub fn lookupTXT(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![][]const u8 {
+    pub fn lookupTXT(
+        self: Resolver,
+        allocator: Allocator,
+        io: std.Io,
+        host: []const u8,
+    ) ![][]const u8 {
         std.debug.assert(host.len > 0);
         const records = try self.queryRaw(allocator, io, host, .TXT, self.deadline(io));
         defer {
@@ -410,11 +429,19 @@ pub const Resolver = struct {
             switch (rtype) {
                 .A, .AAAA => {
                     const data_copy = try allocator.dupe(u8, rdata);
-                    try results.append(allocator, .{ .rtype = rtype, .ttl = ttl, .data = data_copy });
+                    try results.append(allocator, .{
+                        .rtype = rtype,
+                        .ttl = ttl,
+                        .data = data_copy,
+                    });
                 },
                 .CNAME => {
                     const cname_host = try decodeDomainName(allocator, packet, offset, null);
-                    try results.append(allocator, .{ .rtype = rtype, .ttl = ttl, .data = cname_host });
+                    try results.append(allocator, .{
+                        .rtype = rtype,
+                        .ttl = ttl,
+                        .data = cname_host,
+                    });
                 },
                 .MX => {
                     if (rdata.len >= 2) {
@@ -425,7 +452,11 @@ pub const Resolver = struct {
                         var mx_buf = try allocator.alloc(u8, 2 + mx_host.len);
                         std.mem.writeInt(u16, mx_buf[0..][0..2], pref, .big);
                         @memcpy(mx_buf[2..], mx_host);
-                        try results.append(allocator, .{ .rtype = rtype, .ttl = ttl, .data = mx_buf });
+                        try results.append(allocator, .{
+                            .rtype = rtype,
+                            .ttl = ttl,
+                            .data = mx_buf,
+                        });
                     }
                 },
                 .TXT => {
@@ -441,7 +472,12 @@ pub const Resolver = struct {
                             t_pos += t_len;
                         } else break;
                     }
-                    try results.append(allocator, .{ .rtype = rtype, .ttl = ttl, .data = try txt_res.toOwnedSlice(allocator) });
+                    const txt_data = try txt_res.toOwnedSlice(allocator);
+                    try results.append(allocator, .{
+                        .rtype = rtype,
+                        .ttl = ttl,
+                        .data = txt_data,
+                    });
                 },
                 else => {},
             }
@@ -481,9 +517,7 @@ pub fn lookupMX(allocator: Allocator, io: std.Io, host: []const u8) ![]MX {
 
 test "net.dns: lookupIP propagates network errors instead of swallowing into NoRecordsFound" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const r = Resolver{
         .nameserver = "invalid_addr_format",
@@ -496,9 +530,7 @@ test "net.dns: lookupIP propagates network errors instead of swallowing into NoR
 
 test "net.dns: resolver timeout bounds an unresponsive nameserver" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const server = try udp_mod.listenUDP(testing.allocator, io, "udp", "127.0.0.1:0");
     defer server.close();
     const address = try testing.allocator.print("127.0.0.1:{d}", .{server.port()});
@@ -507,5 +539,6 @@ test "net.dns: resolver timeout bounds an unresponsive nameserver" {
         .nameserver = address,
         .timeout = @fromBackingInt(50 * std.time.ns_per_ms),
     };
-    try testing.expectError(error.Timeout, resolver.lookupIP(testing.allocator, io, "example.test"));
+    const res = resolver.lookupIP(testing.allocator, io, "example.test");
+    try testing.expectError(error.Timeout, res);
 }

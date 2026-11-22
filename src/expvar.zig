@@ -40,9 +40,7 @@ pub const Int = struct {
     }
 
     pub fn string(self: *const Int, allocator: Allocator) Allocator.Error![]u8 {
-        var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}", .{self.value()}) catch unreachable;
-        return allocator.dupe(u8, s);
+        return std.fmt.allocPrint(allocator, "{d}", .{self.value()});
     }
 
     pub fn var_ref(self: *Int) Var {
@@ -86,9 +84,7 @@ pub const Float = struct {
     }
 
     pub fn string(self: *Float, allocator: Allocator) Allocator.Error![]u8 {
-        var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}", .{self.value()}) catch unreachable;
-        return allocator.dupe(u8, s);
+        return std.fmt.allocPrint(allocator, "{d}", .{self.value()});
     }
 
     pub fn var_ref(self: *Float) Var {
@@ -305,7 +301,8 @@ pub const Map = struct {
     };
 };
 
-/// Func wraps a function returning a string so that calling its string() method evaluates the function.
+/// Func wraps a function returning a string so that calling its string() method evaluates
+/// the function.
 pub const Func = struct {
     func: *const fn (allocator: Allocator) Allocator.Error![]u8,
 

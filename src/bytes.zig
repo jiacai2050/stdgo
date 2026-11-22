@@ -34,7 +34,8 @@ pub fn index(s: []const u8, sep: []const u8) ?usize {
     return std.mem.indexOf(u8, s, sep);
 }
 
-/// LastIndex returns the index of the last instance of sep in s, or null if sep is not present in s.
+/// LastIndex returns the index of the last instance of sep in s, or null if sep
+/// is not present in s.
 pub fn lastIndex(s: []const u8, sep: []const u8) ?usize {
     return std.mem.lastIndexOf(u8, s, sep);
 }

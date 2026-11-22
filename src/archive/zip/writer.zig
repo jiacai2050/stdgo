@@ -31,7 +31,12 @@ pub const Writer = struct {
     }
 
     /// WriteFile stores a file directly into the ZIP archive.
-    pub fn writeFile(self: *Writer, name: []const u8, data: []const u8, method: zip_struct.Method) anyerror!void {
+    pub fn writeFile(
+        self: *Writer,
+        name: []const u8,
+        data: []const u8,
+        method: zip_struct.Method,
+    ) anyerror!void {
         const local_offset = self.offset;
         const crc = std.hash.Crc32.hash(data);
 

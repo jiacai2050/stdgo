@@ -62,12 +62,16 @@ pub fn parseUrlTarget(raw_url: []const u8) !ParsedTarget {
             if (std.mem.indexOfScalar(u8, authority, ']')) |rb| {
                 if (colon_idx > rb) {
                     host = authority[0..colon_idx];
-                    port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch return error.InvalidPort;
+                    port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch {
+                        return error.InvalidPort;
+                    };
                 }
             }
         } else {
             host = authority[0..colon_idx];
-            port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch return error.InvalidPort;
+            port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch {
+                return error.InvalidPort;
+            };
         }
     }
 
@@ -191,7 +195,10 @@ pub const Request = struct {
     }
 
     /// cookies parses and returns the HTTP cookies sent with the request.
-    pub fn cookies(self: *const Request, allocator: std.mem.Allocator) ![]@import("cookie.zig").Cookie {
+    pub fn cookies(
+        self: *const Request,
+        allocator: std.mem.Allocator,
+    ) ![]@import("cookie.zig").Cookie {
         var list = std.ArrayListUnmanaged(@import("cookie.zig").Cookie).empty;
         errdefer list.deinit(allocator);
 
@@ -251,12 +258,20 @@ pub const Request = struct {
 
     pub fn addCookie(self: *Request, cookie: @import("cookie.zig").Cookie) !void {
         if (self.header.get("Cookie")) |existing| {
-            const combined = try std.fmt.allocPrint(self.allocator, "{s}; {s}={s}", .{ existing, cookie.name, cookie.value });
+            const combined = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}; {s}={s}",
+                .{ existing, cookie.name, cookie.value },
+            );
             errdefer self.allocator.free(combined);
             try self.extra_strings.append(self.allocator, combined);
             try self.header.set("Cookie", combined);
         } else {
-            const s = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ cookie.name, cookie.value });
+            const s = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}={s}",
+                .{ cookie.name, cookie.value },
+            );
             errdefer self.allocator.free(s);
             try self.extra_strings.append(self.allocator, s);
             try self.header.set("Cookie", s);
@@ -264,7 +279,12 @@ pub const Request = struct {
     }
 };
 
-pub fn newRequest(allocator: std.mem.Allocator, method: Method, url: []const u8, body: ?[]const u8) !Request {
+pub fn newRequest(
+    allocator: std.mem.Allocator,
+    method: Method,
+    url: []const u8,
+    body: ?[]const u8,
+) !Request {
     var req = Request.init(allocator, method, url);
     errdefer req.deinit();
     if (body) |b| {

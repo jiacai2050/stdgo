@@ -1,8 +1,10 @@
 const std = @import("std");
 
 /// Runs a homogeneous list of tasks, canceling siblings after the first observed error.
-/// The owner waits for all started tasks before returning; tasks must cooperate with cancellation.
-/// `limit` must be positive, and `tasks` and their borrowed arguments must remain valid until return.
+/// The owner waits for all started tasks before returning; tasks must cooperate with
+/// cancellation.
+/// `limit` must be positive, and `tasks` and their borrowed arguments must remain valid
+/// until return.
 pub const Group = struct {
     pub fn run(
         allocator: std.mem.Allocator,
@@ -21,7 +23,11 @@ pub const Group = struct {
         const Runner = struct {
             fn run(task_io: std.Io, queue: *Queue, args: Args) void {
                 const result: ?anyerror = if (@call(.auto, worker, args)) |_| null else |err| err;
-                queue.putOneUncancelable(task_io, .{ .err = result }) catch unreachable;
+                queue.putOneUncancelable(task_io, .{ .err = result }) catch |err| switch (err) {
+                    error.Closed => {
+                        std.debug.panic("sync.group: worker queue closed unexpectedly", .{});
+                    },
+                };
             }
         };
 
@@ -61,9 +67,7 @@ pub const Group = struct {
 };
 
 test "group runs bounded tasks and propagates the first observed failure" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     const State = struct {
         sibling_started: std.Io.Event = .unset,
         blocked: std.Io.Event = .unset,
@@ -92,15 +96,16 @@ test "group runs bounded tasks and propagates the first observed failure" {
         .{ io, &state, 1 },
         .{ io, &state, 2 },
     };
-    try std.testing.expectError(error.WorkFailed, Group.run(std.testing.allocator, io, Worker.run, &tasks, 2));
+    try std.testing.expectError(
+        error.WorkFailed,
+        Group.run(std.testing.allocator, io, Worker.run, &tasks, 2),
+    );
     try std.testing.expect(state.sibling_finished.load(.acquire));
     try std.testing.expect(!state.extra_started.load(.acquire));
 }
 
 test "group runs at most limit tasks until a slot is freed" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     const State = struct {
         started: std.atomic.Value(usize) = .init(0),
         two_started: std.Io.Event = .unset,
@@ -135,21 +140,20 @@ test "group runs at most limit tasks until a slot is freed" {
 }
 
 test "group rejects a zero concurrency limit" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     const Worker = struct {
         fn run() !void {}
     };
     const Args = std.meta.ArgsTuple(@TypeOf(Worker.run));
     const tasks: [0]Args = .{};
-    try std.testing.expectError(error.InvalidLimit, Group.run(std.testing.allocator, io, Worker.run, &tasks, 0));
+    try std.testing.expectError(
+        error.InvalidLimit,
+        Group.run(std.testing.allocator, io, Worker.run, &tasks, 0),
+    );
 }
 
 test "canceling the owner waits for running tasks to exit" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     const State = struct {
         started: std.Io.Event = .unset,
         blocked: std.Io.Event = .unset,

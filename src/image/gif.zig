@@ -180,7 +180,10 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
                 if (pos >= data.len) return error.UnexpectedEof;
                 const block_size = data[pos];
                 pos += 1;
-                const app_id = if (pos + block_size <= data.len) data[pos .. pos + block_size] else "";
+                const app_id = if (pos + block_size <= data.len)
+                    data[pos .. pos + block_size]
+                else
+                    "";
                 pos += block_size;
 
                 if (mem.startsWith(u8, app_id, "NETSCAPE2.0")) {
@@ -222,7 +225,9 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
             const id_packed = data[pos];
             pos += 1;
 
-            if (img_w == 0 or img_h == 0 or img_w > 10000 or img_h > 10000) return error.InvalidDimensions;
+            if (img_w == 0 or img_h == 0 or img_w > 10000 or img_h > 10000) {
+                return error.InvalidDimensions;
+            }
 
             const has_lct = (id_packed & 0x80) != 0;
             const interlaced = (id_packed & 0x40) != 0;
@@ -263,12 +268,21 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
             if (pos < data.len and data[pos] == 0) pos += 1;
 
             // Decompress LZW stream
-            const total_pixels = std.math.mul(usize, @as(usize, img_w), @as(usize, img_h)) catch return error.InvalidDimensions;
+            const total_pixels = std.math.mul(
+                usize,
+                @as(usize, img_w),
+                @as(usize, img_h),
+            ) catch return error.InvalidDimensions;
             const decoded_indices = try allocator.alloc(u8, total_pixels);
             defer allocator.free(decoded_indices);
 
             var in_stream = bytes.Reader.init(lzw_bytes.items);
-            var lzw_r = lzw.Reader.init(in_stream.reader(), .LSB, @intCast(@max(2, lit_width))) catch return error.CorruptGIFData;
+            const min_code_size: u4 = @intCast(@max(2, lit_width));
+            var lzw_r = lzw.Reader.init(
+                in_stream.reader(),
+                .LSB,
+                min_code_size,
+            ) catch return error.CorruptGIFData;
 
             var total_decoded: usize = 0;
             while (total_decoded < total_pixels) {
@@ -299,7 +313,11 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
                             if (p_idx < total_decoded) {
                                 const c_idx = decoded_indices[p_idx];
                                 p_idx += 1;
-                                var c = if (c_idx < active_palette.len) active_palette[c_idx] else color.RGBA{ .r = 0, .g = 0, .b = 0, .a = 255 };
+                                const default_c = color.RGBA{ .r = 0, .g = 0, .b = 0, .a = 255 };
+                                var c = if (c_idx < active_palette.len)
+                                    active_palette[c_idx]
+                                else
+                                    default_c;
                                 if (gc_transparent) |t_idx| {
                                     if (c_idx == t_idx) c.a = 0;
                                 }
@@ -314,7 +332,11 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
                         const p_idx = y * img_w + x;
                         if (p_idx < total_decoded) {
                             const c_idx = decoded_indices[p_idx];
-                            var c = if (c_idx < active_palette.len) active_palette[c_idx] else color.RGBA{ .r = 0, .g = 0, .b = 0, .a = 255 };
+                            const default_c = color.RGBA{ .r = 0, .g = 0, .b = 0, .a = 255 };
+                            var c = if (c_idx < active_palette.len)
+                                active_palette[c_idx]
+                            else
+                                default_c;
                             if (gc_transparent) |t_idx| {
                                 if (c_idx == t_idx) c.a = 0;
                             }

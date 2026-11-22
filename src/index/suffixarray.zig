@@ -1,4 +1,5 @@
-//! Package suffixarray implements substring search in logarithmic time using an in-memory suffix array,
+//! Package suffixarray implements substring search in logarithmic time using
+//! an in-memory suffix array,
 //! conforming to Go's index/suffixarray package.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -53,7 +54,8 @@ pub const Index = struct {
         return self.data;
     }
 
-    /// Lookup returns an unsorted or sorted slice of offsets where the byte slice s appears in data.
+    /// Lookup returns an unsorted or sorted slice of offsets where the byte slice s
+    /// appears in data.
     /// If n < 0, all occurrences are returned. If n >= 0, at most n occurrences are returned.
     /// The returned offsets are sorted in ascending order.
     pub fn lookup(self: *const Index, s: []const u8, n: isize, allocator: Allocator) ![]usize {
@@ -85,7 +87,9 @@ pub const Index = struct {
             const cmp_len = @min(suffix.len, s.len);
             const ord = std.mem.order(u8, suffix[0..cmp_len], s[0..cmp_len]);
 
-            if (ord == .gt or (ord == .eq and suffix.len >= s.len and !std.mem.startsWith(u8, suffix, s))) {
+            const is_mismatch = ord == .gt or
+                (ord == .eq and suffix.len >= s.len and !std.mem.startsWith(u8, suffix, s));
+            if (is_mismatch) {
                 high = mid;
             } else if (ord == .eq and std.mem.startsWith(u8, suffix, s)) {
                 low = mid + 1;

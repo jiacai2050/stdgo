@@ -182,7 +182,11 @@ pub const Writer = struct {
         defer h.deinit();
 
         var disp_buf: [512]u8 = undefined;
-        const disp = try std.fmt.bufPrint(&disp_buf, "form-data; name=\"{s}\"; filename=\"{s}\"", .{ fieldname, filename });
+        const disp = try std.fmt.bufPrint(
+            &disp_buf,
+            "form-data; name=\"{s}\"; filename=\"{s}\"",
+            .{ fieldname, filename },
+        );
         try h.set("Content-Disposition", disp);
         try h.set("Content-Type", "application/octet-stream");
 
@@ -285,14 +289,18 @@ pub const Reader = struct {
         const b_idx = std.mem.indexOf(u8, self.buf.items, dash_boundary).?;
         // Check if closing boundary: "--boundary--"
         const after_b = b_idx + dash_boundary.len;
-        if (after_b + 2 <= self.buf.items.len and std.mem.eql(u8, self.buf.items[after_b .. after_b + 2], "--")) {
+        if (after_b + 2 <= self.buf.items.len and
+            std.mem.eql(u8, self.buf.items[after_b .. after_b + 2], "--"))
+        {
             self.eof = true;
             return null;
         }
 
         // Advance past boundary and trailing \r\n
         var header_start = after_b;
-        if (header_start + 2 <= self.buf.items.len and std.mem.eql(u8, self.buf.items[header_start .. header_start + 2], "\r\n")) {
+        if (header_start + 2 <= self.buf.items.len and
+            std.mem.eql(u8, self.buf.items[header_start .. header_start + 2], "\r\n"))
+        {
             header_start += 2;
         }
 

@@ -148,7 +148,7 @@ pub const Scanner = struct {
             if (self.start > 0) {
                 const remaining = self.end - self.start;
                 if (remaining > 0) {
-                    std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[self.start..self.end]);
+                    @memcpy(self.buf[0..remaining], self.buf[self.start..self.end]);
                 }
                 self.end = remaining;
                 self.start = 0;

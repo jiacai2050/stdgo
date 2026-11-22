@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
             \\{{ end }}
         ;
 
-        const tmpl = template.Template.new(allocator, "user_card");
+        const tmpl = try template.Template.new(allocator, "user_card");
         defer tmpl.deinit();
         _ = try tmpl.parse(tmpl_src);
 
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
             \\{{- else }} Grade: F (Retry)
             \\{{- end }}
         ;
-        const tmpl = template.Must(template.Template.new(allocator, "grading").parse(tmpl_src));
+        const tmpl = template.Must((try template.Template.new(allocator, "grading")).parse(tmpl_src));
         defer tmpl.deinit();
 
         var buf = stdgo.bytes.Buffer.init(allocator);
@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
             \\  No profile found.
             \\{{- end }}
         ;
-        const tmpl = template.Must(template.Template.new(allocator, "with_demo").parse(tmpl_src));
+        const tmpl = template.Must((try template.Template.new(allocator, "with_demo")).parse(tmpl_src));
         defer tmpl.deinit();
 
         var buf = stdgo.bytes.Buffer.init(allocator);
@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
         const tmpl_src =
             \\Formatted: {{ printf "[#%04d] %s" .id .title }} | First Tag: {{ index .tags 0 }}
         ;
-        const tmpl = template.Must(template.Template.new(allocator, "fmt_demo").parse(tmpl_src));
+        const tmpl = template.Must((try template.Template.new(allocator, "fmt_demo")).parse(tmpl_src));
         defer tmpl.deinit();
 
         var buf = stdgo.bytes.Buffer.init(allocator);
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
             \\{{ counter = add counter 23 }}
             \\Updated Metric: {{ counter }}
         ;
-        const tmpl = template.Must(template.Template.new(allocator, "zig_style_demo").parse(tmpl_src));
+        const tmpl = template.Must((try template.Template.new(allocator, "zig_style_demo")).parse(tmpl_src));
         defer tmpl.deinit();
 
         var buf = stdgo.bytes.Buffer.init(allocator);
@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
             \\Header Request-ID:   {{ .@"x-request-id" }}
             \\Event Type:          {{ .@"type" | upper }}
         ;
-        const tmpl = template.Must(template.Template.new(allocator, "quoted_idents_demo").parse(tmpl_src));
+        const tmpl = template.Must((try template.Template.new(allocator, "quoted_idents_demo")).parse(tmpl_src));
         defer tmpl.deinit();
 
         var buf = stdgo.bytes.Buffer.init(allocator);
@@ -182,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
             \\Banner:        {{ repeat .star 5 }}
         ;
 
-        var tmpl = template.Template.new(allocator, "custom_func_demo");
+        var tmpl = try template.Template.new(allocator, "custom_func_demo");
         defer tmpl.deinit();
 
         _ = try tmpl.addFunc("badge", CustomHelpers.badge);
@@ -221,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
             \\{{- end }}
         ;
 
-        var tmpl = template.Template.new(allocator, "page");
+        var tmpl = try template.Template.new(allocator, "page");
         defer tmpl.deinit();
 
         _ = try tmpl.parse(page_src);

@@ -50,7 +50,13 @@ pub const FlagSet = struct {
         self.actual_args.deinit(self.allocator);
     }
 
-    pub fn boolVar(self: *FlagSet, ptr: *bool, name: []const u8, def_val: bool, usage: []const u8) Allocator.Error!void {
+    pub fn boolVar(
+        self: *FlagSet,
+        ptr: *bool,
+        name: []const u8,
+        def_val: bool,
+        usage: []const u8,
+    ) Allocator.Error!void {
         ptr.* = def_val;
         const def_str = if (def_val) "true" else "false";
         try self.flags.append(self.allocator, .{
@@ -61,7 +67,13 @@ pub const FlagSet = struct {
         });
     }
 
-    pub fn intVar(self: *FlagSet, ptr: *i64, name: []const u8, def_val: i64, usage: []const u8) Allocator.Error!void {
+    pub fn intVar(
+        self: *FlagSet,
+        ptr: *i64,
+        name: []const u8,
+        def_val: i64,
+        usage: []const u8,
+    ) Allocator.Error!void {
         ptr.* = def_val;
         var buf: [32]u8 = undefined;
         const def_str = std.fmt.bufPrint(&buf, "{d}", .{def_val}) catch "0";
@@ -73,7 +85,13 @@ pub const FlagSet = struct {
         });
     }
 
-    pub fn stringVar(self: *FlagSet, ptr: *[]const u8, name: []const u8, def_val: []const u8, usage: []const u8) Allocator.Error!void {
+    pub fn stringVar(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        def_val: []const u8,
+        usage: []const u8,
+    ) Allocator.Error!void {
         ptr.* = def_val;
         try self.flags.append(self.allocator, .{
             .name = name,
@@ -83,7 +101,13 @@ pub const FlagSet = struct {
         });
     }
 
-    pub fn floatVar(self: *FlagSet, ptr: *f64, name: []const u8, def_val: f64, usage: []const u8) Allocator.Error!void {
+    pub fn floatVar(
+        self: *FlagSet,
+        ptr: *f64,
+        name: []const u8,
+        def_val: f64,
+        usage: []const u8,
+    ) Allocator.Error!void {
         ptr.* = def_val;
         var buf: [32]u8 = undefined;
         const def_str = std.fmt.bufPrint(&buf, "{d}", .{def_val}) catch "0.0";

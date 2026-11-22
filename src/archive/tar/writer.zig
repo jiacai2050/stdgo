@@ -68,7 +68,8 @@ pub const Writer = struct {
         }
     }
 
-    /// Close closes the tar archive by writing the padding and two 512-byte zero blocks, then flushing.
+    /// Close closes the tar archive by writing the padding and two 512-byte zero blocks,
+    /// then flushing.
     pub fn close(self: *Writer) anyerror!void {
         if (self.closed) return;
         try self.padPrevious();

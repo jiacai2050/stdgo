@@ -105,7 +105,11 @@ pub const UDPConn = struct {
         return self.readFromDeadline(buf, .none);
     }
 
-    pub fn readFromDeadline(self: *UDPConn, buf: []u8, deadline: Deadline) anyerror!PacketConn.ReadFromResult {
+    pub fn readFromDeadline(
+        self: *UDPConn,
+        buf: []u8,
+        deadline: Deadline,
+    ) anyerror!PacketConn.ReadFromResult {
         var message: std.Io.net.IncomingMessage = .init;
         const result = try self.operate(.{ .net_receive = .{
             .socket_handle = self.socket.handle,
@@ -190,7 +194,11 @@ pub const UDPConn = struct {
         return error.SocketUnconnected;
     }
 
-    fn operate(self: *UDPConn, operation: std.Io.Operation, deadline: Deadline) !std.Io.Operation.Result {
+    fn operate(
+        self: *UDPConn,
+        operation: std.Io.Operation,
+        deadline: Deadline,
+    ) !std.Io.Operation.Result {
         try deadline.validate();
         if (deadline.isNone()) return self.io.operate(operation);
         try deadline.check(self.io);
@@ -216,7 +224,11 @@ pub const UDPConn = struct {
         }
     }
 
-    fn operateTask(io: std.Io, operation: std.Io.Operation, ready: *std.Io.Event) std.Io.Cancelable!std.Io.Operation.Result {
+    fn operateTask(
+        io: std.Io,
+        operation: std.Io.Operation,
+        ready: *std.Io.Event,
+    ) std.Io.Cancelable!std.Io.Operation.Result {
         defer ready.set(io);
         return io.operate(operation);
     }
@@ -287,7 +299,8 @@ pub fn listenUDP(
 
     const hp = try hostport.splitHostPort(laddr);
     const port = std.fmt.parseInt(u16, hp.port, 10) catch return error.InvalidPort;
-    const bind_host = if (hp.host.len == 0 or std.mem.eql(u8, hp.host, "0.0.0.0")) "0.0.0.0" else hp.host;
+    const is_wildcard = hp.host.len == 0 or std.mem.eql(u8, hp.host, "0.0.0.0");
+    const bind_host = if (is_wildcard) "0.0.0.0" else hp.host;
 
     const bind_ip = try std.Io.net.IpAddress.parse(bind_host, port);
     const sock = try bind_ip.bind(io, .{ .mode = .dgram });

@@ -19,7 +19,10 @@ pub const Address = struct {
 
         var needs_quote = false;
         for (self.name) |c| {
-            if (c == '"' or c == '\\' or c == '(' or c == ')' or c == '<' or c == '>' or c == '[' or c == ']' or c == ':' or c == ';' or c == '@' or c == ',' or c == '.') {
+            if (c == '"' or c == '\\' or c == '(' or c == ')' or
+                c == '<' or c == '>' or c == '[' or c == ']' or
+                c == ':' or c == ';' or c == '@' or c == ',' or c == '.')
+            {
                 needs_quote = true;
                 break;
             }
@@ -61,7 +64,9 @@ pub fn parseAddress(allocator: Allocator, s_in: []const u8) ParseError!Address {
 
     // Check for angle bracket form: Name <addr>
     if (std.mem.indexOfScalar(u8, s, '<')) |start_idx| {
-        const end_idx = std.mem.lastIndexOfScalar(u8, s, '>') orelse return ParseError.InvalidAddress;
+        const end_idx = std.mem.lastIndexOfScalar(u8, s, '>') orelse {
+            return ParseError.InvalidAddress;
+        };
         if (end_idx <= start_idx) return ParseError.InvalidAddress;
 
         const raw_addr = std.mem.trim(u8, s[start_idx + 1 .. end_idx], " \t\r\n");
@@ -101,7 +106,9 @@ pub fn parseAddress(allocator: Allocator, s_in: []const u8) ParseError!Address {
 
     // Check for RFC 822 comment syntax: addr (Name)
     if (std.mem.indexOfScalar(u8, s, '(')) |start_idx| {
-        const end_idx = std.mem.lastIndexOfScalar(u8, s, ')') orelse return ParseError.InvalidAddress;
+        const end_idx = std.mem.lastIndexOfScalar(u8, s, ')') orelse {
+            return ParseError.InvalidAddress;
+        };
         if (end_idx <= start_idx) return ParseError.InvalidAddress;
 
         const raw_addr = std.mem.trim(u8, s[0..start_idx], " \t\r\n");

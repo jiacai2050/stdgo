@@ -144,10 +144,13 @@ test "mime/quotedprintable encode and decode" {
     try testing.expectEqualStrings(raw, dec);
 
     // Test soft line break =\r\n
-    const soft_break = "Now's the time =\r\nfor all good men\r\nto come to the aid of their country.";
+    const soft_break =
+        "Now's the time =\r\nfor all good men\r\nto come to the aid of their country.";
     const dec_soft = try decodeAlloc(allocator, soft_break);
     defer allocator.free(dec_soft);
-    try testing.expectEqualStrings("Now's the time for all good men\r\nto come to the aid of their country.", dec_soft);
+    const expected =
+        "Now's the time for all good men\r\nto come to the aid of their country.";
+    try testing.expectEqualStrings(expected, dec_soft);
 
     // Test soft line break =\n
     const soft_break_lf = "Soft break=\ntest";

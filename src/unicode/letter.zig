@@ -1,4 +1,5 @@
-//! Unicode category classification, casing rules, and simple case folding conforming to Go's unicode package.
+//! Unicode category classification, casing rules, and simple case folding
+//! conforming to Go's unicode package.
 const std = @import("std");
 
 pub const MaxRune: u21 = 0x10FFFF;
@@ -112,7 +113,30 @@ pub fn isSpace(r: u21) bool {
 pub fn isPunct(r: u21) bool {
     if (r <= MaxLatin1) {
         return switch (r) {
-            '!', '"', '#', '%', '&', '\'', '(', ')', '*', ',', '-', '.', '/', ':', ';', '?', '@', '[', '\\', ']', '_', '{', '}' => true,
+            '!',
+            '"',
+            '#',
+            '%',
+            '&',
+            '\'',
+            '(',
+            ')',
+            '*',
+            ',',
+            '-',
+            '.',
+            '/',
+            ':',
+            ';',
+            '?',
+            '@',
+            '[',
+            '\\',
+            ']',
+            '_',
+            '{',
+            '}',
+            => true,
             0xA1, 0xA7, 0xAB, 0xB6, 0xB7, 0xBB, 0xBF => true,
             else => false,
         };

@@ -70,7 +70,9 @@ pub fn parseMediaType(allocator: Allocator, v_in: []const u8) ParseError!MediaTy
         if (rest.len == 0) break;
 
         // Parse key
-        const eq_idx = std.mem.indexOfScalar(u8, rest, '=') orelse return ParseError.InvalidMediaType;
+        const eq_idx = std.mem.indexOfScalar(u8, rest, '=') orelse {
+            return ParseError.InvalidMediaType;
+        };
         const key_raw = std.mem.trim(u8, rest[0..eq_idx], " \t\r\n");
         if (key_raw.len == 0) return ParseError.InvalidMediaType;
 
@@ -129,7 +131,11 @@ pub fn parseMediaType(allocator: Allocator, v_in: []const u8) ParseError!MediaTy
 }
 
 /// FormatMediaType serializes mediatype and params into a canonical string.
-pub fn formatMediaType(allocator: Allocator, media_type: []const u8, params: *const std.StringHashMap([]const u8)) Allocator.Error![]u8 {
+pub fn formatMediaType(
+    allocator: Allocator,
+    media_type: []const u8,
+    params: *const std.StringHashMap([]const u8),
+) Allocator.Error![]u8 {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
 
@@ -229,7 +235,10 @@ pub fn typeByExtension(ext_in: []const u8) ?[]const u8 {
 
 /// ExtensionsByType returns the extensions known to be associated with the MIME type typ.
 /// The returned extensions each begin with a leading dot.
-pub fn extensionsByType(allocator: Allocator, typ_in: []const u8) Allocator.Error![]const []const u8 {
+pub fn extensionsByType(
+    allocator: Allocator,
+    typ_in: []const u8,
+) Allocator.Error![]const []const u8 {
     var base_typ = typ_in;
     if (std.mem.indexOfScalar(u8, base_typ, ';')) |idx| {
         base_typ = std.mem.trim(u8, base_typ[0..idx], " \t\r\n");
@@ -261,14 +270,16 @@ test "parseMediaType basic and parameters" {
     try testing.expectEqualStrings("utf-8", mt1.params.get("charset").?);
 
     // 2. Quoted parameters and case-insensitivity
-    var mt2 = try parseMediaType(testing.allocator, "application/JSON; Charset=\"utf-8\"; Key=\"val;with;semi\"");
+    const input2 = "application/JSON; Charset=\"utf-8\"; Key=\"val;with;semi\"";
+    var mt2 = try parseMediaType(testing.allocator, input2);
     defer mt2.deinit(testing.allocator);
     try testing.expectEqualStrings("application/json", mt2.media_type);
     try testing.expectEqualStrings("utf-8", mt2.params.get("charset").?);
     try testing.expectEqualStrings("val;with;semi", mt2.params.get("key").?);
 
     // 3. Content-Disposition with escapes
-    var mt3 = try parseMediaType(testing.allocator, "form-data; name=\"upload\"; filename=\"foo\\\"bar.txt\"");
+    const input3 = "form-data; name=\"upload\"; filename=\"foo\\\"bar.txt\"";
+    var mt3 = try parseMediaType(testing.allocator, input3);
     defer mt3.deinit(testing.allocator);
     try testing.expectEqualStrings("form-data", mt3.media_type);
     try testing.expectEqualStrings("upload", mt3.params.get("name").?);

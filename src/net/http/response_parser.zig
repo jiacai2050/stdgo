@@ -13,7 +13,9 @@ pub const ResponseHead = struct {
 };
 
 pub fn parseResponseHead(allocator: std.mem.Allocator, buf: []const u8) !ResponseHead {
-    const end_of_headers = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.IncompleteHeaders;
+    const end_of_headers = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse {
+        return error.IncompleteHeaders;
+    };
     const header_slice = buf[0..end_of_headers];
 
     var line_iter = std.mem.splitSequence(u8, header_slice, "\r\n");

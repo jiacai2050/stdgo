@@ -26,7 +26,9 @@ pub fn isNoProxy(no_proxy: []const u8, host_with_port: []const u8) bool {
     // Separate host and port
     var req_host = host_with_port;
     if (std.mem.lastIndexOfScalar(u8, host_with_port, ':')) |colon| {
-        if (!std.mem.startsWith(u8, host_with_port, "[") or std.mem.indexOfScalar(u8, host_with_port, ']') != null) {
+        if (!std.mem.startsWith(u8, host_with_port, "[") or
+            std.mem.indexOfScalar(u8, host_with_port, ']') != null)
+        {
             req_host = host_with_port[0..colon];
         }
     }
@@ -57,7 +59,11 @@ pub fn isNoProxy(no_proxy: []const u8, host_with_port: []const u8) bool {
 }
 
 /// Resolves proxy from system environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY).
-pub fn proxyFromEnvironment(allocator: Allocator, scheme: []const u8, host: []const u8) !?[]const u8 {
+pub fn proxyFromEnvironment(
+    allocator: Allocator,
+    scheme: []const u8,
+    host: []const u8,
+) !?[]const u8 {
     return proxyFromEnvWithLookup(allocator, scheme, host, getEnv);
 }
 
@@ -123,8 +129,9 @@ pub fn proxyFromEnvWithLookup(
         if (trimmed.len > 0) {
             // Accept http://, https://, socks5://, or socks5h:// proxy schemes.
             // Note: `socks5://` historically indicated local DNS resolution, whereas `socks5h://`
-            // explicitly requests remote DNS resolution at the proxy host to prevent DNS leaks/poisoning.
-            // stdgo treats both transparently by passing the remote domain to the SOCKS5 handshake (RFC 1928 ATYP 0x03).
+            // explicitly requests remote DNS resolution at the proxy host to prevent DNS
+            // leaks or poisoning. stdgo treats both transparently by passing the remote
+            // domain to the SOCKS5 handshake (RFC 1928 ATYP 0x03).
             if (std.mem.startsWith(u8, trimmed, "http://") or
                 std.mem.startsWith(u8, trimmed, "https://") or
                 std.mem.startsWith(u8, trimmed, "socks5://") or
@@ -214,11 +221,12 @@ pub fn parseProxyDetails(allocator: Allocator, raw_proxy_url: []const u8) !Proxy
 
 test "proxy isNoProxy wildcard and suffix" {
     try std.testing.expect(isNoProxy("*", "example.com:80"));
-    try std.testing.expect(isNoProxy("localhost, 127.0.0.1, .internal.net", "localhost:8080"));
-    try std.testing.expect(isNoProxy("localhost, 127.0.0.1, .internal.net", "service.internal.net"));
-    try std.testing.expect(isNoProxy("localhost, 127.0.0.1, .internal.net", "internal.net"));
-    try std.testing.expect(!isNoProxy("localhost, 127.0.0.1, .internal.net", "external.com"));
-    try std.testing.expect(!isNoProxy("localhost, 127.0.0.1, .internal.net", "fakeinternal.net"));
+    const no_proxy_rule = "localhost, 127.0.0.1, .internal.net";
+    try std.testing.expect(isNoProxy(no_proxy_rule, "localhost:8080"));
+    try std.testing.expect(isNoProxy(no_proxy_rule, "service.internal.net"));
+    try std.testing.expect(isNoProxy(no_proxy_rule, "internal.net"));
+    try std.testing.expect(!isNoProxy(no_proxy_rule, "external.com"));
+    try std.testing.expect(!isNoProxy(no_proxy_rule, "fakeinternal.net"));
 }
 
 test "proxy parseProxyDetails basic auth" {

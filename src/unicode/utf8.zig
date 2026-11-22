@@ -5,7 +5,8 @@ const std = @import("std");
 
 /// Numbers fundamental to the encoding.
 pub const RuneError: u21 = 0xFFFD; // the "error" Rune or "Unicode replacement character"
-pub const RuneSelf: u8 = 0x80; // characters below RuneSelf are represented as themselves in a single byte
+// Characters below RuneSelf are represented as themselves in a single byte
+pub const RuneSelf: u8 = 0x80;
 pub const MaxRune: u21 = 0x10FFFF; // maximum valid Unicode code point
 pub const UTFMax: usize = 4; // maximum number of bytes of a UTF-8 encoded Unicode character
 
@@ -91,9 +92,13 @@ pub fn decodeRune(p: []const u8) Decoded {
         const b2 = p[2];
         if (b1 < tx or b1 >= t2 or b2 < tx or b2 >= t2) return .{ .rune = RuneError, .size = 1 };
 
-        const r: u21 = (@as(u21, b0 & mask3) << 12) | (@as(u21, b1 & maskx) << 6) | @as(u21, b2 & maskx);
+        const r: u21 = (@as(u21, b0 & mask3) << 12) |
+            (@as(u21, b1 & maskx) << 6) | @as(u21, b2 & maskx);
         if (r <= rune2_max) return .{ .rune = RuneError, .size = 1 }; // non-shortest
-        if (r >= surrogate_min and r <= surrogate_max) return .{ .rune = RuneError, .size = 1 }; // surrogate
+        // surrogate
+        if (r >= surrogate_min and r <= surrogate_max) {
+            return .{ .rune = RuneError, .size = 1 };
+        }
         return .{ .rune = r, .size = 3 };
     }
 
@@ -103,9 +108,14 @@ pub fn decodeRune(p: []const u8) Decoded {
         const b1 = p[1];
         const b2 = p[2];
         const b3 = p[3];
-        if (b1 < tx or b1 >= t2 or b2 < tx or b2 >= t2 or b3 < tx or b3 >= t2) return .{ .rune = RuneError, .size = 1 };
+        if (b1 < tx or b1 >= t2 or b2 < tx or b2 >= t2 or b3 < tx or b3 >= t2) {
+            return .{ .rune = RuneError, .size = 1 };
+        }
 
-        const r: u21 = (@as(u21, b0 & mask4) << 18) | (@as(u21, b1 & maskx) << 12) | (@as(u21, b2 & maskx) << 6) | @as(u21, b3 & maskx);
+        const r: u21 = (@as(u21, b0 & mask4) << 18) |
+            (@as(u21, b1 & maskx) << 12) |
+            (@as(u21, b2 & maskx) << 6) |
+            @as(u21, b3 & maskx);
         if (r <= rune3_max) return .{ .rune = RuneError, .size = 1 }; // non-shortest
         if (r > MaxRune) return .{ .rune = RuneError, .size = 1 }; // beyond Unicode limit
         return .{ .rune = r, .size = 4 };

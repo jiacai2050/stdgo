@@ -6,11 +6,22 @@ pub fn connect(io: std.Io, host: []const u8, port: u16, deadline: Deadline) !std
     return connectWithOrder(io, host, port, deadline, false);
 }
 
-pub fn connectOrdered(io: std.Io, host: []const u8, port: u16, deadline: Deadline) !std.Io.net.Stream {
+pub fn connectOrdered(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    deadline: Deadline,
+) !std.Io.net.Stream {
     return connectWithOrder(io, host, port, deadline, true);
 }
 
-fn connectWithOrder(io: std.Io, host: []const u8, port: u16, deadline: Deadline, ordered: bool) !std.Io.net.Stream {
+fn connectWithOrder(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    deadline: Deadline,
+    ordered: bool,
+) !std.Io.net.Stream {
     try deadline.validate();
     try deadline.check(io);
     if (deadline.isNone()) return connectInner(io, host, port, ordered);
@@ -39,7 +50,13 @@ fn connectWithOrder(io: std.Io, host: []const u8, port: u16, deadline: Deadline,
     }
 }
 
-fn connectTask(io: std.Io, host: []const u8, port: u16, ordered: bool, ready: *std.Io.Event) !std.Io.net.Stream {
+fn connectTask(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    ordered: bool,
+    ready: *std.Io.Event,
+) !std.Io.net.Stream {
     defer ready.set(io);
     return connectInner(io, host, port, ordered);
 }
@@ -78,9 +95,7 @@ fn connectInner(io: std.Io, host: []const u8, port: u16, ordered: bool) !std.Io.
 }
 
 test "connect deadline cancels a stalled dial" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const base_io = threaded.io();
+    const base_io = std.testing.io;
     const Stub = struct {
         fn dial(
             userdata: ?*anyopaque,

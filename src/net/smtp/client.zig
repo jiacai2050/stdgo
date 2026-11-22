@@ -152,7 +152,9 @@ pub const Client = struct {
     /// Sends a formatted command string and returns the response.
     pub fn cmd(self: *Client, comptime fmt: []const u8, args: anytype) !Response {
         var cmd_buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&cmd_buf, fmt ++ "\r\n", args) catch return error.SmtpCommandFailed;
+        const msg = std.fmt.bufPrint(&cmd_buf, fmt ++ "\r\n", args) catch {
+            return error.SmtpCommandFailed;
+        };
         const sent = try self.conn.write(msg);
         std.debug.assert(sent == msg.len);
         return self.readResponse();
@@ -185,7 +187,8 @@ pub const Client = struct {
                 var auth_it = std.mem.splitScalar(u8, rest, ' ');
                 while (auth_it.next()) |mech| {
                     if (mech.len > 0) {
-                        try self.auth_mechanisms.append(self.allocator, try self.allocator.dupe(u8, mech));
+                        const m = try self.allocator.dupe(u8, mech);
+                        try self.auth_mechanisms.append(self.allocator, m);
                     }
                 }
             }
@@ -239,7 +242,9 @@ pub const Client = struct {
             const dec_len = try base64.std_encoding.decode(dec_buf, raw_chal);
 
             // Compute response
-            const auth_reply = (try a.next(dec_buf[0..dec_len], true)) orelse return error.SmtpAuthFailed;
+            const auth_reply = (try a.next(dec_buf[0..dec_len], true)) orelse {
+                return error.SmtpAuthFailed;
+            };
             defer self.allocator.free(auth_reply);
 
             // Base64 encode reply

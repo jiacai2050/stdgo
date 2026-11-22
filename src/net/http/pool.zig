@@ -121,7 +121,8 @@ pub const ConnPool = struct {
             i -= 1;
             const entry = self.entries.items[i];
             if (entry.expires) |expires| {
-                if (expires.raw.nanoseconds <= std.Io.Clock.awake.now(entry.conn.stream_reader.io).nanoseconds) {
+                const now_ns = std.Io.Clock.awake.now(entry.conn.stream_reader.io).nanoseconds;
+                if (expires.raw.nanoseconds <= now_ns) {
                     self.allocator.free(entry.host);
                     _ = self.entries.swapRemove(i);
                     entry.conn.close(entry.conn.stream_reader.io);
@@ -129,7 +130,10 @@ pub const ConnPool = struct {
                     continue;
                 }
             }
-            if (entry.port == port and entry.is_tls == is_tls and std.mem.eql(u8, entry.host, host)) {
+            if (entry.port == port and
+                entry.is_tls == is_tls and
+                std.mem.eql(u8, entry.host, host))
+            {
                 const conn = entry.conn;
                 self.allocator.free(entry.host);
                 _ = self.entries.swapRemove(i);
@@ -139,11 +143,21 @@ pub const ConnPool = struct {
         return null;
     }
 
-    pub fn release(self: *ConnPool, io: std.Io, host: []const u8, port: u16, is_tls: bool, conn: *HttpConn) void {
+    pub fn release(
+        self: *ConnPool,
+        io: std.Io,
+        host: []const u8,
+        port: u16,
+        is_tls: bool,
+        conn: *HttpConn,
+    ) void {
         self.mutex.lock();
         var count: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.port == port and entry.is_tls == is_tls and std.mem.eql(u8, entry.host, host)) {
+            if (entry.port == port and
+                entry.is_tls == is_tls and
+                std.mem.eql(u8, entry.host, host))
+            {
                 count += 1;
             }
         }
@@ -169,7 +183,10 @@ pub const ConnPool = struct {
             .conn = conn,
             .expires = if (self.idle_timeout) |duration| .{
                 .clock = .awake,
-                .raw = .{ .nanoseconds = std.Io.Clock.awake.now(io).nanoseconds +| duration.nanoseconds },
+                .raw = .{
+                    .nanoseconds = std.Io.Clock.awake.now(io).nanoseconds +|
+                        duration.nanoseconds,
+                },
             } else null,
         }) catch {
             self.mutex.unlock();
@@ -208,9 +225,7 @@ pub const ConnPool = struct {
 
 test "idle connections are closed without another request" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);

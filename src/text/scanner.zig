@@ -1,6 +1,7 @@
 //! Package text/scanner provides a lexical scanner and tokenizer for UTF-8-encoded text.
 //!
-//! Takes text input and splits it into tokens (ident, int, float, char, string, raw string, comment),
+//! Takes text input and splits it into tokens (ident, int, float, char, string, raw string,
+//! comment),
 //! accurately reporting the file, line, and column position of each token.
 
 const std = @import("std");
@@ -37,7 +38,8 @@ pub const ScanComments: u32 = 1 << 6;
 pub const SkipComments: u32 = 1 << 7;
 
 /// GoTokens enables all standard Go lexical token types.
-pub const GoTokens: u32 = ScanIdents | ScanInts | ScanFloats | ScanChars | ScanStrings | ScanRawStrings | ScanComments | SkipComments;
+pub const GoTokens: u32 = ScanIdents | ScanInts | ScanFloats | ScanChars | ScanStrings |
+    ScanRawStrings | ScanComments | SkipComments;
 
 /// Scanner holds the state for tokenizing UTF-8 text.
 pub const Scanner = struct {
@@ -177,7 +179,9 @@ pub const Scanner = struct {
     fn consumeIdent(self: *Scanner) void {
         while (self.pos_idx < self.src.len) {
             const c = self.src[self.pos_idx];
-            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') {
+            const is_ident = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '_';
+            if (is_ident) {
                 self.advance();
             } else {
                 break;
@@ -191,12 +195,16 @@ pub const Scanner = struct {
         // Base prefix: 0x, 0b, 0o
         if (self.src[self.pos_idx] == '0' and self.pos_idx + 1 < self.src.len) {
             const next = self.src[self.pos_idx + 1];
-            if (next == 'x' or next == 'X' or next == 'b' or next == 'B' or next == 'o' or next == 'O') {
+            if (next == 'x' or next == 'X' or next == 'b' or
+                next == 'B' or next == 'o' or next == 'O')
+            {
                 self.advance();
                 self.advance();
                 while (self.pos_idx < self.src.len) {
                     const c = self.src[self.pos_idx];
-                    if ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') or c == '_') {
+                    const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or
+                        (c >= 'A' and c <= 'F') or c == '_';
+                    if (is_hex) {
                         self.advance();
                     } else {
                         break;
@@ -211,7 +219,10 @@ pub const Scanner = struct {
             if (c >= '0' and c <= '9') {
                 self.advance();
             } else if (c == '.') {
-                if (self.pos_idx + 1 < self.src.len and self.src[self.pos_idx + 1] >= '0' and self.src[self.pos_idx + 1] <= '9') {
+                if (self.pos_idx + 1 < self.src.len and
+                    self.src[self.pos_idx + 1] >= '0' and
+                    self.src[self.pos_idx + 1] <= '9')
+                {
                     is_float = true;
                     self.advance();
                 } else {
@@ -220,7 +231,9 @@ pub const Scanner = struct {
             } else if (c == 'e' or c == 'E') {
                 is_float = true;
                 self.advance();
-                if (self.pos_idx < self.src.len and (self.src[self.pos_idx] == '+' or self.src[self.pos_idx] == '-')) {
+                if (self.pos_idx < self.src.len and
+                    (self.src[self.pos_idx] == '+' or self.src[self.pos_idx] == '-'))
+                {
                     self.advance();
                 }
             } else if (c == '_') {

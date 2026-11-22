@@ -21,7 +21,10 @@ pub const Regexp = struct {
 
     pub fn mustCompile(allocator: Allocator, expr: []const u8) Regexp {
         return compile(allocator, expr) catch |err| {
-            std.debug.panic("regexp.mustCompile: invalid pattern '{s}', error: {any}", .{ expr, err });
+            std.debug.panic(
+                "regexp.mustCompile: invalid pattern '{s}', error: {any}",
+                .{ expr, err },
+            );
         };
     }
 
@@ -40,7 +43,8 @@ pub const Regexp = struct {
         return self.match(s);
     }
 
-    /// FindString returns a string holding the text of the leftmost match of the regular expression.
+    /// FindString returns a string holding the text of the leftmost match of the regular
+    /// expression.
     pub fn findString(self: *const Regexp, s: []const u8) ?[]const u8 {
         const vm = exec_mod.VM.init(self.allocator, &self.prog);
         if (vm.find(s) catch null) |res| {
@@ -51,7 +55,12 @@ pub const Regexp = struct {
 
     /// ReplaceAllString returns a copy of src in which all matches of the Regexp
     /// have been replaced by the repl string.
-    pub fn replaceAllString(self: *const Regexp, allocator: Allocator, src: []const u8, repl: []const u8) anyerror![]u8 {
+    pub fn replaceAllString(
+        self: *const Regexp,
+        allocator: Allocator,
+        src: []const u8,
+        repl: []const u8,
+    ) anyerror![]u8 {
         var buf = bytes.Buffer.init(allocator);
         defer buf.deinit();
 

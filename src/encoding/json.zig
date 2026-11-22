@@ -54,7 +54,10 @@ pub const Decoder = struct {
     /// Token returns the next JSON token in the input stream.
     /// At the end of the input stream, Token returns null.
     pub fn token(self: *Decoder) !?Token {
-        const raw_tok = self.json_reader.nextAlloc(self.allocator, .alloc_if_needed) catch |err| switch (err) {
+        const raw_tok = self.json_reader.nextAlloc(
+            self.allocator,
+            .alloc_if_needed,
+        ) catch |err| switch (err) {
             error.EndOfStream => return null,
             else => |e| return e,
         };
@@ -79,17 +82,21 @@ pub const Decoder = struct {
     /// More reports whether there is another element in the current array or object being parsed.
     pub fn more(self: *Decoder) bool {
         const next_type = self.json_reader.peekNextTokenType() catch return false;
-        return next_type != .array_end and next_type != .object_end and next_type != .end_of_document;
+        return next_type != .array_end and
+            next_type != .object_end and
+            next_type != .end_of_document;
     }
 
-    /// Decode reads the next JSON-encoded value from its input and stores it in the value pointed to by T.
+    /// Decode reads the next JSON-encoded value from its input and stores it in the
+    /// value pointed to by T.
     pub fn decode(self: *Decoder, comptime T: type) !std.json.Parsed(T) {
         return std.json.parseFromTokenSource(T, self.allocator, &self.json_reader, .{
             .ignore_unknown_fields = true,
         });
     }
 
-    /// DecodeLeaky parses without retaining individual allocations. Best used with an arena allocator.
+    /// DecodeLeaky parses without retaining individual allocations. Best used with
+    /// an arena allocator.
     pub fn decodeLeaky(self: *Decoder, comptime T: type) !T {
         return std.json.parseFromTokenSourceLeaky(T, self.allocator, &self.json_reader, .{
             .ignore_unknown_fields = true,
@@ -175,7 +182,12 @@ pub fn marshal(allocator: Allocator, value: anytype) ![]u8 {
 }
 
 /// MarshalIndent is like Marshal but applies Indent to format the output.
-pub fn marshalIndent(allocator: Allocator, value: anytype, prefix: []const u8, indent: []const u8) ![]u8 {
+pub fn marshalIndent(
+    allocator: Allocator,
+    value: anytype,
+    prefix: []const u8,
+    indent: []const u8,
+) ![]u8 {
     var buf = bytes_mod.Buffer.init(allocator);
     errdefer buf.deinit();
 
@@ -201,7 +213,8 @@ pub fn unmarshal(allocator: Allocator, comptime T: type, data: []const u8) !std.
     });
 }
 
-/// UnmarshalLeaky parses the JSON-encoded data using the provided allocator without tracking individual frees.
+/// UnmarshalLeaky parses the JSON-encoded data using the provided allocator
+/// without tracking individual frees.
 pub fn unmarshalLeaky(allocator: Allocator, comptime T: type, data: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, allocator, data, .{
         .ignore_unknown_fields = true,

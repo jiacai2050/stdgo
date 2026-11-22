@@ -40,7 +40,12 @@ pub const Writer = struct {
         return initWithLevel(allocator, w, header, flate.DefaultCompression);
     }
 
-    pub fn initWithLevel(allocator: Allocator, w: *io.Writer, header: Header, level: i32) anyerror!Writer {
+    pub fn initWithLevel(
+        allocator: Allocator,
+        w: *io.Writer,
+        header: Header,
+        level: i32,
+    ) anyerror!Writer {
         // Write 10-byte fixed header
         var hdr: [10]u8 = undefined;
         hdr[0] = gzip_id1;
@@ -247,7 +252,8 @@ test "compress.gzip write and readroundtrip" {
     var gz_buf = bytes.Buffer.init(testing.allocator);
     defer gz_buf.deinit();
 
-    const original_text = "Standard Go gzip implementation in Zig 0.17! With real DEFLATE stream compression.";
+    const original_text =
+        "Standard Go gzip implementation in Zig 0.17! With real DEFLATE stream compression.";
 
     // 1. Write gzip
     var gw = try Writer.init(testing.allocator, gz_buf.writer(), .{

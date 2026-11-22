@@ -80,7 +80,12 @@ pub const BinarySearchResult = struct {
 };
 
 /// BinarySearch searches for target in a sorted slice.
-pub fn binarySearch(comptime T: type, s: []const T, target: T, comptime lessFn: fn (a: T, b: T) bool) BinarySearchResult {
+pub fn binarySearch(
+    comptime T: type,
+    s: []const T,
+    target: T,
+    comptime lessFn: fn (a: T, b: T) bool,
+) BinarySearchResult {
     var lo: usize = 0;
     var hi: usize = s.len;
     while (lo < hi) {

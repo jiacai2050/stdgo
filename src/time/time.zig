@@ -169,7 +169,10 @@ pub const Time = struct {
         const z = days + 719468;
         const era = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
         const doe = z - era * 146097;
-        const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+        const doe_adj = doe - @divFloor(doe, 1460) +
+            @divFloor(doe, 36524) -
+            @divFloor(doe, 146096);
+        const yoe = @divFloor(doe_adj, 365);
         const y = yoe + era * 400;
         const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
         const mp = @divFloor(5 * doy + 2, 153);
@@ -221,7 +224,9 @@ pub const Time = struct {
     pub fn yearDay(self: Time) u16 {
         const c = self.civil();
         const start_of_year = date(c.y, .January, 1, 0, 0, 0, 0, self.loc);
-        const days = @divFloor(self.wall_sec + self.loc.offset_sec - (start_of_year.wall_sec + start_of_year.loc.offset_sec), 86400);
+        const cur_sec = self.wall_sec + self.loc.offset_sec;
+        const soy_sec = start_of_year.wall_sec + start_of_year.loc.offset_sec;
+        const days = @divFloor(cur_sec - soy_sec, 86400);
         return @intCast(days + 1);
     }
 
@@ -303,14 +308,20 @@ pub const Time = struct {
             } else if (std.mem.startsWith(u8, layout[i..], "pm")) {
                 try w.writeAll(if (c.h >= 12) "pm" else "am");
                 i += 2;
-            } else if (std.mem.startsWith(u8, layout[i..], ".000000000") or std.mem.startsWith(u8, layout[i..], ".999999999")) {
+            } else if (std.mem.startsWith(u8, layout[i..], ".000000000") or
+                std.mem.startsWith(u8, layout[i..], ".999999999"))
+            {
                 try w.print(".{d:0>9}", .{self.nanosecond()});
                 i += 10;
-            } else if (std.mem.startsWith(u8, layout[i..], ".000000") or std.mem.startsWith(u8, layout[i..], ".999999")) {
+            } else if (std.mem.startsWith(u8, layout[i..], ".000000") or
+                std.mem.startsWith(u8, layout[i..], ".999999"))
+            {
                 const micros: u32 = @divFloor(self.nanosecond(), 1000);
                 try w.print(".{d:0>6}", .{micros});
                 i += 7;
-            } else if (std.mem.startsWith(u8, layout[i..], ".000") or std.mem.startsWith(u8, layout[i..], ".999")) {
+            } else if (std.mem.startsWith(u8, layout[i..], ".000") or
+                std.mem.startsWith(u8, layout[i..], ".999"))
+            {
                 const millis: u32 = @divFloor(self.nanosecond(), 1_000_000);
                 try w.print(".{d:0>3}", .{millis});
                 i += 4;
@@ -375,7 +386,16 @@ fn formatOffset(offset_sec: i32, with_colon: bool, w: *std.Io.Writer) !void {
 }
 
 /// Constructs a Time value from its civil calendar date and time parts.
-pub fn date(y_in: i32, m: Month, d_in: u8, hour: u8, min: u8, sec: u8, nsec: u32, loc_in: ?Location) Time {
+pub fn date(
+    y_in: i32,
+    m: Month,
+    d_in: u8,
+    hour: u8,
+    min: u8,
+    sec: u8,
+    nsec: u32,
+    loc_in: ?Location,
+) Time {
     var y = y_in;
     const m_val: u8 = @backingInt(m);
     if (m_val <= 2) y -= 1;
@@ -423,12 +443,16 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
 
         if (std.mem.startsWith(u8, layout[li..], "2006")) {
             if (vi + 4 > value.len) return ParseError.InvalidFormat;
-            y = std.fmt.parseInt(i32, value[vi .. vi + 4], 10) catch return ParseError.InvalidFormat;
+            y = std.fmt.parseInt(i32, value[vi .. vi + 4], 10) catch {
+                return ParseError.InvalidFormat;
+            };
             li += 4;
             vi += 4;
         } else if (std.mem.startsWith(u8, layout[li..], "06")) {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
-            const yy = std.fmt.parseInt(i32, value[vi .. vi + 2], 10) catch return ParseError.InvalidFormat;
+            const yy = std.fmt.parseInt(i32, value[vi .. vi + 2], 10) catch {
+                return ParseError.InvalidFormat;
+            };
             y = if (yy >= 69) 1900 + yy else 2000 + yy;
             li += 2;
             vi += 2;
@@ -460,7 +484,9 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             li += 3;
         } else if (std.mem.startsWith(u8, layout[li..], "01")) {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
-            const month_num = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch return ParseError.InvalidFormat;
+            const month_num = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
+                return ParseError.InvalidFormat;
+            };
             if (month_num < 1 or month_num > 12) return ParseError.ValueOutOfRange;
             m = @fromBackingInt(@intCast(month_num));
             li += 2;
@@ -489,29 +515,41 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             }
             if (!found) return ParseError.InvalidFormat;
             li += 3;
-        } else if (std.mem.startsWith(u8, layout[li..], "02") or std.mem.startsWith(u8, layout[li..], "_2")) {
+        } else if (std.mem.startsWith(u8, layout[li..], "02") or
+            std.mem.startsWith(u8, layout[li..], "_2"))
+        {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
             const s = std.mem.trimStart(u8, value[vi .. vi + 2], " ");
             d = std.fmt.parseInt(u8, s, 10) catch return ParseError.InvalidFormat;
             if (d < 1 or d > 31) return ParseError.ValueOutOfRange;
             li += 2;
             vi += 2;
-        } else if (std.mem.startsWith(u8, layout[li..], "15") or std.mem.startsWith(u8, layout[li..], "03")) {
+        } else if (std.mem.startsWith(u8, layout[li..], "15") or
+            std.mem.startsWith(u8, layout[li..], "03"))
+        {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
-            hour = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch return ParseError.InvalidFormat;
+            hour = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
+                return ParseError.InvalidFormat;
+            };
             li += 2;
             vi += 2;
         } else if (std.mem.startsWith(u8, layout[li..], "04")) {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
-            min = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch return ParseError.InvalidFormat;
+            min = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
+                return ParseError.InvalidFormat;
+            };
             li += 2;
             vi += 2;
         } else if (std.mem.startsWith(u8, layout[li..], "05")) {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
-            sec = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch return ParseError.InvalidFormat;
+            sec = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
+                return ParseError.InvalidFormat;
+            };
             li += 2;
             vi += 2;
-        } else if (std.mem.startsWith(u8, layout[li..], "PM") or std.mem.startsWith(u8, layout[li..], "pm")) {
+        } else if (std.mem.startsWith(u8, layout[li..], "PM") or
+            std.mem.startsWith(u8, layout[li..], "pm"))
+        {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
             if (std.ascii.eqlIgnoreCase(value[vi .. vi + 2], "PM")) {
                 pm = true;
@@ -520,7 +558,9 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             } else return ParseError.InvalidFormat;
             li += 2;
             vi += 2;
-        } else if (std.mem.startsWith(u8, layout[li..], ".000000000") or std.mem.startsWith(u8, layout[li..], ".999999999")) {
+        } else if (std.mem.startsWith(u8, layout[li..], ".000000000") or
+            std.mem.startsWith(u8, layout[li..], ".999999999"))
+        {
             li += 10;
             if (vi < value.len and value[vi] == '.') {
                 vi += 1;
@@ -537,7 +577,9 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
                 }
                 nsec = ns;
             }
-        } else if (std.mem.startsWith(u8, layout[li..], ".000") or std.mem.startsWith(u8, layout[li..], ".999")) {
+        } else if (std.mem.startsWith(u8, layout[li..], ".000") or
+            std.mem.startsWith(u8, layout[li..], ".999"))
+        {
             li += 4;
             if (vi < value.len and value[vi] == '.') {
                 vi += 1;
@@ -554,7 +596,9 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
                 }
                 nsec = ms * 1_000_000;
             }
-        } else if (std.mem.startsWith(u8, layout[li..], "Z07:00") or std.mem.startsWith(u8, layout[li..], "-07:00")) {
+        } else if (std.mem.startsWith(u8, layout[li..], "Z07:00") or
+            std.mem.startsWith(u8, layout[li..], "-07:00"))
+        {
             const has_z = std.mem.startsWith(u8, layout[li..], "Z");
             li += 6;
             if (has_z and vi < value.len and (value[vi] == 'Z' or value[vi] == 'z')) {
@@ -565,15 +609,25 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
                 if (vi + 6 > value.len) return ParseError.InvalidFormat;
                 const sign_ch = value[vi];
                 if (sign_ch != '+' and sign_ch != '-') return ParseError.InvalidFormat;
-                const oh = std.fmt.parseInt(i32, value[vi + 1 .. vi + 3], 10) catch return ParseError.InvalidFormat;
+                const oh = std.fmt.parseInt(
+                    i32,
+                    value[vi + 1 .. vi + 3],
+                    10,
+                ) catch return ParseError.InvalidFormat;
                 if (value[vi + 3] != ':') return ParseError.InvalidFormat;
-                const om = std.fmt.parseInt(i32, value[vi + 4 .. vi + 6], 10) catch return ParseError.InvalidFormat;
+                const om = std.fmt.parseInt(
+                    i32,
+                    value[vi + 4 .. vi + 6],
+                    10,
+                ) catch return ParseError.InvalidFormat;
                 const total = oh * 3600 + om * 60;
                 offset_sec = if (sign_ch == '-') -total else total;
                 zone_name = value[vi .. vi + 6];
                 vi += 6;
             }
-        } else if (std.mem.startsWith(u8, layout[li..], "Z0700") or std.mem.startsWith(u8, layout[li..], "-0700")) {
+        } else if (std.mem.startsWith(u8, layout[li..], "Z0700") or
+            std.mem.startsWith(u8, layout[li..], "-0700"))
+        {
             const has_z = std.mem.startsWith(u8, layout[li..], "Z");
             li += 5;
             if (has_z and vi < value.len and (value[vi] == 'Z' or value[vi] == 'z')) {
@@ -584,8 +638,16 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
                 if (vi + 5 > value.len) return ParseError.InvalidFormat;
                 const sign_ch = value[vi];
                 if (sign_ch != '+' and sign_ch != '-') return ParseError.InvalidFormat;
-                const oh = std.fmt.parseInt(i32, value[vi + 1 .. vi + 3], 10) catch return ParseError.InvalidFormat;
-                const om = std.fmt.parseInt(i32, value[vi + 3 .. vi + 5], 10) catch return ParseError.InvalidFormat;
+                const oh = std.fmt.parseInt(
+                    i32,
+                    value[vi + 1 .. vi + 3],
+                    10,
+                ) catch return ParseError.InvalidFormat;
+                const om = std.fmt.parseInt(
+                    i32,
+                    value[vi + 3 .. vi + 5],
+                    10,
+                ) catch return ParseError.InvalidFormat;
                 const total = oh * 3600 + om * 60;
                 offset_sec = if (sign_ch == '-') -total else total;
                 zone_name = value[vi .. vi + 5];
@@ -595,7 +657,10 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             li += 3;
             // Parse alphanumeric timezone name, e.g. UTC, GMT, CST
             const v_start = vi;
-            while (vi < value.len and ((value[vi] >= 'A' and value[vi] <= 'Z') or (value[vi] >= 'a' and value[vi] <= 'z'))) : (vi += 1) {}
+            while (vi < value.len and
+                ((value[vi] >= 'A' and value[vi] <= 'Z') or
+                    (value[vi] >= 'a' and value[vi] <= 'z'))) : (vi += 1)
+            {}
             if (vi == v_start) return ParseError.InvalidFormat;
             zone_name = value[v_start..vi];
             if (std.mem.eql(u8, zone_name, "UTC") or std.mem.eql(u8, zone_name, "GMT")) {
@@ -631,9 +696,7 @@ pub fn sleep(io: std.Io, d: Duration) !void {
 test "time.Time now and add/sub" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const t_now = Time.now(io);
     try testing.expect(t_now.wall_sec > 0);
@@ -674,7 +737,8 @@ test "time calendar breakdown and date construction" {
 test "time format and parse standard layouts" {
     const testing = std.testing;
 
-    const t0 = date(2026, .November, 15, 14, 30, 45, 123_000_000, Location.fixedZone("CST", 8 * 3600));
+    const loc = Location.fixedZone("CST", 8 * 3600);
+    const t0 = date(2026, .November, 15, 14, 30, 45, 123_000_000, loc);
 
     // RFC3339 format
     var buf: [64]u8 = undefined;

@@ -310,7 +310,11 @@ pub fn chmod(io: Io, path: []const u8, mode: u32) !void {
 /// IsNotExist returns a boolean indicating whether the error is known to
 /// report that a file or directory does not exist.
 pub fn isNotExist(err: anyerror) bool {
-    return err == error.FileNotFound or err == error.UnknownUser or err == error.UnknownGroup or err == error.UnknownUserId or err == error.UnknownGroupId;
+    return err == error.FileNotFound or
+        err == error.UnknownUser or
+        err == error.UnknownGroup or
+        err == error.UnknownUserId or
+        err == error.UnknownGroupId;
 }
 
 /// IsExist returns a boolean indicating whether the error is known to report
@@ -331,9 +335,7 @@ pub fn isPermission(err: anyerror) bool {
 
 test "os.file: create, write, seek, read, remove" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const test_dir = "test_os_scratch_dir";
     mkdirAll(io, test_dir, 0o755) catch {};

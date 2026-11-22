@@ -12,7 +12,12 @@ pub const HttpConn = struct {
     stream_writer: io_util.SocketWriter = undefined,
     tls_mem: ?[]u8 = null,
 
-    pub fn initPlain(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, deadline: Deadline) !*HttpConn {
+    pub fn initPlain(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        deadline: Deadline,
+    ) !*HttpConn {
         const buf_size = 16 * 1024;
         const mem = try allocator.alloc(u8, buf_size * 2);
         errdefer allocator.free(mem);

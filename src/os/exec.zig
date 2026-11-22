@@ -26,9 +26,18 @@ pub const Cmd = struct {
 
         try io.checkCancel();
 
-        const stdin_mode: std.process.SpawnOptions.StdIo = if (self.stdin != null) .pipe else .inherit;
-        const stdout_mode: std.process.SpawnOptions.StdIo = if (self.stdout != null) .pipe else .inherit;
-        const stderr_mode: std.process.SpawnOptions.StdIo = if (self.stderr != null) .pipe else .inherit;
+        const stdin_mode: std.process.SpawnOptions.StdIo = if (self.stdin != null)
+            .pipe
+        else
+            .inherit;
+        const stdout_mode: std.process.SpawnOptions.StdIo = if (self.stdout != null)
+            .pipe
+        else
+            .inherit;
+        const stderr_mode: std.process.SpawnOptions.StdIo = if (self.stderr != null)
+            .pipe
+        else
+            .inherit;
 
         const cwd_mode: Child.Cwd = if (self.dir) |d| .{ .path = d } else .inherit;
 
@@ -128,9 +137,7 @@ pub fn command(allocator: Allocator, argv: []const []const u8) Cmd {
 
 test "os.exec: command and output" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const argv = [_][]const u8{ "echo", "hello stdgo exec" };
     var cmd = command(testing.allocator, &argv);
@@ -142,9 +149,7 @@ test "os.exec: command and output" {
 
 test "os.exec: stdin piping via bytes.Reader" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const input_text = "pipe through standard input into cat\n";
     var r = bytes_mod.Reader.init(input_text);
@@ -161,9 +166,7 @@ test "os.exec: stdin piping via bytes.Reader" {
 
 test "os.exec: task cancellation" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const argv = [_][]const u8{ "sleep", "0.1" };
     var cmd = command(testing.allocator, &argv);

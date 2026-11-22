@@ -185,9 +185,7 @@ test "singleflight: basic sequential deduplication" {
 }
 
 test "singleflight: concurrent deduplication" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const SharedState = struct {
         calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -210,7 +208,9 @@ test "singleflight: concurrent deduplication" {
         res: Group(i32).Result = undefined,
 
         fn run(self: *@This()) void {
-            self.res = self.group.do("heavy-key", SharedState.slowWork, .{self.state}) catch unreachable;
+            self.res = self.group.do("heavy-key", SharedState.slowWork, .{self.state}) catch |err| {
+                std.debug.panic("singleflight worker failed: {s}", .{@errorName(err)});
+            };
         }
     };
 

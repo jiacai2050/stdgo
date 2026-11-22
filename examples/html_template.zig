@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
             \\</html>
         ;
 
-        var tmpl = html.Template.new(allocator, "body_esc");
+        var tmpl = try html.Template.new(allocator, "body_esc");
         defer tmpl.deinit();
         _ = try tmpl.parse(page_src);
 
@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
             \\</form>
         ;
 
-        var tmpl = html.Template.new(allocator, "attr_esc");
+        var tmpl = try html.Template.new(allocator, "attr_esc");
         defer tmpl.deinit();
         _ = try tmpl.parse(form_src);
 
@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
             \\</nav>
         ;
 
-        var tmpl = html.Template.new(allocator, "url_esc");
+        var tmpl = try html.Template.new(allocator, "url_esc");
         defer tmpl.deinit();
         _ = try tmpl.parse(nav_src);
 
@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
             \\</script>
         ;
 
-        var tmpl = html.Template.new(allocator, "js_esc");
+        var tmpl = try html.Template.new(allocator, "js_esc");
         defer tmpl.deinit();
         _ = try tmpl.parse(script_src);
 
@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
             \\</script>
         ;
 
-        var tmpl = html.Template.new(allocator, "safe_types");
+        var tmpl = try html.Template.new(allocator, "safe_types");
         defer tmpl.deinit();
         _ = try tmpl.parse(safe_src);
 
@@ -150,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
             \\</section>
         ;
 
-        var tmpl = html.Template.new(allocator, "components");
+        var tmpl = try html.Template.new(allocator, "components");
         defer tmpl.deinit();
         _ = try tmpl.parse(page_src);
 

@@ -270,7 +270,11 @@ pub fn parseFloat(s: []const u8, bit_size: u8) error{ SyntaxError, RangeError }!
     if (s.len == 0) return error.SyntaxError;
 
     if (mem.eql(u8, s, "NaN") or mem.eql(u8, s, "nan")) return std.math.nan(f64);
-    if (mem.eql(u8, s, "+Inf") or mem.eql(u8, s, "Inf") or mem.eql(u8, s, "+inf") or mem.eql(u8, s, "inf")) return std.math.inf(f64);
+    if (mem.eql(u8, s, "+Inf") or mem.eql(u8, s, "Inf") or
+        mem.eql(u8, s, "+inf") or mem.eql(u8, s, "inf"))
+    {
+        return std.math.inf(f64);
+    }
     if (mem.eql(u8, s, "-Inf") or mem.eql(u8, s, "-inf")) return -std.math.inf(f64);
 
     return std.fmt.parseFloat(f64, s) catch return error.SyntaxError;

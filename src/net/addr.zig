@@ -45,7 +45,9 @@ pub const TCPAddr = struct {
         var ip_buf: [46]u8 = undefined;
         const ip_str = self.ip.stringBuf(&ip_buf);
         var port_buf: [6]u8 = undefined;
-        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{self.port}) catch unreachable;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{self.port}) catch |err| switch (err) {
+            error.NoSpaceLeft => return error.OutOfMemory,
+        };
         return hostport.joinHostPort(allocator, ip_str, port_str);
     }
 
@@ -96,7 +98,9 @@ pub const UDPAddr = struct {
         var ip_buf: [46]u8 = undefined;
         const ip_str = self.ip.stringBuf(&ip_buf);
         var port_buf: [6]u8 = undefined;
-        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{self.port}) catch unreachable;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{self.port}) catch |err| switch (err) {
+            error.NoSpaceLeft => return error.OutOfMemory,
+        };
         return hostport.joinHostPort(allocator, ip_str, port_str);
     }
 
@@ -126,7 +130,8 @@ pub const UDPAddr = struct {
     };
 };
 
-/// LookupPort looks up the port for the given network and service name (e.g. "http", "https", "ssh").
+/// LookupPort looks up the port for the given network and service name
+/// (e.g. "http", "https", "ssh").
 /// If service is already a numeric string, it parses and returns the number.
 pub fn lookupPort(network: []const u8, service: []const u8) !u16 {
     _ = network;

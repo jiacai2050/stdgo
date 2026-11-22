@@ -62,7 +62,8 @@ pub const MIMEHeader = struct {
         self.entries.deinit();
     }
 
-    /// Adds the key, value pair to the header. It appends to any existing values associated with key.
+    /// Adds the key, value pair to the header. It appends to any existing values
+    /// associated with key.
     pub fn add(self: *MIMEHeader, key: []const u8, value: []const u8) !void {
         const c_key = try canonicalMIMEHeaderKey(self.allocator, key);
         errdefer self.allocator.free(c_key);
@@ -125,7 +126,8 @@ pub const MIMEHeader = struct {
     }
 };
 
-/// Reader implements convenience methods for reading textproto lines, headers, and dot-encoded bodies.
+/// Reader implements convenience methods for reading textproto lines, headers,
+/// and dot-encoded bodies.
 pub const Reader = struct {
     allocator: Allocator,
     r: *std.Io.Reader,
@@ -204,7 +206,9 @@ pub const Reader = struct {
 
                 // Trim leading whitespace from the rest
                 var start: usize = 0;
-                while (start < rest.len and (rest[start] == ' ' or rest[start] == '\t')) : (start += 1) {}
+                while (start < rest.len and
+                    (rest[start] == ' ' or rest[start] == '\t')) : (start += 1)
+                {}
 
                 try full.writeByte(' ');
                 _ = try full.write(rest[start..]);
@@ -236,10 +240,14 @@ pub const Reader = struct {
             }
 
             // Key-Value separated by colon ':'
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return Error.MalformedMIMEHeader;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
+                return Error.MalformedMIMEHeader;
+            };
             const key = line[0..colon];
             var val_start = colon + 1;
-            while (val_start < line.len and (line[val_start] == ' ' or line[val_start] == '\t')) : (val_start += 1) {}
+            while (val_start < line.len and
+                (line[val_start] == ' ' or line[val_start] == '\t')) : (val_start += 1)
+            {}
             const val = line[val_start..];
 
             try hdr.add(key, val);

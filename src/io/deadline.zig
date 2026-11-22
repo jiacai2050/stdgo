@@ -61,9 +61,7 @@ pub const Deadline = struct {
 };
 
 test "deadline validates clocks and elapsed budgets" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
 
     try Deadline.none.check(io);
     try std.testing.expect(!try Deadline.none.isExpired(io));

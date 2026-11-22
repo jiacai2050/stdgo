@@ -503,7 +503,9 @@ pub const Reader = struct {
             }
 
             if (repeat > 0) {
-                if (repeat > self.block_size - buf_index) return StructuralError.RepeatPastEndOfBlock;
+                if (repeat > self.block_size - buf_index) {
+                    return StructuralError.RepeatPastEndOfBlock;
+                }
                 for (0..repeat) |_| {
                     const b = mtf.first();
                     self.tt[buf_index] = b;
@@ -576,7 +578,10 @@ test "bzip2 decompression of test vector" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    const bz2_hex = "425a6839314159265359b98ead8e0000051f8060051000004000801ea6dc10200022a7e8a687e8a60d34281a686464c4098a8774d689eb3e84dc1bdd964a83fd2196292f36fb22ad8413c177245385090b98ead8e0";
+    const bz2_hex =
+        "425a6839314159265359b98ead8e0000051f8060051000004000801ea6dc10200022a7e8" ++
+        "a687e8a60d34281a686464c4098a8774d689eb3e84dc1bdd964a83fd2196292f36fb22ad" ++
+        "8413c177245385090b98ead8e0";
 
     var raw: [100]u8 = undefined;
     const raw_slice = try std.fmt.hexToBytes(raw[0 .. bz2_hex.len / 2], bz2_hex);
@@ -584,7 +589,8 @@ test "bzip2 decompression of test vector" {
     const decompressed = try decompressAlloc(alloc, raw_slice);
     defer alloc.free(decompressed);
 
-    try testing.expectEqualStrings("Hello, World! Welcome to stdgo bzip2 decompressor.", decompressed);
+    const expected = "Hello, World! Welcome to stdgo bzip2 decompressor.";
+    try testing.expectEqualStrings(expected, decompressed);
 }
 
 test "bzip2 repeated bytes RLE decoding" {
@@ -592,7 +598,9 @@ test "bzip2 repeated bytes RLE decoding" {
     const alloc = testing.allocator;
 
     // Compressed string: "AAAAABBBBBCCCCCDDDDDEEEEE"
-    const rep_hex = "425a6839314159265359211fd445000004440020003e002000223d23d20c02ef378a91224a4f177245385090211fd445";
+    const rep_hex =
+        "425a6839314159265359211fd445000004440020003e002000223d23d20c02ef378a9122" ++
+        "4a4f177245385090211fd445";
     var raw: [64]u8 = undefined;
     const raw_slice = try std.fmt.hexToBytes(raw[0 .. rep_hex.len / 2], rep_hex);
 

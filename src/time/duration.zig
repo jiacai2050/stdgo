@@ -189,7 +189,9 @@ pub fn parseDuration(s_in: []const u8) Error!Duration {
 
         // Consume unit
         var u_end: usize = 0;
-        while (u_end < s.len and s[u_end] != '.' and (s[u_end] < '0' or s[u_end] > '9')) : (u_end += 1) {}
+        while (u_end < s.len and s[u_end] != '.' and (s[u_end] < '0' or s[u_end] > '9')) {
+            u_end += 1;
+        }
         const unit = s[0..u_end];
         s = s[u_end..];
 
@@ -210,7 +212,8 @@ pub fn parseDuration(s_in: []const u8) Error!Duration {
 
         total_ns += v * unit_ns;
         if (post) {
-            const frac_ns: u64 = @intFromFloat((@as(f64, @floatFromInt(f)) / scale) * @as(f64, @floatFromInt(unit_ns)));
+            const frac_f: f64 = @as(f64, @floatFromInt(f)) / scale;
+            const frac_ns: u64 = @intFromFloat(frac_f * @as(f64, @floatFromInt(unit_ns)));
             total_ns += frac_ns;
         }
     }

@@ -35,3 +35,4 @@ bench/go/bench-go
 bench/zig/zig-out/
 bench/zig/.zig-cache/
 docs/apidocs/
+proxy.log

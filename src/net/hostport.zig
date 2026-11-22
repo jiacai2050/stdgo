@@ -21,7 +21,9 @@ pub fn splitHostPort(hostport: []const u8) Error!HostPort {
 
     if (hostport[0] == '[') {
         // Enclosed in brackets, e.g. "[::1]:80"
-        const close_bracket = std.mem.indexOfScalar(u8, hostport, ']') orelse return Error.MissingPort;
+        const close_bracket = std.mem.indexOfScalar(u8, hostport, ']') orelse {
+            return Error.MissingPort;
+        };
         if (close_bracket + 1 >= hostport.len or hostport[close_bracket + 1] != ':') {
             return Error.MissingPort;
         }
@@ -49,7 +51,8 @@ pub fn splitHostPort(hostport: []const u8) Error!HostPort {
 /// JoinHostPort returns "[host]:port".
 pub fn joinHostPort(allocator: Allocator, host: []const u8, port: []const u8) Allocator.Error![]u8 {
     // If host needs brackets
-    const needs_brackets = std.mem.indexOfScalar(u8, host, ':') != null and (host.len == 0 or host[0] != '[');
+    const needs_brackets = std.mem.indexOfScalar(u8, host, ':') != null and
+        (host.len == 0 or host[0] != '[');
     if (needs_brackets) {
         return std.fmt.allocPrint(allocator, "[{s}]:{s}", .{ host, port });
     } else {

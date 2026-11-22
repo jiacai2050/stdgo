@@ -42,12 +42,21 @@ pub fn readBody(
     }
 }
 
-fn readBodyTask(io: std.Io, reader: *std.Io.Reader, buffer: []u8, ready: *std.Io.Event) std.Io.Reader.ShortError!usize {
+fn readBodyTask(
+    io: std.Io,
+    reader: *std.Io.Reader,
+    buffer: []u8,
+    ready: *std.Io.Event,
+) std.Io.Reader.ShortError!usize {
     defer ready.set(io);
     return reader.readSliceShort(buffer);
 }
 
-pub fn operate(io: std.Io, operation: std.Io.Operation, deadline: Deadline) !std.Io.Operation.Result {
+pub fn operate(
+    io: std.Io,
+    operation: std.Io.Operation,
+    deadline: Deadline,
+) !std.Io.Operation.Result {
     if (operation == .net_read) return read(io, operation, deadline);
     if (deadline.isNone()) return io.operate(operation);
     try deadline.check(io);
@@ -76,7 +85,11 @@ pub fn operate(io: std.Io, operation: std.Io.Operation, deadline: Deadline) !std
     }
 }
 
-fn write(io: std.Io, operation: std.Io.Operation, ready: *std.Io.Event) std.Io.Cancelable!std.Io.Operation.Result {
+fn write(
+    io: std.Io,
+    operation: std.Io.Operation,
+    ready: *std.Io.Event,
+) std.Io.Cancelable!std.Io.Operation.Result {
     defer ready.set(io);
     return io.operate(operation);
 }
@@ -120,16 +133,30 @@ pub const SocketReader = struct {
     interface: std.Io.Reader,
     err: ?anyerror = null,
 
-    pub fn init(io: std.Io, socket: std.Io.net.Stream, buffer: []u8, deadline: Deadline) SocketReader {
+    pub fn init(
+        io: std.Io,
+        socket: std.Io.net.Stream,
+        buffer: []u8,
+        deadline: Deadline,
+    ) SocketReader {
         return .{
             .io = io,
             .socket = socket,
             .deadline = deadline,
-            .interface = .{ .vtable = &.{ .stream = stream, .readVec = readVec }, .buffer = buffer, .seek = 0, .end = 0 },
+            .interface = .{
+                .vtable = &.{ .stream = stream, .readVec = readVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
         };
     }
 
-    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const dest = limit.slice(try writer.writableSliceGreedy(1));
         var data: [1][]u8 = .{dest};
         const n = try readVec(reader, &data);
@@ -168,7 +195,12 @@ pub const SocketWriter = struct {
     interface: std.Io.Writer,
     err: ?anyerror = null,
 
-    pub fn init(io: std.Io, socket: std.Io.net.Stream, buffer: []u8, deadline: Deadline) SocketWriter {
+    pub fn init(
+        io: std.Io,
+        socket: std.Io.net.Stream,
+        buffer: []u8,
+        deadline: Deadline,
+    ) SocketWriter {
         return .{
             .io = io,
             .socket = socket,
@@ -177,7 +209,11 @@ pub const SocketWriter = struct {
         };
     }
 
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *SocketWriter = @alignCast(@fieldParentPtr("interface", writer));
         const result = operate(self.io, .{ .net_write = .{
             .socket_handle = self.socket.socket.handle,

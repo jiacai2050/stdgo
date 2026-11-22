@@ -34,7 +34,11 @@ pub const ClientOptions = struct {
     /// supported and verified on Linux and macOS.
     timeout_ns: ?u64 = null,
     timeout: ?time_mod.Duration = null,
-    check_redirect: ?*const fn (ctx_ptr: ?*anyopaque, req: *Request, via: []const *const Request) anyerror!void = null,
+    check_redirect: ?*const fn (
+        ctx_ptr: ?*anyopaque,
+        req: *Request,
+        via: []const *const Request,
+    ) anyerror!void = null,
     check_redirect_ctx: ?*anyopaque = null,
 };
 
@@ -98,7 +102,9 @@ pub const Client = struct {
     pub fn do(self: *Client, req: *Request, deadline: deadline_mod.Deadline) !Response {
         try deadline.validate();
         try self.io.checkCancel();
-        const request_deadline = deadline.earlier(io_util.fromTimeout(self.io, self.options.timeout_ns));
+        const request_deadline = deadline.earlier(
+            io_util.fromTimeout(self.io, self.options.timeout_ns),
+        );
 
         var current_url = try self.allocator.dupe(u8, req.url);
         defer self.allocator.free(current_url);
@@ -179,7 +185,12 @@ pub const Client = struct {
             }
 
             const is_redirect = switch (resp.status) {
-                .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => true,
+                .moved_permanently,
+                .found,
+                .see_other,
+                .temporary_redirect,
+                .permanent_redirect,
+                => true,
                 else => false,
             };
 
@@ -206,26 +217,43 @@ pub const Client = struct {
                 redirects_followed += 1;
 
                 var new_url: []u8 = undefined;
-                if (std.mem.startsWith(u8, location, "http://") or std.mem.startsWith(u8, location, "https://")) {
+                if (std.mem.startsWith(u8, location, "http://") or
+                    std.mem.startsWith(u8, location, "https://"))
+                {
                     new_url = try self.allocator.dupe(u8, location);
                 } else {
                     const scheme_end = std.mem.indexOf(u8, current_url, "://");
                     const host_start = if (scheme_end) |pos| pos + 3 else 0;
                     const slash_idx = std.mem.indexOfScalar(u8, current_url[host_start..], '/');
-                    const host_root = if (slash_idx) |idx| current_url[0 .. host_start + idx] else current_url;
+                    const host_root = if (slash_idx) |idx|
+                        current_url[0 .. host_start + idx]
+                    else
+                        current_url;
                     if (std.mem.startsWith(u8, location, "/")) {
-                        new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ host_root, location });
+                        new_url = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}{s}",
+                            .{ host_root, location },
+                        );
                     } else {
                         const last_slash = std.mem.lastIndexOfScalar(u8, current_url, '/');
-                        const dir_base = if (last_slash) |ls| current_url[0 .. ls + 1] else host_root;
-                        new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ dir_base, location });
+                        const dir_base = if (last_slash) |ls|
+                            current_url[0 .. ls + 1]
+                        else
+                            host_root;
+                        new_url = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}{s}",
+                            .{ dir_base, location },
+                        );
                     }
                 }
 
                 const new_target = try parseUrlTarget(new_url);
 
                 // Security: Strip sensitive headers on cross-origin redirects
-                const is_cross_origin = !std.ascii.eqlIgnoreCase(target.host, new_target.host) or (target.is_tls and !new_target.is_tls);
+                const is_cross_origin = !std.ascii.eqlIgnoreCase(target.host, new_target.host) or
+                    (target.is_tls and !new_target.is_tls);
                 if (is_cross_origin) {
                     req.header.del("Authorization");
                     req.header.del("Proxy-Authorization");
@@ -282,7 +310,12 @@ pub const Client = struct {
         return self.do(&req, .none);
     }
 
-    pub fn post(self: *Client, url: []const u8, content_type: []const u8, body: []const u8) !Response {
+    pub fn post(
+        self: *Client,
+        url: []const u8,
+        content_type: []const u8,
+        body: []const u8,
+    ) !Response {
         var req = Request.init(self.allocator, .POST, url);
         defer req.deinit();
         try req.header.set("Content-Type", content_type);
@@ -290,7 +323,12 @@ pub const Client = struct {
         return self.do(&req, .none);
     }
 
-    pub fn put(self: *Client, url: []const u8, content_type: []const u8, body: []const u8) !Response {
+    pub fn put(
+        self: *Client,
+        url: []const u8,
+        content_type: []const u8,
+        body: []const u8,
+    ) !Response {
         var req = Request.init(self.allocator, .PUT, url);
         defer req.deinit();
         try req.header.set("Content-Type", content_type);
@@ -304,7 +342,12 @@ pub const Client = struct {
         return self.do(&req, .none);
     }
 
-    pub fn patch(self: *Client, url: []const u8, content_type: []const u8, body: []const u8) !Response {
+    pub fn patch(
+        self: *Client,
+        url: []const u8,
+        content_type: []const u8,
+        body: []const u8,
+    ) !Response {
         var req = Request.init(self.allocator, .PATCH, url);
         defer req.deinit();
         try req.header.set("Content-Type", content_type);
@@ -335,7 +378,13 @@ pub fn head(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response
     return resp;
 }
 
-pub fn post(allocator: std.mem.Allocator, io: std.Io, url: []const u8, content_type: []const u8, body: []const u8) !Response {
+pub fn post(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) !Response {
     var c = Client.init(allocator, io, .{ .transport = .{ .max_idle_conns_per_host = 0 } });
     defer c.deinit();
 
@@ -344,7 +393,13 @@ pub fn post(allocator: std.mem.Allocator, io: std.Io, url: []const u8, content_t
     return resp;
 }
 
-pub fn put(allocator: std.mem.Allocator, io: std.Io, url: []const u8, content_type: []const u8, body: []const u8) !Response {
+pub fn put(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) !Response {
     var c = Client.init(allocator, io, .{ .transport = .{ .max_idle_conns_per_host = 0 } });
     defer c.deinit();
 
@@ -362,7 +417,13 @@ pub fn delete(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Respon
     return resp;
 }
 
-pub fn patch(allocator: std.mem.Allocator, io: std.Io, url: []const u8, content_type: []const u8, body: []const u8) !Response {
+pub fn patch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) !Response {
     var c = Client.init(allocator, io, .{ .transport = .{ .max_idle_conns_per_host = 0 } });
     defer c.deinit();
 
@@ -371,7 +432,12 @@ pub fn patch(allocator: std.mem.Allocator, io: std.Io, url: []const u8, content_
     return resp;
 }
 
-pub fn postForm(allocator: std.mem.Allocator, io: std.Io, url: []const u8, data: []const u8) !Response {
+pub fn postForm(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    data: []const u8,
+) !Response {
     var c = Client.init(allocator, io, .{ .transport = .{ .max_idle_conns_per_host = 0 } });
     defer c.deinit();
 
@@ -381,13 +447,12 @@ pub fn postForm(allocator: std.mem.Allocator, io: std.Io, url: []const u8, data:
 }
 
 test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
-    // Zig 0.17.0 std.Io.Threaded has an upstream union panic on Windows when socket operations cancel/timeout.
+    // Zig 0.17.0 std.Io.Threaded has an upstream union panic on Windows when socket
+    // operations cancel/timeout.
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var c = Client.init(testing.allocator, io, .{
         .timeout_ns = 3 * std.time.ns_per_s,
@@ -423,7 +488,10 @@ test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
         try testing.expectEqual(@as(u16, 200), resp.status_code);
         const body = try resp.readAllAlloc(64 * 1024);
         defer testing.allocator.free(body);
-        try testing.expect(std.mem.indexOf(u8, body, "x-stdgo-test") != null or std.mem.indexOf(u8, body, "X-Stdgo-Test") != null);
+        try testing.expect(
+            std.mem.indexOf(u8, body, "x-stdgo-test") != null or
+                std.mem.indexOf(u8, body, "X-Stdgo-Test") != null,
+        );
     }
 
     // 3. POST /post
@@ -539,7 +607,10 @@ test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
         try testing.expectEqual(@as(u16, 200), resp.status_code);
         const body = try resp.readAllAlloc(64 * 1024);
         defer testing.allocator.free(body);
-        try testing.expect(std.mem.indexOf(u8, body, "slideshow") != null or std.mem.indexOf(u8, body, "{") != null);
+        try testing.expect(
+            std.mem.indexOf(u8, body, "slideshow") != null or
+                std.mem.indexOf(u8, body, "{") != null,
+        );
     }
 
     // 11. GET /qrcode?text=stdgo (SVG output)
@@ -586,23 +657,81 @@ test "Client: real https comprehensive API tests on edgebin.liujiacai.net" {
     }
 }
 
-test "Client: HTTP proxy and HTTPS CONNECT tunneling via 127.0.0.1:8888" {
+test "Client: HTTP proxy and HTTPS CONNECT tunneling" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const port_str = std.process.Environ.getAlloc(
+        std.testing.environ,
+        testing.allocator,
+        "STDGO_HTTP_PROXY_PORT",
+    ) catch null;
+    defer if (port_str) |s| testing.allocator.free(s);
+
+    if (port_str == null or port_str.?.len == 0) {
+        return error.SkipZigTest;
+    }
+    const port = std.fmt.parseInt(u16, port_str.?, 10) catch {
+        return error.SkipZigTest;
+    };
+
+    const io = testing.io;
+
+    const proxy_url = try std.fmt.allocPrint(
+        testing.allocator,
+        "http://127.0.0.1:{d}",
+        .{port},
+    );
+    defer testing.allocator.free(proxy_url);
 
     var c = Client.init(testing.allocator, io, .{
-        .proxy_url = "http://127.0.0.1:8888",
+        .proxy_url = proxy_url,
     });
     defer c.deinit();
 
-    // 1. Test curl -L -x http://127.0.0.1:8888 ip.liujiacai.net/json
+    // 1. Test curl -L -x http://127.0.0.1:<port> ip.liujiacai.net/json
     // HTTP request -> 301 Redirect -> HTTPS request via CONNECT tunnel -> 200 OK
-    var resp = c.get("ip.liujiacai.net/json") catch |err| {
-        std.debug.print("Proxy test skipped (proxy not running or unreachable): {s}\n", .{@errorName(err)});
+    var resp = try c.get("ip.liujiacai.net/json");
+    defer resp.close();
+
+    try testing.expectEqual(@as(u16, 200), resp.status_code);
+    const body = try resp.readAllAlloc(16 * 1024);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"ip\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"country\":") != null);
+}
+
+test "Client: SOCKS5 proxy tunneling" {
+    const testing = std.testing;
+    const port_str = std.process.Environ.getAlloc(
+        std.testing.environ,
+        testing.allocator,
+        "STDGO_SOCKS_PROXY_PORT",
+    ) catch null;
+    defer if (port_str) |s| testing.allocator.free(s);
+
+    if (port_str == null or port_str.?.len == 0) {
+        return error.SkipZigTest;
+    }
+    const port = std.fmt.parseInt(u16, port_str.?, 10) catch {
         return error.SkipZigTest;
     };
+
+    const io = testing.io;
+
+    const proxy_url = try std.fmt.allocPrint(
+        testing.allocator,
+        "socks5h://127.0.0.1:{d}",
+        .{port},
+    );
+    defer testing.allocator.free(proxy_url);
+
+    var c = Client.init(testing.allocator, io, .{
+        .proxy_url = proxy_url,
+    });
+    defer c.deinit();
+
+    // SOCKS5 tunnel: HTTP request -> 301 Redirect -> HTTPS request -> 200 OK
+    var resp = try c.get("ip.liujiacai.net/json");
     defer resp.close();
 
     try testing.expectEqual(@as(u16, 200), resp.status_code);
@@ -616,9 +745,7 @@ test "Client: HTTP proxy and HTTPS CONNECT tunneling via 127.0.0.1:8888" {
 test "Client: expired and invalid deadlines fail before request" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var c = Client.init(testing.allocator, io, .{});
     defer c.deinit();
@@ -633,11 +760,10 @@ test "Client: expired and invalid deadlines fail before request" {
 
 test "Client: CheckRedirect and cross-origin header stripping" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
-    // Create a mock local TCP server that returns a 302 redirect from port A to port B (cross-origin)
+    // Create a mock local TCP server that returns a 302 redirect from port A to
+    // port B (cross-origin)
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server1 = try address.listen(io, .{ .reuse_address = true });
     defer server1.deinit(io);
@@ -664,7 +790,8 @@ test "Client: CheckRedirect and cross-origin header stripping" {
             var resp_buf: [256]u8 = undefined;
             const resp = try std.fmt.bufPrint(
                 &resp_buf,
-                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{d}/target\r\nContent-Length: 0\r\n\r\n",
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{d}/target\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
                 .{port2},
             );
             try sw.interface.writeAll(resp);
@@ -700,7 +827,11 @@ test "Client: CheckRedirect and cross-origin header stripping" {
 
     const State = struct {
         redirect_calls: usize = 0,
-        fn checkRedirect(ctx_ptr: ?*anyopaque, _: *Request, via: []const *const Request) anyerror!void {
+        fn checkRedirect(
+            ctx_ptr: ?*anyopaque,
+            _: *Request,
+            via: []const *const Request,
+        ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
             self.redirect_calls += 1;
             try testing.expectEqual(@as(usize, 1), via.len);
@@ -715,7 +846,11 @@ test "Client: CheckRedirect and cross-origin header stripping" {
     });
     defer c.deinit();
 
-    const start_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/start", .{p1});
+    const start_url = try std.fmt.allocPrint(
+        testing.allocator,
+        "http://127.0.0.1:{d}/start",
+        .{p1},
+    );
     defer testing.allocator.free(start_url);
 
     var req = try newRequest(testing.allocator, .GET, start_url, null);
@@ -737,9 +872,7 @@ test "Client: CheckRedirect and cross-origin header stripping" {
 test "Client: max_redirects exceeded returns error.TooManyRedirects without double-free" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try loopback.listen(io, .{ .reuse_address = true });
@@ -760,8 +893,10 @@ test "Client: max_redirects exceeded returns error.TooManyRedirects without doub
 
                 var w_buf: [256]u8 = undefined;
                 var sw = conn.writer(s_io, &w_buf);
-                // Return 302 redirecting back to itself with Connection: close to avoid keep-alive race
-                const resp = "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                // Return 302 redirecting back to itself with Connection: close
+                // to avoid keep-alive race
+                const resp = "HTTP/1.1 302 Found\r\nLocation: /loop\r\n" ++
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
                 try sw.interface.writeAll(resp);
                 try sw.interface.flush();
             }
@@ -776,7 +911,11 @@ test "Client: max_redirects exceeded returns error.TooManyRedirects without doub
     });
     defer c.deinit();
 
-    const start_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/start", .{port});
+    const start_url = try std.fmt.allocPrint(
+        testing.allocator,
+        "http://127.0.0.1:{d}/start",
+        .{port},
+    );
     defer testing.allocator.free(start_url);
 
     var req = try newRequest(testing.allocator, .GET, start_url, null);
@@ -791,9 +930,7 @@ test "Client: max_redirects exceeded returns error.TooManyRedirects without doub
 test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
@@ -802,7 +939,12 @@ test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" 
 
     // Server collects uploaded chunks
     const ServerHandler = struct {
-        fn run(s: *std.Io.net.Server, s_io: std.Io, received: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) !void {
+        fn run(
+            s: *std.Io.net.Server,
+            s_io: std.Io,
+            received: *std.ArrayListUnmanaged(u8),
+            alloc: std.mem.Allocator,
+        ) !void {
             var conn = try s.accept(s_io);
             defer conn.close(s_io);
 
@@ -851,11 +993,19 @@ test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" 
     var uploaded = std.ArrayListUnmanaged(u8).empty;
     defer uploaded.deinit(testing.allocator);
 
-    const s_thread = try std.Thread.spawn(.{}, ServerHandler.run, .{ &server, io, &uploaded, testing.allocator });
+    const s_thread = try std.Thread.spawn(
+        .{},
+        ServerHandler.run,
+        .{ &server, io, &uploaded, testing.allocator },
+    );
 
     // Stream from custom Reader
     var src = std.Io.Reader.fixed("first-chunk second-chunk third-chunk");
-    const target_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/stream-upload", .{port});
+    const target_url = try std.fmt.allocPrint(
+        testing.allocator,
+        "http://127.0.0.1:{d}/stream-upload",
+        .{port},
+    );
     defer testing.allocator.free(target_url);
 
     // Create request with body_reader and unknown length (null) -> chunked
@@ -879,9 +1029,7 @@ test "Client: Streaming request body with Reader and Chunked Transfer-Encoding" 
 test "Client: Transparent response gzip decompression" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
@@ -932,7 +1080,11 @@ test "Client: Transparent response gzip decompression" {
     });
     defer c.deinit();
 
-    const target_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/gzip-test", .{port});
+    const target_url = try std.fmt.allocPrint(
+        testing.allocator,
+        "http://127.0.0.1:{d}/gzip-test",
+        .{port},
+    );
     defer testing.allocator.free(target_url);
 
     var resp = try c.get(target_url);
@@ -959,11 +1111,21 @@ test "Client: timeout interrupts socket reads and writes" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
-    const Scenario = enum { headers, body, gzip, upload, tls, socks, connect_proxy, transport_headers, zero_timeout, tls_phase, header_phase };
+    const Scenario = enum {
+        headers,
+        body,
+        gzip,
+        upload,
+        tls,
+        socks,
+        connect_proxy,
+        transport_headers,
+        zero_timeout,
+        tls_phase,
+        header_phase,
+    };
     const Server = struct {
         fn run(server: *std.Io.net.Server, server_io: std.Io, scenario: Scenario) !void {
             var stream = try server.accept(server_io);
@@ -993,12 +1155,26 @@ test "Client: timeout interrupts socket reads and writes" {
         }
     };
 
-    for ([_]Scenario{ .headers, .body, .gzip, .upload, .tls, .socks, .connect_proxy, .transport_headers, .zero_timeout, .tls_phase, .header_phase }) |scenario| {
+    const all_scenarios = [_]Scenario{
+        .headers,
+        .body,
+        .gzip,
+        .upload,
+        .tls,
+        .socks,
+        .connect_proxy,
+        .transport_headers,
+        .zero_timeout,
+        .tls_phase,
+        .header_phase,
+    };
+    for (all_scenarios) |scenario| {
         const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         var server = try address.listen(io, .{ .reuse_address = true });
         defer server.deinit(io);
+        const is_https = (scenario == .tls or scenario == .connect_proxy or scenario == .tls_phase);
         const url = try testing.allocator.print("{s}://127.0.0.1:{d}/", .{
-            if (scenario == .tls or scenario == .connect_proxy or scenario == .tls_phase) "https" else "http",
+            if (is_https) "https" else "http",
             server.socket.address.ip4.port,
         });
         defer testing.allocator.free(url);
@@ -1019,7 +1195,9 @@ test "Client: timeout interrupts socket reads and writes" {
                 .{ .response_header_timeout = @fromBackingInt(200 * std.time.ns_per_ms) }
             else
                 null,
-            .timeout_ns = if (scenario == .transport_headers or scenario == .tls_phase or scenario == .header_phase)
+            .timeout_ns = if (scenario == .transport_headers or
+                scenario == .tls_phase or
+                scenario == .header_phase)
                 null
             else if (scenario == .zero_timeout)
                 0
@@ -1029,7 +1207,8 @@ test "Client: timeout interrupts socket reads and writes" {
         defer client.deinit();
         var req = Request.init(testing.allocator, if (scenario == .upload) .POST else .GET, url);
         defer req.deinit();
-        const upload = try testing.allocator.alloc(u8, if (scenario == .upload) 16 * 1024 * 1024 else 0);
+        const upload_size: usize = if (scenario == .upload) 16 * 1024 * 1024 else 0;
+        const upload = try testing.allocator.alloc(u8, upload_size);
         defer testing.allocator.free(upload);
         @memset(upload, 0x61);
         if (scenario == .upload) try req.setBody(upload);
@@ -1065,9 +1244,7 @@ test "Client: timeout budget spans redirects" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -1085,13 +1262,19 @@ test "Client: timeout budget spans redirects" {
                 if (index == 0) {
                     var write_buf: [256]u8 = undefined;
                     var writer = stream.writer(server_io, &write_buf);
-                    try writer.interface.writeAll("HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    try writer.interface.writeAll(
+                        "HTTP/1.1 302 Found\r\nLocation: /next\r\n" ++
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                     try writer.interface.flush();
                 }
             }
         }
     };
-    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    const url = try testing.allocator.print(
+        "http://127.0.0.1:{d}/",
+        .{server.socket.address.ip4.port},
+    );
     defer testing.allocator.free(url);
     var client = Client.init(testing.allocator, io, .{
         .proxy_from_env = false,
@@ -1110,9 +1293,7 @@ test "Client: body deadline remains active after headers arrive" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -1132,7 +1313,10 @@ test "Client: body deadline remains active after headers arrive" {
             try std.Io.sleep(server_io, .fromMilliseconds(400), .awake);
         }
     };
-    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    const url = try testing.allocator.print(
+        "http://127.0.0.1:{d}/",
+        .{server.socket.address.ip4.port},
+    );
     defer testing.allocator.free(url);
     var client = Client.init(testing.allocator, io, .{
         .proxy_from_env = false,
@@ -1155,9 +1339,7 @@ test "Client: Expect 100-continue handles interim responses and early rejection"
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const Scenario = enum { accepted, partial_timeout, rejected, immediate };
     const Server = struct {
         fn run(server: *std.Io.net.Server, server_io: std.Io, scenario: Scenario) !void {
@@ -1201,7 +1383,10 @@ test "Client: Expect 100-continue handles interim responses and early rejection"
         const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         var server = try address.listen(io, .{ .reuse_address = true });
         defer server.deinit(io);
-        const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+        const url = try testing.allocator.print(
+            "http://127.0.0.1:{d}/",
+            .{server.socket.address.ip4.port},
+        );
         defer testing.allocator.free(url);
         var client = Client.init(testing.allocator, io, .{
             .proxy_from_env = false,
@@ -1224,7 +1409,8 @@ test "Client: Expect 100-continue handles interim responses and early rejection"
         try request.setBody("abc");
         try request.header.add("Expect", "100-continue");
         var response = try client.do(&request, .none);
-        try testing.expectEqual(@as(u16, if (scenario == .rejected) 417 else 200), response.status_code);
+        const expected_status: u16 = if (scenario == .rejected) 417 else 200;
+        try testing.expectEqual(expected_status, response.status_code);
         response.close();
         try server_task.await(io);
     }
@@ -1232,13 +1418,15 @@ test "Client: Expect 100-continue handles interim responses and early rejection"
 
 test "Client: custom round tripper receives the earliest request deadline" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const Custom = struct {
         received: deadline_mod.Deadline = .none,
 
-        fn roundTrip(ctx: *anyopaque, _: *Request, deadline: deadline_mod.Deadline) anyerror!Response {
+        fn roundTrip(
+            ctx: *anyopaque,
+            _: *Request,
+            deadline: deadline_mod.Deadline,
+        ) anyerror!Response {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.received = deadline;
             return error.TestRoundTrip;
@@ -1263,10 +1451,10 @@ test "Client: custom round tripper receives the earliest request deadline" {
 }
 
 test "Client: cancellation interrupts a timed socket read" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -1290,7 +1478,10 @@ test "Client: cancellation interrupts a timed socket read" {
             response.close();
         }
     };
-    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    const url = try testing.allocator.print(
+        "http://127.0.0.1:{d}/",
+        .{server.socket.address.ip4.port},
+    );
     defer testing.allocator.free(url);
     var client = Client.init(testing.allocator, io, .{
         .proxy_from_env = false,
@@ -1311,9 +1502,7 @@ test "Client: pooled connections receive a fresh request deadline" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -1337,7 +1526,10 @@ test "Client: pooled connections receive a fresh request deadline" {
             }
         }
     };
-    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    const url = try testing.allocator.print(
+        "http://127.0.0.1:{d}/",
+        .{server.socket.address.ip4.port},
+    );
     defer testing.allocator.free(url);
     var client = Client.init(testing.allocator, io, .{
         .proxy_from_env = false,
@@ -1363,10 +1555,10 @@ test "Client: pooled connections receive a fresh request deadline" {
 }
 
 test "Client: cancellation interrupts a timed socket write" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -1393,7 +1585,10 @@ test "Client: cancellation interrupts a timed socket write" {
             response.close();
         }
     };
-    const url = try testing.allocator.print("http://127.0.0.1:{d}/", .{server.socket.address.ip4.port});
+    const url = try testing.allocator.print(
+        "http://127.0.0.1:{d}/",
+        .{server.socket.address.ip4.port},
+    );
     defer testing.allocator.free(url);
     const payload = try testing.allocator.alloc(u8, 16 * 1024 * 1024);
     defer testing.allocator.free(payload);

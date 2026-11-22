@@ -220,7 +220,11 @@ pub const Buffer = struct {
         return @intCast(remaining);
     }
 
-    fn drainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn drainImpl(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *Buffer = @alignCast(@fieldParentPtr("writer_inst", w));
         if (w.end > 0) {
             self.length += w.end;

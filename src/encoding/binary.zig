@@ -73,7 +73,10 @@ pub const Endian = enum {
 
 pub const LittleEndian = Endian.little;
 pub const BigEndian = Endian.big;
-pub const NativeEndian: Endian = if (@import("builtin").cpu.arch.endian() == .little) .little else .big;
+pub const NativeEndian: Endian = if (@import("builtin").cpu.arch.endian() == .little)
+    .little
+else
+    .big;
 
 /// PutUvarint encodes a uint64 into buf and returns the number of bytes written.
 /// If the buffer is too small, returns Error.BufferTooSmall.

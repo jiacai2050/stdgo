@@ -4,12 +4,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const enable_sqlite = b.option(bool, "sqlite", "Enable SQLite database driver (default: false)") orelse false;
-    const enable_tsan = b.option(bool, "tsan", "Enable ThreadSanitizer (default: false)") orelse false;
+    const enable_sqlite = b.option(
+        bool,
+        "sqlite",
+        "Enable SQLite database driver (default: false)",
+    ) orelse false;
+    const enable_tsan = b.option(
+        bool,
+        "tsan",
+        "Enable ThreadSanitizer (default: false)",
+    ) orelse false;
     const build_options = b.addOptions();
     build_options.addOption(bool, "have_sqlite", enable_sqlite);
 
-    // ThreadSanitizer is supported by Clang/LLVM on POSIX platforms (Linux, macOS, BSDs), but unsupported on Windows.
+    // ThreadSanitizer is supported by Clang/LLVM on POSIX platforms (Linux, macOS, BSDs),
+    // but unsupported on Windows.
     const sanitize_thread = enable_tsan and target.result.os.tag != .windows;
 
     const mod = b.addModule("stdgo", .{

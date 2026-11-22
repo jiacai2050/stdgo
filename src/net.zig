@@ -73,9 +73,7 @@ test "net.listen and net.Dialer loopback integration" {
     const std = @import("std");
     const time = @import("time.zig");
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var listener_inst = try listen(testing.allocator, io, "tcp", "127.0.0.1:0");
     defer listener_inst.close();
@@ -117,9 +115,7 @@ test "net.listen and net.Dialer loopback integration" {
 test "net.Dialer rejects expired configured and call deadlines before connecting" {
     const std = @import("std");
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     const Deadline = @import("io/deadline.zig").Deadline;
     const deadline = Deadline.after(io, .zero);
     const configured: Dialer = .{ .deadline = deadline };
@@ -137,9 +133,7 @@ test "net.pipe in-memory bidirectional communication" {
     const testing = @import("std").testing;
     const std = @import("std");
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const pair = try pipe(testing.allocator, threaded.io());
+    const pair = try pipe(testing.allocator, testing.io);
     const c1 = pair.conn1;
     const c2 = pair.conn2;
 
@@ -177,9 +171,7 @@ test "net.listenUDP and dialUDP loopback test" {
     const testing = @import("std").testing;
     const std = @import("std");
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const server_uc = try listenUDP(testing.allocator, io, "udp", "127.0.0.1:0");
     defer server_uc.close();
@@ -202,7 +194,11 @@ test "net.listenUDP and dialUDP loopback test" {
     defer unrelated_uc.close();
 
     var client_addr_buf: [32]u8 = undefined;
-    const client_addr_str = try std.fmt.bufPrint(&client_addr_buf, "127.0.0.1:{d}", .{client_uc.port()});
+    const client_addr_str = try std.fmt.bufPrint(
+        &client_addr_buf,
+        "127.0.0.1:{d}",
+        .{client_uc.port()},
+    );
     const client_udp_addr = UDPAddr{
         .ip = .{ .v4 = .{ 127, 0, 0, 1 } },
         .port = client_uc.port(),
@@ -223,9 +219,7 @@ test "net.dns wire encoding and mock DNS server" {
     const testing = @import("std").testing;
     const std = @import("std");
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     // 1. Test domain encoding and decoding
     var wire_buf: [128]u8 = undefined;

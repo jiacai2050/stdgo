@@ -1,17 +1,18 @@
-//! RFC 1928 (SOCKS Protocol Version 5) and RFC 1929 (Username/Password Authentication) implementation.
+//! RFC 1928 (SOCKS Protocol Version 5) and RFC 1929 (Username/Password Authentication).
 //!
 //! ### socks5:// vs socks5h:// URL Schemes
-//! - `socks5://`: The client resolves hostnames using local DNS before connecting, sending the raw
-//!   resolved IP (IPv4 `0x01` or IPv6 `0x04`) to the SOCKS5 proxy server.
-//!   *Warning*: This can cause DNS leaks to the local ISP and may fail if the local DNS is poisoned.
-//! - `socks5h://`: The `h` suffix indicates remote **Host** name resolution. The client bypasses local
-//!   DNS entirely and transmits the target hostname directly (ATYP `0x03` Domain Name) to the remote
-//!   SOCKS5 proxy server, which performs DNS resolution on behalf of the client.
+//! - `socks5://`: The client resolves hostnames using local DNS before connecting,
+//!   sending the raw resolved IP (IPv4 `0x01` or IPv6 `0x04`) to the SOCKS5 proxy server.
+//!   *Warning*: This can cause DNS leaks to the local ISP and may fail if the local DNS is
+//!   poisoned.
+//! - `socks5h://`: The `h` suffix indicates remote **Host** name resolution. The client bypasses
+//!   local DNS entirely and transmits the target hostname directly (ATYP `0x03` Domain Name)
+//!   to the remote SOCKS5 proxy server, which performs DNS resolution on behalf of the client.
 //!   *Benefits*: Prevents DNS leaks, bypasses local DNS censorship/poisoning, and enables reaching
 //!   internal domains hosted behind the remote proxy network.
 //!
-//! In stdgo's implementation, `establishSocks5Tunnel` natively supports sending domain names directly
-//! via ATYP `0x03`, preserving full privacy and remote resolution compatibility.
+//! In stdgo's implementation, `establishSocks5Tunnel` natively supports sending domain names
+//! directly via ATYP `0x03`, preserving full privacy and remote resolution compatibility.
 const std = @import("std");
 
 pub const Socks5Error = error{
@@ -206,9 +207,7 @@ fn readExact(r: anytype, out: []u8) !void {
 test "socks5: username/password auth verification" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const socks_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var socks_server = try socks_addr.listen(io, .{ .reuse_address = true });

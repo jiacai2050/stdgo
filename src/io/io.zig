@@ -136,7 +136,11 @@ pub const LimitReader = struct {
         return self.reader().readSliceShort(buf);
     }
 
-    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *LimitReader = @alignCast(@fieldParentPtr("reader_inst", r));
         if (self.n <= 0) return error.EndOfStream;
         const bounded = @min(@backingInt(limit), @as(usize, @intCast(self.n)));
@@ -175,7 +179,11 @@ pub const TeeReader = struct {
         return self.reader().readSliceShort(buf);
     }
 
-    fn streamImpl(r: *std.Io.Reader, dst: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn streamImpl(
+        r: *std.Io.Reader,
+        dst: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *TeeReader = @alignCast(@fieldParentPtr("reader_inst", r));
         const max_bytes = @backingInt(limit);
         if (max_bytes == 0) return 0;

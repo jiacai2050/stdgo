@@ -17,6 +17,11 @@ pub const Op = enum {
 };
 
 /// Draw aligns src with sp and composites the result into r of dst using op.
+fn blendComponent(src: u8, dst: u8, inv_a: u32) u8 {
+    const term = (@as(u32, dst) * inv_a + 127) / 255;
+    return @intCast(@min(255, @as(u32, src) + term));
+}
+
 pub fn draw(dst: *RGBAImage, r: Rectangle, src: *const RGBAImage, sp: Point, op: Op) void {
     const clip_r = r.intersect(dst.bounds());
     if (clip_r.empty()) return;
@@ -36,10 +41,10 @@ pub fn draw(dst: *RGBAImage, r: Rectangle, src: *const RGBAImage, sp: Point, op:
                 const dst_c = dst.at(x, y);
                 const inv_a: u32 = 255 - @as(u32, src_c.a);
 
-                const out_r: u8 = @intCast(@min(255, @as(u32, src_c.r) + (@as(u32, dst_c.r) * inv_a + 127) / 255));
-                const out_g: u8 = @intCast(@min(255, @as(u32, src_c.g) + (@as(u32, dst_c.g) * inv_a + 127) / 255));
-                const out_b: u8 = @intCast(@min(255, @as(u32, src_c.b) + (@as(u32, dst_c.b) * inv_a + 127) / 255));
-                const out_a: u8 = @intCast(@min(255, @as(u32, src_c.a) + (@as(u32, dst_c.a) * inv_a + 127) / 255));
+                const out_r = blendComponent(src_c.r, dst_c.r, inv_a);
+                const out_g = blendComponent(src_c.g, dst_c.g, inv_a);
+                const out_b = blendComponent(src_c.b, dst_c.b, inv_a);
+                const out_a = blendComponent(src_c.a, dst_c.a, inv_a);
 
                 dst.set(x, y, color.RGBA{
                     .r = out_r,
@@ -66,10 +71,10 @@ pub fn drawColor(dst: *RGBAImage, r: Rectangle, c: color.RGBA, op: Op) void {
                 const dst_c = dst.at(x, y);
                 const inv_a: u32 = 255 - @as(u32, c.a);
 
-                const out_r: u8 = @intCast(@min(255, @as(u32, c.r) + (@as(u32, dst_c.r) * inv_a + 127) / 255));
-                const out_g: u8 = @intCast(@min(255, @as(u32, c.g) + (@as(u32, dst_c.g) * inv_a + 127) / 255));
-                const out_b: u8 = @intCast(@min(255, @as(u32, c.b) + (@as(u32, dst_c.b) * inv_a + 127) / 255));
-                const out_a: u8 = @intCast(@min(255, @as(u32, c.a) + (@as(u32, dst_c.a) * inv_a + 127) / 255));
+                const out_r = blendComponent(c.r, dst_c.r, inv_a);
+                const out_g = blendComponent(c.g, dst_c.g, inv_a);
+                const out_b = blendComponent(c.b, dst_c.b, inv_a);
+                const out_a = blendComponent(c.a, dst_c.a, inv_a);
 
                 dst.set(x, y, color.RGBA{
                     .r = out_r,

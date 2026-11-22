@@ -179,12 +179,18 @@ pub const Limiter = struct {
         return self.reserveN(Time.now(io), 1);
     }
 
-    /// ReserveN returns a Reservation that indicates how long the caller must wait before n events happen.
+    /// ReserveN returns a Reservation that indicates how long the caller must wait
+    /// before n events happen.
     pub fn reserveN(self: *Limiter, now: Time, n: u32) Reservation {
         return self.reserveNInternal(now, n, null);
     }
 
-    fn reserveNInternal(self: *Limiter, now: Time, n: u32, max_future_reserve: ?Duration) Reservation {
+    fn reserveNInternal(
+        self: *Limiter,
+        now: Time,
+        n: u32,
+        max_future_reserve: ?Duration,
+    ) Reservation {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -274,7 +280,10 @@ pub const Limiter = struct {
         const d = res.delayFrom(now);
         if (d.nanoseconds() <= 0) return;
 
-        const ready_at = deadlines.Deadline.after(io, .fromNanoseconds(d.nanoseconds())).timestamp.?;
+        const ready_at = deadlines.Deadline.after(
+            io,
+            .fromNanoseconds(d.nanoseconds()),
+        ).timestamp.?;
         if (deadline.timestamp) |end| {
             if (ready_at.compare(.gt, end)) {
                 res.cancelAt(Time.now(io));
@@ -378,9 +387,7 @@ test "rate.Limiter generation overflow disables refunds" {
 test "rate.Limiter wait with deadline and std.Io" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     var lim = Limiter.init(50, 2); // 50 tokens/sec
 

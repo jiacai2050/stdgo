@@ -340,7 +340,9 @@ pub const Data = struct {
 
         var is_64 = false;
         var off: usize = 4;
-        if (sec.info[0] == 0xff and sec.info[1] == 0xff and sec.info[2] == 0xff and sec.info[3] == 0xff) {
+        if (sec.info[0] == 0xff and sec.info[1] == 0xff and
+            sec.info[2] == 0xff and sec.info[3] == 0xff)
+        {
             if (sec.info.len < 14) return error.InfoTooShort;
             off = 12;
             is_64 = true;
@@ -579,7 +581,9 @@ pub const Reader = struct {
             }
 
             const abbrev_tab = try self.ensureUnitAbbrevs();
-            const abbrev = abbrev_tab.abbrevs.get(@intCast(code_u64)) orelse return error.UnknownAbbreviationCode;
+            const abbrev = abbrev_tab.abbrevs.get(@intCast(code_u64)) orelse {
+                return error.UnknownAbbreviationCode;
+            };
 
             if (abbrev.children) {
                 self.depth += 1;

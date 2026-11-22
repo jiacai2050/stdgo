@@ -24,7 +24,11 @@ pub const GzipState = struct {
         .stream = bridgeStream,
     };
 
-    fn bridgeStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn bridgeStream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const state: *GzipState = @fieldParentPtr("bridge_reader", r);
         var tmp: [4096]u8 = undefined;
         const max_len = if (limit == .unlimited) tmp.len else @min(tmp.len, @backingInt(limit));
@@ -91,7 +95,11 @@ pub const ResponseBodyReader = struct {
 
     const reader_vtable: std.Io.Reader.VTable = .{ .stream = stream };
 
-    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *ResponseBodyReader = @fieldParentPtr("interface", r);
         // Writers with an empty buffer (e.g. hash writers) only accept bytes
         // through `drain`, so read into scratch space and forward them.
@@ -323,8 +331,12 @@ pub const Response = struct {
 
         if (self.pool) |pool| {
             if (self.can_keep_alive and self.pool_host != null) {
-                // If EOF not yet reached, drain remaining small fixed-size body so connection can be reused
-                if (!body_ptr.eof_reached and body_ptr.mode == .fixed and body_ptr.remaining_bytes <= 16 * 1024) {
+                // If EOF not yet reached, drain remaining small fixed-size body
+                // so connection can be reused
+                const is_drainable = !body_ptr.eof_reached and
+                    body_ptr.mode == .fixed and
+                    body_ptr.remaining_bytes <= 16 * 1024;
+                if (is_drainable) {
                     var drain_buf: [1024]u8 = undefined;
                     while (!body_ptr.eof_reached) {
                         const n = body_ptr.read(&drain_buf) catch break;
@@ -333,7 +345,13 @@ pub const Response = struct {
                 }
 
                 if (body_ptr.eof_reached and body_ptr.read_err == null) {
-                    pool.release(body_ptr.io, self.pool_host.?, self.pool_port, self.conn.is_tls, self.conn);
+                    pool.release(
+                        body_ptr.io,
+                        self.pool_host.?,
+                        self.pool_port,
+                        self.conn.is_tls,
+                        self.conn,
+                    );
                     if (self.pool_host) |h| {
                         self.allocator.free(h);
                     }
@@ -370,7 +388,10 @@ pub const Response = struct {
         return list.toOwnedSlice(self.allocator);
     }
 
-    pub fn cookies(self: *const Response, allocator: std.mem.Allocator) ![]@import("cookie.zig").Cookie {
+    pub fn cookies(
+        self: *const Response,
+        allocator: std.mem.Allocator,
+    ) ![]@import("cookie.zig").Cookie {
         var list = std.ArrayListUnmanaged(@import("cookie.zig").Cookie).empty;
         errdefer list.deinit(allocator);
 
@@ -400,9 +421,7 @@ pub const Response = struct {
 
 test "ResponseBodyReader.reader reads fixed and chunked bodies" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var conn: HttpConn = undefined;
     conn.stream_reader = .init(io, undefined, &.{}, .none);
     var buf: [4]u8 = undefined;
@@ -413,7 +432,8 @@ test "ResponseBodyReader.reader reads fixed and chunked bodies" {
     const fixed_len = try fixed.reader(&buf).readSliceShort(&out);
     try testing.expectEqualStrings("hello world", out[0..fixed_len]);
 
-    var chunked = ResponseBodyReader.init(io, &conn, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    const chunked_payload = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    var chunked = ResponseBodyReader.init(io, &conn, .chunked, 0, chunked_payload);
     const r = chunked.reader(&buf);
     try testing.expectEqualStrings("hel", try r.take(3));
     const chunked_len = try r.readSliceShort(&out);
@@ -423,15 +443,14 @@ test "ResponseBodyReader.reader reads fixed and chunked bodies" {
 
 test "ResponseBodyReader.reader streams into writers with an empty buffer" {
     const testing = std.testing;
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
     var conn: HttpConn = undefined;
     conn.stream_reader = .init(io, undefined, &.{}, .none);
     const Digest = @import("../../crypto/sha256.zig").Digest;
     var buf: [4]u8 = undefined;
 
-    var body = ResponseBodyReader.init(io, &conn, .chunked, 0, "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    const chunked_data = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    var body = ResponseBodyReader.init(io, &conn, .chunked, 0, chunked_data);
     var digest = Digest.init();
     const n = try body.reader(&buf).streamRemaining(digest.writer());
     try testing.expectEqual(@as(usize, 11), n);

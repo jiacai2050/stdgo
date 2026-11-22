@@ -185,18 +185,26 @@ pub const File = struct {
                     image_base = mem.readInt(u32, opt_data[28..32], .little);
                     sec_align = mem.readInt(u32, opt_data[32..36], .little);
                     file_align = mem.readInt(u32, opt_data[36..40], .little);
-                    subsystem = @fromBackingInt(@intCast(mem.readInt(u16, opt_data[68..70], .little)));
+                    const raw_subsys = mem.readInt(u16, opt_data[68..70], .little);
+                    subsystem = @fromBackingInt(@intCast(raw_subsys));
                     dll_chars = mem.readInt(u16, opt_data[70..72], .little);
 
                     // Data directories at offset 96 (each 8 bytes)
                     if (opt_data.len >= 96) {
-                        const num_rva = if (opt_data.len >= 96) mem.readInt(u32, opt_data[92..96], .little) else 0;
+                        const num_rva = if (opt_data.len >= 96)
+                            mem.readInt(u32, opt_data[92..96], .little)
+                        else
+                            0;
                         const count = @min(16, num_rva);
                         for (0..count) |i| {
                             const d_off = 96 + i * 8;
                             if (d_off + 8 <= opt_data.len) {
                                 ddir[i] = .{
-                                    .virtual_address = mem.readInt(u32, opt_data[d_off..][0..4], .little),
+                                    .virtual_address = mem.readInt(
+                                        u32,
+                                        opt_data[d_off..][0..4],
+                                        .little,
+                                    ),
                                     .size = mem.readInt(u32, opt_data[d_off + 4 ..][0..4], .little),
                                 };
                             }
@@ -209,7 +217,8 @@ pub const File = struct {
                     image_base = mem.readInt(u64, opt_data[24..32], .little);
                     sec_align = mem.readInt(u32, opt_data[32..36], .little);
                     file_align = mem.readInt(u32, opt_data[36..40], .little);
-                    subsystem = @fromBackingInt(@intCast(mem.readInt(u16, opt_data[68..70], .little)));
+                    const raw_subsys = mem.readInt(u16, opt_data[68..70], .little);
+                    subsystem = @fromBackingInt(@intCast(raw_subsys));
                     dll_chars = mem.readInt(u16, opt_data[70..72], .little);
 
                     // Data directories at offset 112 (each 8 bytes)
@@ -220,7 +229,11 @@ pub const File = struct {
                             const d_off = 112 + i * 8;
                             if (d_off + 8 <= opt_data.len) {
                                 ddir[i] = .{
-                                    .virtual_address = mem.readInt(u32, opt_data[d_off..][0..4], .little),
+                                    .virtual_address = mem.readInt(
+                                        u32,
+                                        opt_data[d_off..][0..4],
+                                        .little,
+                                    ),
                                     .size = mem.readInt(u32, opt_data[d_off + 4 ..][0..4], .little),
                                 };
                             }
@@ -268,7 +281,10 @@ pub const File = struct {
             const num_linenums = mem.readInt(u16, sh_data[34..36], .little);
             const sec_chars = mem.readInt(u32, sh_data[36..40], .little);
 
-            const sec_payload = if (raw_off + raw_size <= data.len) data[raw_off .. raw_off + raw_size] else &.{};
+            const sec_payload = if (raw_off + raw_size <= data.len)
+                data[raw_off .. raw_off + raw_size]
+            else
+                &.{};
 
             sections[i] = .{
                 .header = .{
@@ -312,7 +328,9 @@ pub const File = struct {
 
     /// Read COFF symbol table
     pub fn symbols(self: *const File, alloc: Allocator) ![]COFFSymbol {
-        if (self.file_header.number_of_symbols == 0 or self.file_header.pointer_to_symbol_table == 0) {
+        if (self.file_header.number_of_symbols == 0 or
+            self.file_header.pointer_to_symbol_table == 0)
+        {
             return alloc.alloc(COFFSymbol, 0);
         }
 
@@ -406,7 +424,8 @@ test "parse minimal synthetic Windows PE64 file" {
     mem.writeInt(u32, sec[12..16], 0x1000, .little); // VirtualAddress
     mem.writeInt(u32, sec[16..20], 64, .little); // SizeOfRawData = 64
     mem.writeInt(u32, sec[20..24], 320, .little); // PointerToRawData
-    mem.writeInt(u32, sec[36..40], 0x60000020, .little); // Characteristics: Code + Executable + Readable
+    // Characteristics: Code + Executable + Readable
+    mem.writeInt(u32, sec[36..40], 0x60000020, .little);
 
     // Section data at offset 320 (e.g. x86_64 nop ret: 0x90, 0xc3)
     buf[320] = 0x90;

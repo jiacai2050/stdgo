@@ -250,7 +250,10 @@ pub const Compiler = struct {
             const lo = self.pattern[self.pos];
             self.pos += 1;
             var hi = lo;
-            if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
+            if (self.pos + 1 < self.pattern.len and
+                self.pattern[self.pos] == '-' and
+                self.pattern[self.pos + 1] != ']')
+            {
                 self.pos += 1; // skip '-'
                 hi = self.pattern[self.pos];
                 self.pos += 1;
@@ -266,7 +269,11 @@ pub const Compiler = struct {
         return self.makeClassRanges(ranges.items, negated);
     }
 
-    fn makeClassRanges(self: *Compiler, in_ranges: []const Range, negated: bool) Allocator.Error!Frag {
+    fn makeClassRanges(
+        self: *Compiler,
+        in_ranges: []const Range,
+        negated: bool,
+    ) Allocator.Error!Frag {
         const ranges_copy = try self.allocator.dupe(Range, in_ranges);
         const idx = try self.emit(.{
             .op = .class,

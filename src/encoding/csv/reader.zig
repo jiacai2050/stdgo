@@ -57,7 +57,9 @@ pub const Reader = struct {
             }
 
             // Skip empty lines
-            if (raw_line.len == 0 or (raw_line.len == 1 and (raw_line[0] == '\r' or raw_line[0] == '\n'))) {
+            const is_empty = raw_line.len == 0 or
+                (raw_line.len == 1 and (raw_line[0] == '\r' or raw_line[0] == '\n'));
+            if (is_empty) {
                 continue;
             }
 
@@ -115,7 +117,11 @@ pub const Reader = struct {
         return try line.toOwnedSlice();
     }
 
-    fn parseRecord(self: *Reader, allocator: Allocator, raw: []const u8) anyerror![]const []const u8 {
+    fn parseRecord(
+        self: *Reader,
+        allocator: Allocator,
+        raw: []const u8,
+    ) anyerror![]const []const u8 {
         var fields = std.ArrayList([]const u8).empty;
         errdefer {
             for (fields.items) |f| allocator.free(f);
@@ -131,7 +137,9 @@ pub const Reader = struct {
         while (i <= src.len) {
             var field_start = i;
             if (self.trim_leading_space) {
-                while (field_start < src.len and (src[field_start] == ' ' or src[field_start] == '\t')) {
+                while (field_start < src.len and
+                    (src[field_start] == ' ' or src[field_start] == '\t'))
+                {
                     field_start += 1;
                 }
             }

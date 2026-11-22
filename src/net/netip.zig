@@ -9,7 +9,9 @@ pub const Addr = struct {
     is_v4: bool,
 
     pub const ipv4_unspecified = addrFrom4([_]u8{ 0, 0, 0, 0 });
-    pub const ipv6_unspecified = addrFrom16([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    pub const ipv6_unspecified = addrFrom16([_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    });
     pub const ipv4_loopback = addrFrom4([_]u8{ 127, 0, 0, 1 });
     pub const ipv6_loopback = addrFrom16([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
 
@@ -64,7 +66,10 @@ pub const Addr = struct {
 
     pub fn isUnspecified(self: Addr) bool {
         if (self.is_v4) {
-            return self.bytes[12] == 0 and self.bytes[13] == 0 and self.bytes[14] == 0 and self.bytes[15] == 0;
+            return self.bytes[12] == 0 and
+                self.bytes[13] == 0 and
+                self.bytes[14] == 0 and
+                self.bytes[15] == 0;
         }
         for (self.bytes) |b| {
             if (b != 0) return false;
@@ -90,7 +95,8 @@ pub const Addr = struct {
 
     pub fn unmap(self: Addr) Addr {
         if (!self.is_v4) {
-            if (std.mem.startsWith(u8, self.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
+            const v4_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std.mem.startsWith(u8, self.bytes[0..12], &v4_prefix)) {
                 return addrFrom4(self.bytes[12..16].*);
             }
         }
@@ -125,7 +131,9 @@ pub fn parseAddr(s: []const u8) !Addr {
         var ip4: [4]u8 = undefined;
         var count: usize = 0;
         while (parts.next()) |part| {
-            if (count >= 4 or part.len == 0 or (part.len > 1 and part[0] == '0')) return error.InvalidIp;
+            if (count >= 4 or part.len == 0 or (part.len > 1 and part[0] == '0')) {
+                return error.InvalidIp;
+            }
             const val = std.fmt.parseInt(u8, part, 10) catch return error.InvalidIp;
             ip4[count] = val;
             count += 1;
@@ -170,7 +178,9 @@ pub const Prefix = struct {
         if (remaining > 0) {
             const shift: u3 = @intCast(8 - remaining);
             const mask = @as(u8, 0xff) << shift;
-            if ((self.addr.bytes[offset + i] & mask) != (addr.bytes[offset + i] & mask)) return false;
+            const a_byte = self.addr.bytes[offset + i];
+            const b_byte = addr.bytes[offset + i];
+            if ((a_byte & mask) != (b_byte & mask)) return false;
         }
         return true;
     }
@@ -244,6 +254,8 @@ test "netip: AddrPort parsing" {
 
 test "netip: Addr format" {
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("192.168.1.1", try std.fmt.bufPrint(&buf, "{f}", .{try parseAddr("192.168.1.1")}));
-    try testing.expectEqualStrings("2001:db8:0:0:0:0:0:1", try std.fmt.bufPrint(&buf, "{f}", .{try parseAddr("2001:db8::1")}));
+    const s1 = try std.fmt.bufPrint(&buf, "{f}", .{try parseAddr("192.168.1.1")});
+    try testing.expectEqualStrings("192.168.1.1", s1);
+    const s2 = try std.fmt.bufPrint(&buf, "{f}", .{try parseAddr("2001:db8::1")});
+    try testing.expectEqualStrings("2001:db8:0:0:0:0:0:1", s2);
 }

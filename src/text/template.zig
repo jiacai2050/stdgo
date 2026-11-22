@@ -5,8 +5,9 @@
 //!
 //! # Architecture & Safety
 //! - **Zero Memory Leaks**: Uses a dual-arena memory model. Template AST nodes and static strings
-//!   are managed by the `Template` instance arena, while dynamic evaluation contexts and intermediate
-//!   values are scoped within an execution arena automatically freed when `execute` returns.
+//!   are managed by the `Template` instance arena, while dynamic evaluation contexts and
+//!   intermediate values are scoped within an execution arena automatically freed when
+//!   `execute` returns.
 //! - **Compile-Time Reflection**: Automatically translates native Zig structs, slices, arrays,
 //!   optionals, maps, and primitives into dynamic template values via comptime `@typeInfo`.
 //! - **Streaming Output**: Never buffers rendered templates entirely into RAM unless requested;
@@ -20,8 +21,9 @@
 //! - `{{ . }}`: Evaluates to the current root context object.
 //! - `{{ .Field }}`: Accesses a field/key on the current context object.
 //! - `{{ .User.Profile.Email }}`: Traverses nested struct fields or map keys.
-//! - `{{ .@"content-type" }}`: Zig-style quoted identifiers for keywords, hyphens, or special chars.
-//!   Even handles dots inside quotes without splitting paths (e.g. `{{ .@"app.kubernetes.io/name" }}`).
+//! - `{{ .@"content-type" }}`: Zig-style quoted identifiers for keywords, hyphens, or special
+//!   chars. Even handles dots inside quotes without splitting paths
+//!   (e.g. `{{ .@"app.kubernetes.io/name" }}`).
 //! - Literals:
 //!   - Strings: `"hello world"`
 //!   - Integers: `42`, `-10`
@@ -30,7 +32,8 @@
 //!   - Null / Nil: `null`, `nil`
 //!
 //! ## 2. Pipelines and Function Calls
-//! - Command Pipeline: Passes the result of the left-hand command as the **last** argument to the next:
+//! - Command Pipeline: Passes the result of the left-hand command as the **last** argument to the
+//!   next:
 //!   `{{ .Name | upper }}`
 //!   `{{ .Count | printf "Total: %04d items" }}`
 //! - Prefix Function Invocation:
@@ -41,7 +44,8 @@
 //!
 //! ## 3. Built-in Function Reference
 //! - **Formatting & Output**:
-//!   - `printf fmt args...`: Formats string with specifiers (`%s`, `%d`, `%f`, `%v`, width/padding `%04d`).
+//!   - `printf fmt args...`: Formats string with specifiers
+//!     (`%s`, `%d`, `%f`, `%v`, width/padding `%04d`).
 //!   - `print args...`: Concatenates arguments without spaces.
 //!   - `println args...`: Concatenates arguments with spaces, appended with newline `\n`.
 //! - **Comparison**:
@@ -52,7 +56,8 @@
 //!   - `gt a b`: Returns true if `a > b`.
 //!   - `ge a b`: Returns true if `a >= b`.
 //! - **Boolean Logic**:
-//!   - `and a b...`: Short-circuiting or truthy evaluation (returns first falsy or last truthy value).
+//!   - `and a b...`: Short-circuiting or truthy evaluation (returns first falsy or last truthy
+//!     value).
 //!   - `or a b...`: Short-circuiting evaluation (returns first truthy or last falsy value).
 //!   - `not a`: Inverts truthiness of `a`.
 //! - **Collections & Slices**:
@@ -285,7 +290,9 @@ pub fn toValue(allocator: Allocator, data: anytype) Allocator.Error!Value {
                 return Value{ .list = try list.toOwnedSlice(allocator) };
             },
             .one => {
-                if (@typeInfo(ptr_info.child) == .array and @typeInfo(ptr_info.child).array.child == u8) {
+                const is_u8_array = @typeInfo(ptr_info.child) == .array and
+                    @typeInfo(ptr_info.child).array.child == u8;
+                if (is_u8_array) {
                     return Value{ .string = data[0..] };
                 }
                 return toValue(allocator, data.*);
@@ -415,8 +422,10 @@ pub const Template = struct {
     funcs: FuncMap,
     templates: std.StringHashMap([]const Node),
 
-    pub fn new(allocator: Allocator, name: []const u8) *Template {
-        const tmpl = allocator.create(Template) catch unreachable;
+    pub fn new(allocator: Allocator, name: []const u8) !*Template {
+        const tmpl = try allocator.create(Template);
+        errdefer allocator.destroy(tmpl);
+
         tmpl.* = .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
@@ -425,7 +434,12 @@ pub const Template = struct {
             .funcs = FuncMap.init(allocator),
             .templates = std.StringHashMap([]const Node).init(allocator),
         };
-        tmpl.registerDefaultFuncs();
+        errdefer {
+            tmpl.arena.deinit();
+            tmpl.funcs.deinit();
+            tmpl.templates.deinit();
+        }
+        try tmpl.registerDefaultFuncs();
         return tmpl;
     }
 
@@ -500,7 +514,14 @@ pub const Template = struct {
         try self.executeNodes(eval_alloc, w, sub_nodes, root_val, &root_scope);
     }
 
-    fn executeNodes(self: *Template, eval_alloc: Allocator, w: *io.Writer, nodes: []const Node, ctx: Value, scope: *Scope) anyerror!void {
+    fn executeNodes(
+        self: *Template,
+        eval_alloc: Allocator,
+        w: *io.Writer,
+        nodes: []const Node,
+        ctx: Value,
+        scope: *Scope,
+    ) anyerror!void {
         for (nodes) |node| {
             switch (node) {
                 .text => |t| try w.writeAll(t),
@@ -517,27 +538,57 @@ pub const Template = struct {
                     try res.format(w);
                 },
                 .@"if" => |if_node| {
-                    const cond_val = try self.evalCommand(eval_alloc, if_node.condition, ctx, null, scope);
+                    const cond_val = try self.evalCommand(
+                        eval_alloc,
+                        if_node.condition,
+                        ctx,
+                        null,
+                        scope,
+                    );
                     if (cond_val.isTruthy()) {
                         var child_scope = Scope.init(eval_alloc, scope);
-                        try self.executeNodes(eval_alloc, w, if_node.then_branch, ctx, &child_scope);
+                        try self.executeNodes(
+                            eval_alloc,
+                            w,
+                            if_node.then_branch,
+                            ctx,
+                            &child_scope,
+                        );
                     } else if (if_node.else_branch) |else_branch| {
                         var child_scope = Scope.init(eval_alloc, scope);
                         try self.executeNodes(eval_alloc, w, else_branch, ctx, &child_scope);
                     }
                 },
                 .with => |with_node| {
-                    const val = try self.evalCommand(eval_alloc, with_node.target, ctx, null, scope);
+                    const val = try self.evalCommand(
+                        eval_alloc,
+                        with_node.target,
+                        ctx,
+                        null,
+                        scope,
+                    );
                     if (val.isTruthy()) {
                         var child_scope = Scope.init(eval_alloc, scope);
-                        try self.executeNodes(eval_alloc, w, with_node.body_branch, val, &child_scope);
+                        try self.executeNodes(
+                            eval_alloc,
+                            w,
+                            with_node.body_branch,
+                            val,
+                            &child_scope,
+                        );
                     } else if (with_node.else_branch) |eb| {
                         var child_scope = Scope.init(eval_alloc, scope);
                         try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope);
                     }
                 },
                 .range => |range_node| {
-                    const target_val = try self.evalCommand(eval_alloc, range_node.target, ctx, null, scope);
+                    const target_val = try self.evalCommand(
+                        eval_alloc,
+                        range_node.target,
+                        ctx,
+                        null,
+                        scope,
+                    );
                     switch (target_val) {
                         .list => |items| {
                             if (items.len == 0) {
@@ -552,9 +603,16 @@ pub const Template = struct {
                                         try loop_scope.declare(item_name, item, true);
                                     }
                                     if (range_node.index_capture) |idx_name| {
-                                        try loop_scope.declare(idx_name, Value{ .int = @intCast(idx) }, true);
+                                        const idx_val = Value{ .int = @intCast(idx) };
+                                        try loop_scope.declare(idx_name, idx_val, true);
                                     }
-                                    try self.executeNodes(eval_alloc, w, range_node.body_branch, item, &loop_scope);
+                                    try self.executeNodes(
+                                        eval_alloc,
+                                        w,
+                                        range_node.body_branch,
+                                        item,
+                                        &loop_scope,
+                                    );
                                 }
                             }
                         },
@@ -580,7 +638,13 @@ pub const Template = struct {
         }
     }
 
-    fn evalPipeline(self: *Template, eval_alloc: Allocator, pipeline: []const []const u8, ctx: Value, scope: *Scope) anyerror!Value {
+    fn evalPipeline(
+        self: *Template,
+        eval_alloc: Allocator,
+        pipeline: []const []const u8,
+        ctx: Value,
+        scope: *Scope,
+    ) anyerror!Value {
         if (pipeline.len == 0) return Value.null;
 
         var current: ?Value = null;
@@ -590,7 +654,14 @@ pub const Template = struct {
         return current orelse Value.null;
     }
 
-    fn evalCommand(self: *Template, eval_alloc: Allocator, cmd_str: []const u8, ctx: Value, pipelined_arg: ?Value, scope: *Scope) anyerror!Value {
+    fn evalCommand(
+        self: *Template,
+        eval_alloc: Allocator,
+        cmd_str: []const u8,
+        ctx: Value,
+        pipelined_arg: ?Value,
+        scope: *Scope,
+    ) anyerror!Value {
         const tokens = try tokenizeCommand(eval_alloc, cmd_str);
         if (tokens.len == 0) {
             return pipelined_arg orelse Value.null;
@@ -628,7 +699,13 @@ pub const Template = struct {
         return Value.null;
     }
 
-    fn resolveSingleValue(self: *Template, eval_alloc: Allocator, ident_str: []const u8, ctx: Value, scope: *Scope) anyerror!Value {
+    fn resolveSingleValue(
+        self: *Template,
+        eval_alloc: Allocator,
+        ident_str: []const u8,
+        ctx: Value,
+        scope: *Scope,
+    ) anyerror!Value {
         const ident = std.mem.trim(u8, ident_str, " \t\r\n");
         if (ident.len == 0) return Value.null;
 
@@ -734,11 +811,15 @@ pub const Template = struct {
         return curr;
     }
 
+    fn isSpace(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+    }
+
     fn tokenizeCommand(allocator: Allocator, s: []const u8) ![]const []const u8 {
         var list = std.ArrayList([]const u8).empty;
         var i: usize = 0;
         while (i < s.len) {
-            while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n')) : (i += 1) {}
+            while (i < s.len and isSpace(s[i])) : (i += 1) {}
             if (i >= s.len) break;
             if (s[i] == '"') {
                 const start = i;
@@ -767,7 +848,7 @@ pub const Template = struct {
                 try list.append(allocator, s[start..i]);
             } else {
                 const start = i;
-                while (i < s.len and s[i] != ' ' and s[i] != '\t' and s[i] != '\r' and s[i] != '\n') : (i += 1) {
+                while (i < s.len and !isSpace(s[i])) : (i += 1) {
                     if (s[i] == '"') {
                         i += 1;
                         while (i < s.len and s[i] != '"') : (i += 1) {
@@ -781,7 +862,7 @@ pub const Template = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    fn registerDefaultFuncs(self: *Template) void {
+    fn registerDefaultFuncs(self: *Template) !void {
         const DefaultFuncs = struct {
             fn upper(allocator: Allocator, args: []const Value) anyerror!Value {
                 if (args.len == 0) return Value.null;
@@ -933,7 +1014,10 @@ pub const Template = struct {
 
                         var width: ?usize = null;
                         const width_start = j;
-                        while (j < fmt_str.len and fmt_str[j] >= '0' and fmt_str[j] <= '9') : (j += 1) {}
+                        while (j < fmt_str.len and
+                            fmt_str[j] >= '0' and
+                            fmt_str[j] <= '9') : (j += 1)
+                        {}
                         if (j > width_start) {
                             width = std.fmt.parseInt(usize, fmt_str[width_start..j], 10) catch null;
                         }
@@ -962,7 +1046,11 @@ pub const Template = struct {
                                         .float => |v| @intFromFloat(v),
                                         else => 0,
                                     };
-                                    const s = std.fmt.bufPrint(&num_buf, "{d}", .{val_i64}) catch "";
+                                    const s = std.fmt.bufPrint(
+                                        &num_buf,
+                                        "{d}",
+                                        .{val_i64},
+                                    ) catch "";
                                     if (width) |w| {
                                         if (s.len < w) {
                                             const fill: u8 = if (pad_zero) '0' else ' ';
@@ -978,7 +1066,11 @@ pub const Template = struct {
                                         .int => |v| @floatFromInt(v),
                                         else => 0.0,
                                     };
-                                    const s = std.fmt.bufPrint(&num_buf, "{d:.6}", .{val_f64}) catch "";
+                                    const s = std.fmt.bufPrint(
+                                        &num_buf,
+                                        "{d:.6}",
+                                        .{val_f64},
+                                    ) catch "";
                                     if (width) |w| {
                                         if (s.len < w) {
                                             for (0..w - s.len) |_| try out.append(allocator, ' ');
@@ -1037,8 +1129,14 @@ pub const Template = struct {
                 if (args.len < 2) return Value.null;
                 if (args[0] != .list) return Value.null;
                 const l = args[0].list;
-                const start_idx: usize = if (args[1] == .int and args[1].int >= 0) @min(@as(usize, @intCast(args[1].int)), l.len) else 0;
-                const end_idx: usize = if (args.len >= 3 and args[2] == .int and args[2].int >= 0) @min(@as(usize, @intCast(args[2].int)), l.len) else l.len;
+                const start_idx: usize = if (args[1] == .int and args[1].int >= 0)
+                    @min(@as(usize, @intCast(args[1].int)), l.len)
+                else
+                    0;
+                const end_idx: usize = if (args.len >= 3 and args[2] == .int and args[2].int >= 0)
+                    @min(@as(usize, @intCast(args[2].int)), l.len)
+                else
+                    l.len;
                 if (start_idx > end_idx) return Value.null;
 
                 const sub_slice = try allocator.alloc(Value, end_idx - start_idx);
@@ -1049,8 +1147,14 @@ pub const Template = struct {
             fn add(_: Allocator, args: []const Value) anyerror!Value {
                 if (args.len < 2) return Value{ .int = 0 };
                 if (args[0] == .float or args[1] == .float) {
-                    const a: f64 = if (args[0] == .float) args[0].float else @floatFromInt(args[0].int);
-                    const b: f64 = if (args[1] == .float) args[1].float else @floatFromInt(args[1].int);
+                    const a: f64 = if (args[0] == .float)
+                        args[0].float
+                    else
+                        @floatFromInt(args[0].int);
+                    const b: f64 = if (args[1] == .float)
+                        args[1].float
+                    else
+                        @floatFromInt(args[1].int);
                     return Value{ .float = a + b };
                 }
                 const a: i64 = if (args[0] == .int) args[0].int else 0;
@@ -1061,8 +1165,14 @@ pub const Template = struct {
             fn sub(_: Allocator, args: []const Value) anyerror!Value {
                 if (args.len < 2) return Value{ .int = 0 };
                 if (args[0] == .float or args[1] == .float) {
-                    const a: f64 = if (args[0] == .float) args[0].float else @floatFromInt(args[0].int);
-                    const b: f64 = if (args[1] == .float) args[1].float else @floatFromInt(args[1].int);
+                    const a: f64 = if (args[0] == .float)
+                        args[0].float
+                    else
+                        @floatFromInt(args[0].int);
+                    const b: f64 = if (args[1] == .float)
+                        args[1].float
+                    else
+                        @floatFromInt(args[1].int);
                     return Value{ .float = a - b };
                 }
                 const a: i64 = if (args[0] == .int) args[0].int else 0;
@@ -1073,8 +1183,14 @@ pub const Template = struct {
             fn mul(_: Allocator, args: []const Value) anyerror!Value {
                 if (args.len < 2) return Value{ .int = 0 };
                 if (args[0] == .float or args[1] == .float) {
-                    const a: f64 = if (args[0] == .float) args[0].float else @floatFromInt(args[0].int);
-                    const b: f64 = if (args[1] == .float) args[1].float else @floatFromInt(args[1].int);
+                    const a: f64 = if (args[0] == .float)
+                        args[0].float
+                    else
+                        @floatFromInt(args[0].int);
+                    const b: f64 = if (args[1] == .float)
+                        args[1].float
+                    else
+                        @floatFromInt(args[1].int);
                     return Value{ .float = a * b };
                 }
                 const a: i64 = if (args[0] == .int) args[0].int else 0;
@@ -1083,26 +1199,26 @@ pub const Template = struct {
             }
         };
 
-        self.funcs.put("upper", DefaultFuncs.upper) catch unreachable;
-        self.funcs.put("lower", DefaultFuncs.lower) catch unreachable;
-        self.funcs.put("len", DefaultFuncs.len) catch unreachable;
-        self.funcs.put("not", DefaultFuncs.not) catch unreachable;
-        self.funcs.put("eq", DefaultFuncs.eq) catch unreachable;
-        self.funcs.put("ne", DefaultFuncs.ne) catch unreachable;
-        self.funcs.put("lt", DefaultFuncs.lt) catch unreachable;
-        self.funcs.put("le", DefaultFuncs.le) catch unreachable;
-        self.funcs.put("gt", DefaultFuncs.gt) catch unreachable;
-        self.funcs.put("ge", DefaultFuncs.ge) catch unreachable;
-        self.funcs.put("and", DefaultFuncs.andFn) catch unreachable;
-        self.funcs.put("or", DefaultFuncs.orFn) catch unreachable;
-        self.funcs.put("print", DefaultFuncs.print) catch unreachable;
-        self.funcs.put("println", DefaultFuncs.println) catch unreachable;
-        self.funcs.put("printf", DefaultFuncs.printf) catch unreachable;
-        self.funcs.put("index", DefaultFuncs.index) catch unreachable;
-        self.funcs.put("slice", DefaultFuncs.slice) catch unreachable;
-        self.funcs.put("add", DefaultFuncs.add) catch unreachable;
-        self.funcs.put("sub", DefaultFuncs.sub) catch unreachable;
-        self.funcs.put("mul", DefaultFuncs.mul) catch unreachable;
+        try self.funcs.put("upper", DefaultFuncs.upper);
+        try self.funcs.put("lower", DefaultFuncs.lower);
+        try self.funcs.put("len", DefaultFuncs.len);
+        try self.funcs.put("not", DefaultFuncs.not);
+        try self.funcs.put("eq", DefaultFuncs.eq);
+        try self.funcs.put("ne", DefaultFuncs.ne);
+        try self.funcs.put("lt", DefaultFuncs.lt);
+        try self.funcs.put("le", DefaultFuncs.le);
+        try self.funcs.put("gt", DefaultFuncs.gt);
+        try self.funcs.put("ge", DefaultFuncs.ge);
+        try self.funcs.put("and", DefaultFuncs.andFn);
+        try self.funcs.put("or", DefaultFuncs.orFn);
+        try self.funcs.put("print", DefaultFuncs.print);
+        try self.funcs.put("println", DefaultFuncs.println);
+        try self.funcs.put("printf", DefaultFuncs.printf);
+        try self.funcs.put("index", DefaultFuncs.index);
+        try self.funcs.put("slice", DefaultFuncs.slice);
+        try self.funcs.put("add", DefaultFuncs.add);
+        try self.funcs.put("sub", DefaultFuncs.sub);
+        try self.funcs.put("mul", DefaultFuncs.mul);
     }
 };
 
@@ -1126,7 +1242,9 @@ fn compareValues(a: Value, b: Value) ?std.math.Order {
         return .eq;
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);
-    if (a == .safe_string and b == .safe_string) return std.mem.order(u8, a.safe_string.data, b.safe_string.data);
+    if (a == .safe_string and b == .safe_string) {
+        return std.mem.order(u8, a.safe_string.data, b.safe_string.data);
+    }
     if (a == .string and b == .safe_string) return std.mem.order(u8, a.string, b.safe_string.data);
     if (a == .safe_string and b == .string) return std.mem.order(u8, a.safe_string.data, b.string);
     if (a == .bool and b == .bool) {
@@ -1157,7 +1275,12 @@ const Parser = struct {
     template: *Template,
     last_stop_tag: ?[]const u8 = null,
 
-    fn parseTemplateHeader(header: []const u8) struct { name: []const u8, pipeline_str: ?[]const u8 } {
+    const HeaderInfo = struct {
+        name: []const u8,
+        pipeline_str: ?[]const u8,
+    };
+
+    fn parseTemplateHeader(header: []const u8) HeaderInfo {
         const trimmed = std.mem.trim(u8, header, " \t\r\n");
         if (trimmed.len > 0 and trimmed[0] == '"') {
             var i: usize = 1;
@@ -1165,7 +1288,10 @@ const Parser = struct {
                 if (trimmed[i] == '\\' and i + 1 < trimmed.len) i += 1;
             }
             const name = trimmed[1..i];
-            const rest = if (i + 1 < trimmed.len) std.mem.trim(u8, trimmed[i + 1 ..], " \t\r\n") else "";
+            const rest = if (i + 1 < trimmed.len)
+                std.mem.trim(u8, trimmed[i + 1 ..], " \t\r\n")
+            else
+                "";
             return .{
                 .name = name,
                 .pipeline_str = if (rest.len > 0) rest else null,
@@ -1228,7 +1354,9 @@ const Parser = struct {
             const inner = std.mem.trim(u8, self.input[tag_start..tag_end], " \t\r\n");
             self.pos = close_tag + 2;
             if (has_right_trim) {
-                while (self.pos < self.input.len and (self.input[self.pos] == ' ' or self.input[self.pos] == '\t' or self.input[self.pos] == '\r' or self.input[self.pos] == '\n')) : (self.pos += 1) {}
+                while (self.pos < self.input.len and
+                    std.ascii.isWhitespace(self.input[self.pos])) : (self.pos += 1)
+                {}
             }
 
             // Comment {{/* ... */}}
@@ -1369,7 +1497,8 @@ const Parser = struct {
                 const pipe_end = std.mem.lastIndexOfScalar(u8, header, '|');
                 if (pipe_start != null and pipe_end != null and pipe_end.? > pipe_start.?) {
                     target = std.mem.trim(u8, header[0..pipe_start.?], " \t\r\n");
-                    const captures_str = std.mem.trim(u8, header[pipe_start.? + 1 .. pipe_end.?], " \t\r\n");
+                    const cap_slice = header[pipe_start.? + 1 .. pipe_end.?];
+                    const captures_str = std.mem.trim(u8, cap_slice, " \t\r\n");
                     var it_cap = std.mem.splitScalar(u8, captures_str, ',');
                     if (it_cap.next()) |p1| {
                         const c1 = std.mem.trim(u8, p1, " \t\r\n");
@@ -1404,10 +1533,16 @@ const Parser = struct {
             if (std.mem.indexOfScalar(u8, inner, '=')) |eq_pos| {
                 const before = inner[0..eq_pos];
                 const after = inner[eq_pos + 1 ..];
-                const is_cmp = (eq_pos > 0 and (inner[eq_pos - 1] == '!' or inner[eq_pos - 1] == '<' or inner[eq_pos - 1] == '>' or inner[eq_pos - 1] == '=')) or (after.len > 0 and after[0] == '=');
+                const has_prev_op = eq_pos > 0 and (inner[eq_pos - 1] == '!' or
+                    inner[eq_pos - 1] == '<' or
+                    inner[eq_pos - 1] == '>' or
+                    inner[eq_pos - 1] == '=');
+                const has_next_eq = after.len > 0 and after[0] == '=';
+                const is_cmp = has_prev_op or has_next_eq;
                 if (!is_cmp) {
                     const var_name = std.mem.trim(u8, before, " \t\r\n");
-                    if (var_name.len > 0 and std.mem.indexOfAny(u8, var_name, " \t\r\n()|") == null) {
+                    const has_invalid_char = std.mem.indexOfAny(u8, var_name, " \t\r\n()|") != null;
+                    if (var_name.len > 0 and !has_invalid_char) {
                         const expr_str = std.mem.trim(u8, after, " \t\r\n");
                         const pipeline = try self.splitPipeline(expr_str);
                         try nodes.append(self.allocator, .{
@@ -1480,7 +1615,7 @@ test "text.template: simple field interpolation and function pipeline" {
     const bytes = @import("../bytes.zig");
 
     const tmpl_src = "Hello, {{ .Name | upper }}! Welcome to {{ .Platform }}.";
-    var tmpl = Template.new(testing.allocator, "greeting");
+    var tmpl = try Template.new(testing.allocator, "greeting");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(tmpl_src);
@@ -1503,7 +1638,7 @@ test "text.template: if-else conditional evaluation" {
     const bytes = @import("../bytes.zig");
 
     const tmpl_src = "{{ if .IsAdmin }}Admin access granted{{ else }}Access restricted{{ end }}";
-    var tmpl = Template.new(testing.allocator, "auth");
+    var tmpl = try Template.new(testing.allocator, "auth");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(tmpl_src);
@@ -1526,7 +1661,7 @@ test "text.template: range loop iteration" {
     const bytes = @import("../bytes.zig");
 
     const tmpl_src = "Items: {{ range .Items }}[{{ . }}] {{ else }}No items{{ end }}";
-    var tmpl = Template.new(testing.allocator, "loop");
+    var tmpl = try Template.new(testing.allocator, "loop");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(tmpl_src);
@@ -1551,7 +1686,7 @@ test "text.template: whitespace trimming {{- and -}}" {
     const bytes = @import("../bytes.zig");
 
     const tmpl_src = "Hello,   {{- .Name -}}   !";
-    var tmpl = Template.new(testing.allocator, "trim");
+    var tmpl = try Template.new(testing.allocator, "trim");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1575,7 +1710,7 @@ test "text.template: else if multi-branch ladder" {
         \\{{- end }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "ladder");
+    var tmpl = try Template.new(testing.allocator, "ladder");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1620,7 +1755,7 @@ test "text.template: with pipeline re-scoping and else" {
         \\{{ with .User }}User: {{ .Name }} ({{ .Role }}){{ else }}Anonymous Guest{{ end }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "with_test");
+    var tmpl = try Template.new(testing.allocator, "with_test");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1656,7 +1791,7 @@ test "text.template: comparison builtins (eq, ne, lt, le, gt, ge)" {
         \\{{- if ge .B .A }}B>=A {{ end }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "compare");
+    var tmpl = try Template.new(testing.allocator, "compare");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1675,7 +1810,7 @@ test "text.template: boolean logic and parenthesized expressions (and, or, not)"
         \\{{ if and .IsAdmin (gt .Age 18) }}Eligible Admin{{ else }}Not Eligible{{ end }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "bool_logic");
+    var tmpl = try Template.new(testing.allocator, "bool_logic");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1704,7 +1839,7 @@ test "text.template: printf, print, println format builtins" {
         \\{{ printf "ID: %04d, Name: %s" .ID .Name }} | {{ print "A" "B" "C" }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "fmt_test");
+    var tmpl = try Template.new(testing.allocator, "fmt_test");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1723,7 +1858,7 @@ test "text.template: index and slice builtins" {
         \\First: {{ index .Items 0 }} | Sub: {{ slice .Items 1 3 }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "index_slice");
+    var tmpl = try Template.new(testing.allocator, "index_slice");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1744,7 +1879,7 @@ test "text.template: Zig-style const declaration and expression pipeline" {
         \\Greeting: {{ greeting }}!
     ;
 
-    var tmpl = Template.new(testing.allocator, "const_demo");
+    var tmpl = try Template.new(testing.allocator, "const_demo");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1766,7 +1901,7 @@ test "text.template: Zig-style var declaration and mutation" {
         \\After: {{ count }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "var_demo");
+    var tmpl = try Template.new(testing.allocator, "var_demo");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1786,7 +1921,7 @@ test "text.template: Zig-style const re-assignment error" {
         \\{{ fixed = 100 }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "const_err");
+    var tmpl = try Template.new(testing.allocator, "const_err");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1806,7 +1941,7 @@ test "text.template: Zig-style for loop payload capture |item, idx|" {
         \\{{- end }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "for_capture");
+    var tmpl = try Template.new(testing.allocator, "for_capture");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1831,7 +1966,7 @@ test "text.template: Zig-style variable lexical scoping" {
         \\Out: {{ x }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "scope_demo");
+    var tmpl = try Template.new(testing.allocator, "scope_demo");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1862,7 +1997,7 @@ test "text.template: Zig-style @\"...\" quoted identifier fields" {
         \\Const: {{ ct }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "quoted_idents");
+    var tmpl = try Template.new(testing.allocator, "quoted_idents");
     defer tmpl.deinit();
     _ = try tmpl.parse(tmpl_src);
 
@@ -1905,11 +2040,12 @@ test "text.template: custom functions via addFunc and funcMap" {
 
         fn exclaim(allocator: Allocator, args: []const Value) anyerror!Value {
             if (args.len == 0 or args[0] != .string) return Value.null;
-            return Value{ .string = try std.fmt.allocPrint(allocator, "[{s}!]", .{args[0].string}) };
+            const res = try std.fmt.allocPrint(allocator, "[{s}!]", .{args[0].string});
+            return Value{ .string = res };
         }
     };
 
-    var tmpl = Template.new(testing.allocator, "custom_func_demo");
+    var tmpl = try Template.new(testing.allocator, "custom_func_demo");
     defer tmpl.deinit();
 
     _ = try tmpl.addFunc("repeat", Helpers.repeat);
@@ -1928,7 +2064,7 @@ test "text.template: custom functions via addFunc and funcMap" {
     defer f_map.deinit();
     try f_map.put("exclaim", Helpers.exclaim);
 
-    var tmpl2 = Template.new(testing.allocator, "func_map_demo");
+    var tmpl2 = try Template.new(testing.allocator, "func_map_demo");
     defer tmpl2.deinit();
     _ = try tmpl2.funcMap(f_map);
     _ = try tmpl2.parse("{{ .Word | exclaim }}");
@@ -1954,7 +2090,7 @@ test "text.template: define and template basic composition" {
         \\{{ template "user_card" .User }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "main");
+    var tmpl = try Template.new(testing.allocator, "main");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(tmpl_src);
@@ -1982,7 +2118,7 @@ test "text.template: executeTemplate directly" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    var tmpl = Template.new(testing.allocator, "multi");
+    var tmpl = try Template.new(testing.allocator, "multi");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(
@@ -2004,7 +2140,10 @@ test "text.template: executeTemplate directly" {
 
     // 3. Unknown template
     buf.reset();
-    try testing.expectError(error.TemplateNotFound, tmpl.executeTemplate(buf.writer(), "non_existent", .{}));
+    try testing.expectError(
+        error.TemplateNotFound,
+        tmpl.executeTemplate(buf.writer(), "non_existent", .{}),
+    );
 }
 
 test "text.template: block statement default and override" {
@@ -2013,7 +2152,7 @@ test "text.template: block statement default and override" {
 
     // Case 1: Default fallback when block is not overridden
     {
-        var tmpl = Template.new(testing.allocator, "page_default");
+        var tmpl = try Template.new(testing.allocator, "page_default");
         defer tmpl.deinit();
 
         _ = try tmpl.parse("Page: [{{ block \"content\" . }}Default Content: {{ .Msg }}{{ end }}]");
@@ -2027,7 +2166,7 @@ test "text.template: block statement default and override" {
 
     // Case 2: Override when defined prior to block
     {
-        var tmpl = Template.new(testing.allocator, "page_override");
+        var tmpl = try Template.new(testing.allocator, "page_override");
         defer tmpl.deinit();
 
         _ = try tmpl.parse(
@@ -2062,7 +2201,7 @@ test "text.template: recursive template calls for tree structures" {
         \\Tree: {{ template "node" . }}
     ;
 
-    var tmpl = Template.new(testing.allocator, "tree");
+    var tmpl = try Template.new(testing.allocator, "tree");
     defer tmpl.deinit();
 
     _ = try tmpl.parse(tmpl_src);

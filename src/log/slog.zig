@@ -299,7 +299,8 @@ pub const Logger = struct {
         const total = @min(combined_buf.len, self.extra_attrs.len + attrs.len);
         @memcpy(combined_buf[0..self.extra_attrs.len], self.extra_attrs);
         const copied_attrs = @min(attrs.len, total - self.extra_attrs.len);
-        @memcpy(combined_buf[self.extra_attrs.len .. self.extra_attrs.len + copied_attrs], attrs[0..copied_attrs]);
+        const dest = combined_buf[self.extra_attrs.len .. self.extra_attrs.len + copied_attrs];
+        @memcpy(dest, attrs[0..copied_attrs]);
 
         return self.h.handle(.{
             .time_unix_sec = 1700000000,
@@ -356,7 +357,8 @@ test "log.slog TextHandler formatting" {
     // Info should appear
     try logger.info("login attempt", &attrs);
     const out = buf.string();
-    try testing.expect(std.mem.indexOf(u8, out, "level=INFO msg=\"login attempt\" user=alice attempts=3 admin=false\n") != null);
+    const expected = "level=INFO msg=\"login attempt\" user=alice attempts=3 admin=false\n";
+    try testing.expect(std.mem.indexOf(u8, out, expected) != null);
 }
 
 test "log.slog JSONHandler formatting" {

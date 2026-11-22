@@ -200,7 +200,12 @@ pub fn walkDir(fs: MapFS, allocator: Allocator, root: []const u8, walk_fn: WalkF
     }
 }
 
-fn walkDirInternal(fs: MapFS, allocator: Allocator, current_dir: []const u8, walk_fn: WalkFn) !void {
+fn walkDirInternal(
+    fs: MapFS,
+    allocator: Allocator,
+    current_dir: []const u8,
+    walk_fn: WalkFn,
+) !void {
     const entries = try fs.readDir(allocator, current_dir);
     defer allocator.free(entries);
 

@@ -192,7 +192,8 @@ fn currentUid() ?u32 {
     } else if (builtin.link_libc) {
         return @intCast(std.c.getuid());
     } else {
-        @compileError("stdgo.os.user: platform '" ++ @tagName(builtin.os.tag) ++ "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
+        @compileError("stdgo.os.user: platform '" ++ @tagName(builtin.os.tag) ++
+            "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
     }
 }
 
@@ -204,7 +205,8 @@ fn currentGid() ?u32 {
     } else if (builtin.link_libc) {
         return @intCast(std.c.getgid());
     } else {
-        @compileError("stdgo.os.user: platform '" ++ @tagName(builtin.os.tag) ++ "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
+        @compileError("stdgo.os.user: platform '" ++ @tagName(builtin.os.tag) ++
+            "' requires linking libc. Please call artifact.linkLibC() in build.zig.");
     }
 }
 
@@ -362,7 +364,8 @@ pub fn lookupGroupId(allocator: Allocator, gid: []const u8, options: Options) Er
 
 /// Current returns the current user.
 pub fn current(allocator: Allocator, options: Options) Error!*User {
-    // 1. Try environment variables ($USER, $LOGNAME, $HOME) first (matching Go's currentFromEnvironment)
+    // 1. Try environment variables ($USER, $LOGNAME, $HOME) first
+    // (matching Go's currentFromEnvironment)
     if (options.env) |env| {
         const env_user = env.get("USER") orelse env.get("LOGNAME") orelse env.get("USERNAME");
         const env_home = env.get("HOME") orelse env.get("USERPROFILE");

@@ -40,7 +40,11 @@ pub const Writer = struct {
         .flush = outFlush,
     };
 
-    fn outDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    fn outDrain(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
         const self: *Writer = @alignCast(@fieldParentPtr("out_writer", w));
         if (w.end > 0) {
             self.underlying.writeAll(w.buffer[0..w.end]) catch return error.WriteFailed;
@@ -66,7 +70,8 @@ pub const Writer = struct {
 
     fn outFlushInternal(self: *Writer) std.Io.Writer.Error!void {
         if (self.out_writer.end > 0) {
-            self.underlying.writeAll(self.out_writer.buffer[0..self.out_writer.end]) catch return error.WriteFailed;
+            const buf = self.out_writer.buffer[0..self.out_writer.end];
+            self.underlying.writeAll(buf) catch return error.WriteFailed;
             self.out_writer.end = 0;
         }
         self.underlying.flush() catch return error.WriteFailed;
@@ -151,9 +156,11 @@ pub fn newWriter(allocator: Allocator, w: *io.Writer, level: i32) Error!*Writer 
     };
 
     if (level == NoCompression) {
-        self.mode = .{ .raw = try flate_impl.Compress.Raw.init(&self.out_writer, window_buf, .raw) };
+        const r = try flate_impl.Compress.Raw.init(&self.out_writer, window_buf, .raw);
+        self.mode = .{ .raw = r };
     } else if (level == HuffmanOnly) {
-        self.mode = .{ .huffman = try flate_impl.Compress.Huffman.init(&self.out_writer, window_buf, .raw) };
+        const h = try flate_impl.Compress.Huffman.init(&self.out_writer, window_buf, .raw);
+        self.mode = .{ .huffman = h };
     } else {
         const opts: flate_impl.Compress.Options = switch (level) {
             1 => flate_impl.Compress.Options.level_1,
@@ -167,7 +174,8 @@ pub fn newWriter(allocator: Allocator, w: *io.Writer, level: i32) Error!*Writer 
             9 => flate_impl.Compress.Options.level_9,
             else => return Error.InvalidCompressionLevel,
         };
-        self.mode = .{ .normal = try flate_impl.Compress.init(&self.out_writer, window_buf, .raw, opts) };
+        const n = try flate_impl.Compress.init(&self.out_writer, window_buf, .raw, opts);
+        self.mode = .{ .normal = n };
     }
 
     return self;
@@ -193,7 +201,9 @@ test "compress.flate: raw deflate round-trip" {
     const testing = std.testing;
     const bytes = @import("../bytes.zig");
 
-    const original_text = "Raw RFC 1951 Deflate bitstream in Zig 0.17! Repeating pattern: abcdefg 1234567 abcdefg 1234567";
+    const original_text =
+        "Raw RFC 1951 Deflate bitstream in Zig 0.17! Repeating pattern: " ++
+        "abcdefg 1234567 abcdefg 1234567";
 
     var comp_buf = bytes.Buffer.init(testing.allocator);
     defer comp_buf.deinit();

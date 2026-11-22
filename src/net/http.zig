@@ -95,7 +95,8 @@ test "http Header get set add del" {
 }
 
 test "http Cookie parseSetCookie" {
-    const raw = "session=xyz123; Path=/; Domain=example.com; Secure; HttpOnly; SameSite=Lax; Max-Age=3600";
+    const raw = "session=xyz123; Path=/; Domain=example.com; " ++
+        "Secure; HttpOnly; SameSite=Lax; Max-Age=3600";
     const c = parseSetCookie(raw).?;
     try std.testing.expectEqualStrings("session", c.name);
     try std.testing.expectEqualStrings("xyz123", c.value);
@@ -142,8 +143,8 @@ test "http parseUrlTarget" {
 
 fn createTestRequestOnStack(allocator: std.mem.Allocator) !Request {
     // Tests that returning Request across stack frames preserves Content-Length slice
-    const req = try newRequest(allocator, .POST, "http://127.0.0.1:8080/submit", "test payload data");
-    return req;
+    const url = "http://127.0.0.1:8080/submit";
+    return try newRequest(allocator, .POST, url, "test payload data");
 }
 
 test "http newRequest stack escape safety" {
@@ -167,7 +168,8 @@ test "http Request setBasicAuth and addCookie" {
     defer req.deinit();
 
     try req.setBasicAuth("aladdin", "opensesame");
-    try testing.expectEqualStrings("Basic YWxhZGRpbjpvcGVuc2VzYW1l", req.header.get("Authorization").?);
+    const auth_header = req.header.get("Authorization").?;
+    try testing.expectEqualStrings("Basic YWxhZGRpbjpvcGVuc2VzYW1l", auth_header);
 
     try req.addCookie(.{ .name = "foo", .value = "bar" });
     try req.addCookie(.{ .name = "baz", .value = "qux" });
@@ -215,7 +217,9 @@ test "http Cookie string formatting" {
 
     const s = try c.string(testing.allocator);
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("session_id=xyz789; Path=/app; Domain=example.com; Max-Age=7200; Secure; HttpOnly; SameSite=Lax", s);
+    const expected = "session_id=xyz789; Path=/app; Domain=example.com; " ++
+        "Max-Age=7200; Secure; HttpOnly; SameSite=Lax";
+    try testing.expectEqualStrings(expected, s);
 }
 
 test "http Request basicAuth decoding, cookies and clone" {
@@ -249,15 +253,17 @@ test "http Request basicAuth decoding, cookies and clone" {
 test "http custom RoundTripper injection and closeIdleConnections" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     const MockRoundTripper = struct {
         calls: usize = 0,
         idle_closed: bool = false,
 
-        fn roundTrip(ctx: *anyopaque, _: *Request, _: @import("../io/deadline.zig").Deadline) anyerror!Response {
+        fn roundTrip(
+            ctx: *anyopaque,
+            _: *Request,
+            _: @import("../io/deadline.zig").Deadline,
+        ) anyerror!Response {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             return error.MockNetworkError;
@@ -299,9 +305,7 @@ test "http custom RoundTripper injection and closeIdleConnections" {
 test "http transparent SOCKS5 proxy end-to-end" {
     const testing = std.testing;
 
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     // 1. Target HTTP server
     const http_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -322,7 +326,8 @@ test "http transparent SOCKS5 proxy end-to-end" {
 
             var w_buf: [512]u8 = undefined;
             var writer = client_sock.writer(s_io, &w_buf);
-            const resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\nHello from SOCKS5";
+            const resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\n" ++
+                "Connection: close\r\n\r\nHello from SOCKS5";
             writer.interface.writeAll(resp) catch return;
             writer.interface.flush() catch return;
         }
@@ -363,8 +368,13 @@ test "http transparent SOCKS5 proxy end-to-end" {
             cr.interface.toss(cr.interface.buffered().len);
 
             // Connect to real target
-            const target_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", target_port) catch return;
-            var upstream = target_addr.connect(s_io, .{ .mode = .stream, .timeout = .none }) catch return;
+            const target_addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", target_port) catch {
+                return;
+            };
+            var upstream = target_addr.connect(
+                s_io,
+                .{ .mode = .stream, .timeout = .none },
+            ) catch return;
             defer upstream.close(s_io);
 
             // Reply Success: 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0
@@ -393,7 +403,11 @@ test "http transparent SOCKS5 proxy end-to-end" {
             cw.interface.flush() catch return;
         }
     };
-    const socks_thread = try std.Thread.spawn(.{}, SocksWorker.run, .{ &socks_server, io, http_port });
+    const socks_thread = try std.Thread.spawn(
+        .{},
+        SocksWorker.run,
+        .{ &socks_server, io, http_port },
+    );
     defer socks_thread.join();
 
     // 3. Client configured with SOCKS5 proxy
