@@ -49,7 +49,10 @@ pub fn main(init: std.process.Init) !void {
         );
     } else {
         std.debug.print("=== stdgo: database/sql Example (Engine: Pure Zig MockDriver) ===\n", .{});
-        std.debug.print("Tip: Run with `-Dsqlite=true` to test against the real C SQLite3 engine.\n\n", .{});
+        std.debug.print(
+            "Tip: Run with `-Dsqlite=true` to test against the real C SQLite3 engine.\n\n",
+            .{},
+        );
 
         var mock_state = sql.MockDriver.State.init(allocator);
         defer mock_state.deinit();
@@ -100,36 +103,37 @@ fn runDatabaseDemo(
             \\    price REAL NOT NULL,
             \\    in_stock INTEGER NOT NULL
             \\);
-        , &.{}, .none);
+        , .{}, .none);
         std.debug.print("   -> Table 'products' created successfully.\n\n", .{});
     }
 
-    // 4. Insert Records via db.exec
-    std.debug.print("3. Inserting initial records via db.exec:\n", .{});
+    // 4. Insert Records via db.exec (Positional & Named Args)
+    std.debug.print("3. Inserting records via db.exec (positional & named arguments):\n", .{});
+    // Positional parameters using anonymous tuple .{ ... }
     const r1 = try db.exec(
         "INSERT INTO products (name, price, in_stock) VALUES (?, ?, ?)",
-        &.{
-            sql.Value{ .string = "Mechanical Keyboard" },
-            sql.Value{ .float = 129.99 },
-            sql.Value{ .int = 1 },
-        },
+        .{ "Mechanical Keyboard", 129.99, 1 },
         .none,
     );
-    std.debug.print("   -> Insert #1: ID={d}, Rows Affected={d}\n", .{
+    std.debug.print("   -> Insert #1 (positional tuple): ID={d}, Rows Affected={d}\n", .{
         try r1.lastInsertId(),
         try r1.rowsAffected(),
     });
 
-    const r2 = try db.exec(
-        "INSERT INTO products (name, price, in_stock) VALUES (?, ?, ?)",
-        &.{
-            sql.Value{ .string = "Ergonomic Mouse" },
-            sql.Value{ .float = 79.50 },
-            sql.Value{ .int = 1 },
-        },
-        .none,
-    );
-    std.debug.print("   -> Insert #2: ID={d}, Rows Affected={d}\n\n", .{
+    // Named parameters using anonymous struct literal .{ .name = ... }
+    const r2 = if (is_sqlite)
+        try db.exec(
+            "INSERT INTO products (name, price, in_stock) VALUES (:name, :price, :in_stock)",
+            .{ .name = "Ergonomic Mouse", .price = 79.50, .in_stock = 1 },
+            .none,
+        )
+    else
+        try db.exec(
+            "INSERT INTO products (name, price, in_stock) VALUES (?, ?, ?)",
+            .{ "Ergonomic Mouse", 79.50, 1 },
+            .none,
+        );
+    std.debug.print("   -> Insert #2 (named struct): ID={d}, Rows Affected={d}\n\n", .{
         try r2.lastInsertId(),
         try r2.rowsAffected(),
     });
@@ -138,7 +142,16 @@ fn runDatabaseDemo(
     // Precompiles SQL bytecode once and executes repeatedly in batch loops.
     std.debug.print("4. Prepared Statements (db.prepare & Stmt batch execution):\n", .{});
     {
-        var prep_stmt = try db.prepare("INSERT INTO products (name, price, in_stock) VALUES (?, ?, ?)", .none);
+        var prep_stmt = if (is_sqlite)
+            try db.prepare(
+                "INSERT INTO products (name, price, in_stock) VALUES (:name, :price, :in_stock)",
+                .none,
+            )
+        else
+            try db.prepare(
+                "INSERT INTO products (name, price, in_stock) VALUES (?, ?, ?)",
+                .none,
+            );
         defer prep_stmt.close();
 
         const batch = [_]struct { name: []const u8, price: f64, in_stock: i64 }{
@@ -146,11 +159,8 @@ fn runDatabaseDemo(
             .{ .name = "USB-C Hub Multiport", .price = 45.00, .in_stock = 0 },
         };
         for (batch) |item| {
-            const ins_res = try prep_stmt.exec(&.{
-                sql.Value{ .string = item.name },
-                sql.Value{ .float = item.price },
-                sql.Value{ .int = item.in_stock },
-            }, .none);
+            // Directly pass the struct instance `item`! Zero manual value mapping.
+            const ins_res = try prep_stmt.exec(item, .none);
             std.debug.print("   -> Stmt executed for '{s}': ID={d}, Rows={d}\n", .{
                 item.name,
                 try ins_res.lastInsertId(),
@@ -163,8 +173,15 @@ fn runDatabaseDemo(
     // 6. Query Records with Comptime Typed Struct Scanning (nextStruct)
     // Decodes columns directly into struct fields at compile time with zero heap allocation!
     if (is_sqlite) {
-        std.debug.print("5. Querying 'products' table via rows.nextStruct (comptime typed):\n", .{});
-        var rows = try db.query("SELECT id, name, price, in_stock FROM products ORDER BY id ASC", &.{}, .none);
+        std.debug.print(
+            "5. Querying 'products' table via rows.nextStruct (comptime typed):\n",
+            .{},
+        );
+        var rows = try db.query(
+            "SELECT id, name, price, in_stock FROM products ORDER BY id ASC",
+            .{},
+            .none,
+        );
         defer rows.close();
 
         std.debug.print("   Columns: [", .{});
@@ -174,11 +191,10 @@ fn runDatabaseDemo(
         }
         std.debug.print("]\n", .{});
 
-        const col_types = try rows.columnTypes(allocator);
-        defer allocator.free(col_types);
         std.debug.print("   Schema Column Types: [", .{});
-        for (col_types, 0..) |ct, i| {
+        for (0..rows.columnCount()) |i| {
             if (i > 0) std.debug.print(", ", .{});
+            const ct = try rows.columnType(i);
             std.debug.print("{s}: {s}", .{ ct.name(), ct.databaseTypeName() orelse "UNKNOWN" });
         }
         std.debug.print("]\n", .{});
@@ -195,7 +211,7 @@ fn runDatabaseDemo(
     } else {
         std.debug.print("5. Querying 'users' table via rows.nextStruct (comptime typed):\n", .{});
         const User = struct { id: i64, name: []const u8, role: []const u8 };
-        var rows = try db.query("SELECT id, name, role FROM users", &.{}, .none);
+        var rows = try db.query("SELECT id, name, role FROM users", .{}, .none);
         defer rows.close();
 
         std.debug.print("   Columns: [", .{});
@@ -205,11 +221,10 @@ fn runDatabaseDemo(
         }
         std.debug.print("]\n", .{});
 
-        const col_types = try rows.columnTypes(allocator);
-        defer allocator.free(col_types);
         std.debug.print("   Schema Column Types: [", .{});
-        for (col_types, 0..) |ct, i| {
+        for (0..rows.columnCount()) |i| {
             if (i > 0) std.debug.print(", ", .{});
+            const ct = try rows.columnType(i);
             std.debug.print("{s}: {s}", .{ ct.name(), ct.databaseTypeName() orelse "UNKNOWN" });
         }
         std.debug.print("]\n", .{});
@@ -227,7 +242,11 @@ fn runDatabaseDemo(
     // 7. Single-row Queries (scanStruct & ErrNoRows)
     std.debug.print("6. Single-row Queries (row.scanStruct & ErrNoRows):\n", .{});
     if (is_sqlite) {
-        var row = db.queryRow("SELECT name, price FROM products WHERE id = ?", &.{sql.Value{ .int = 1 }}, .none);
+        var row = db.queryRow(
+            "SELECT name, price FROM products WHERE id = ?",
+            .{1},
+            .none,
+        );
         defer row.close();
         const summary = try row.scanStruct(ProductSummary, .none);
         std.debug.print("   -> Product #1 scanned: '{s}' | ${d:.2}\n", .{
@@ -235,15 +254,22 @@ fn runDatabaseDemo(
             summary.price,
         });
 
-        var non_existent = db.queryRow("SELECT name, price FROM products WHERE id = 9999", &.{}, .none);
+        var non_existent = db.queryRow(
+            "SELECT name, price FROM products WHERE id = 9999",
+            .{},
+            .none,
+        );
         defer non_existent.close();
         _ = non_existent.scanStruct(ProductSummary, .none) catch |err| switch (err) {
-            error.ErrNoRows => std.debug.print("   -> Querying ID 9999 returned error.ErrNoRows as expected!\n\n", .{}),
+            error.ErrNoRows => std.debug.print(
+                "   -> Querying ID 9999 returned error.ErrNoRows as expected!\n\n",
+                .{},
+            ),
             else => return err,
         };
     } else {
         const UserRole = struct { id: i64, name: []const u8, role: []const u8 };
-        var row = db.queryRow("SELECT id, name, role FROM users LIMIT 1", &.{}, .none);
+        var row = db.queryRow("SELECT id, name, role FROM users LIMIT 1", .{}, .none);
         defer row.close();
         const u = try row.scanStruct(UserRole, .none);
         std.debug.print("   -> User scanned: ID {d}, Name '{s}'\n", .{
@@ -254,7 +280,10 @@ fn runDatabaseDemo(
         var empty_row = sql.Row{ .rows = null };
         defer empty_row.close();
         _ = empty_row.scanStruct(UserRole, .none) catch |err| switch (err) {
-            error.ErrNoRows => std.debug.print("   -> Empty result handled gracefully with error.ErrNoRows!\n\n", .{}),
+            error.ErrNoRows => std.debug.print(
+                "   -> Empty result handled gracefully with error.ErrNoRows!\n\n",
+                .{},
+            ),
             else => return err,
         };
     }
@@ -267,13 +296,13 @@ fn runDatabaseDemo(
             .read_only = false,
         }, .none);
 
-        _ = try tx.exec("UPDATE products SET price = price * 0.9 WHERE id = 1", &.{}, .none);
+        _ = try tx.exec("UPDATE products SET price = price * 0.9 WHERE id = 1", .{}, .none);
         try tx.commit(.none);
         std.debug.print("   -> Transaction #1 (Serializable) committed successfully!\n", .{});
 
         // Demonstrating clean rollback on error
         var tx_abort = try db.begin(.none);
-        _ = try tx_abort.exec("DELETE FROM products", &.{}, .none);
+        _ = try tx_abort.exec("DELETE FROM products", .{}, .none);
         try tx_abort.rollback(.none);
         std.debug.print("   -> Transaction #2 rolled back cleanly on error!\n\n", .{});
     }
@@ -284,7 +313,7 @@ fn runDatabaseDemo(
         const conn = try db.conn(.none);
         defer conn.release();
 
-        const exec_res = conn.exec("SELECT * FORM products", &.{}, .none);
+        const exec_res = conn.exec("SELECT * FORM products", .{}, .none);
         if (exec_res) |_| {} else |err| {
             std.debug.print("   -> Exec failed with Zig error: {any}\n", .{err});
             if (conn.lastError()) |msg| {

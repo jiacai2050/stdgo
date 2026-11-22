@@ -4,6 +4,21 @@
 const std = @import("std");
 const deadlines = @import("../../io/deadline.zig");
 const Deadline = deadlines.Deadline;
+const time_pkg = @import("../../time/time.zig");
+
+/// Blob represents raw binary data (BLOB) in SQL to distinguish from UTF-8 strings.
+pub const Blob = struct {
+    data: []const u8,
+
+    pub fn init(data: []const u8) Blob {
+        return .{ .data = data };
+    }
+};
+
+/// Convenience helper to create a Blob from a byte slice.
+pub fn blob(data: []const u8) Blob {
+    return Blob.init(data);
+}
 
 /// Validates cancellation and deadline before invoking a driver operation.
 ///
@@ -24,6 +39,132 @@ pub const Value = union(enum) {
     string: []const u8,
     bytes: []const u8,
 
+    /// Binds any supported scalar/struct Zig value into a driver Value at compile time.
+    /// Supports native scalars, enums, optional types, time.Time, Blob, and custom types
+    /// implementing .bind().
+    pub fn bind(val: anytype) Value {
+        const T = @TypeOf(val);
+        if (T == Value) return val;
+        if (T == NamedValue) return val.value;
+        if (T == Blob) return .{ .bytes = val.data };
+        const info = @typeInfo(T);
+        if (info == .@"struct" and @hasDecl(T, "bind")) {
+            return val.bind();
+        }
+        switch (info) {
+            .null => return .null,
+            .optional => {
+                if (val) |v| return bind(v);
+                return .null;
+            },
+            .int => return .{ .int = @intCast(val) },
+            .comptime_int => return .{ .int = @intCast(val) },
+            .float => return .{ .float = @floatCast(val) },
+            .comptime_float => return .{ .float = @floatCast(val) },
+            .bool => return .{ .bool = val },
+            .pointer => |ptr| {
+                if (ptr.size == .slice and ptr.child == u8) {
+                    return .{ .string = val };
+                }
+                if (ptr.size == .one and @typeInfo(ptr.child) == .array and
+                    @typeInfo(ptr.child).array.child == u8)
+                {
+                    return .{ .string = val };
+                }
+                @compileError("unsupported pointer type for sql Value: " ++ @typeName(T));
+            },
+            .@"enum" => return .{ .string = @tagName(val) },
+            else => {
+                if (T == time_pkg.Time) {
+                    return .{ .int = val.wall_sec };
+                }
+                @compileError("unsupported type for sql Value: " ++ @typeName(T));
+            },
+        }
+    }
+
+    /// Scans this driver Value into the destination Zig type T at compile time.
+    /// Supports standard scalar types, enums, stdgo.time.Time, Blob, and custom types
+    /// implementing .scan().
+    pub fn scan(self: Value, comptime T: type) !T {
+        const info = @typeInfo(T);
+        if (info == .optional) {
+            if (self == .null) return null;
+            return try self.scan(info.optional.child);
+        }
+        if (info == .@"struct" and @hasDecl(T, "scan")) {
+            var res: T = undefined;
+            try res.scan(self);
+            return res;
+        }
+        if (T == Blob) {
+            switch (self) {
+                .bytes => |b| return Blob{ .data = b },
+                .string => |s| return Blob{ .data = s },
+                .null => return error.UnexpectedNull,
+                else => return error.ColumnTypeMismatch,
+            }
+        }
+        if (T == time_pkg.Time) {
+            switch (self) {
+                .int => |i| return time_pkg.Time.unix(i, 0),
+                .string => |s| {
+                    if (time_pkg.parse(time_pkg.RFC3339Nano, s)) |t| return t else |_| {}
+                    if (time_pkg.parse(time_pkg.RFC3339, s)) |t| return t else |_| {}
+                    if (time_pkg.parse("2006-01-02 15:04:05", s)) |t| return t else |_| {}
+                    if (time_pkg.parse("2006-01-02", s)) |t| return t else |_| {}
+                    return error.ColumnTypeMismatch;
+                },
+                else => return error.ColumnTypeMismatch,
+            }
+        }
+        if (info == .@"enum") {
+            switch (self) {
+                .int => |i| {
+                    const TagType = @typeInfo(T).@"enum".tag_type;
+                    const tag_val = std.math.cast(TagType, i) orelse return error.IntegerOverflow;
+                    return std.enums.fromInt(T, tag_val) orelse error.InvalidEnumValue;
+                },
+                .string => |s| {
+                    return std.meta.stringToEnum(T, s) orelse error.InvalidEnumValue;
+                },
+                else => return error.ColumnTypeMismatch,
+            }
+        }
+        switch (self) {
+            .null => return error.UnexpectedNull,
+            .int => |i| {
+                switch (info) {
+                    .int => return std.math.cast(T, i) orelse error.IntegerOverflow,
+                    .float => return @floatFromInt(i),
+                    .bool => return i != 0,
+                    else => return error.ColumnTypeMismatch,
+                }
+            },
+            .float => |f| {
+                switch (info) {
+                    .float => return @floatCast(f),
+                    else => return error.ColumnTypeMismatch,
+                }
+            },
+            .bool => |b| {
+                switch (info) {
+                    .bool => return b,
+                    .int => return if (b) @as(T, 1) else @as(T, 0),
+                    else => return error.ColumnTypeMismatch,
+                }
+            },
+            .string => |s| {
+                if (T == []const u8) return s;
+                return error.ColumnTypeMismatch;
+            },
+            .bytes => |b| {
+                if (T == []const u8) return b;
+                return error.ColumnTypeMismatch;
+            },
+        }
+    }
+
     pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .null => try writer.writeAll("NULL"),
@@ -34,6 +175,13 @@ pub const Value = union(enum) {
             .bytes => |b| try writer.print("0x{x}", .{b}),
         }
     }
+};
+
+/// NamedValue holds an optional argument name and its driver Value.
+/// Corresponds to Go's database/sql/driver.NamedValue.
+pub const NamedValue = struct {
+    name: ?[]const u8 = null,
+    value: Value,
 };
 
 /// ErrBadConn should be returned by a driver when a connection is in a bad state
@@ -204,7 +352,7 @@ pub const Stmt = struct {
         exec: *const fn (
             ctx: *anyopaque,
             io: std.Io,
-            args: []const Value,
+            args: []const NamedValue,
             deadline: Deadline,
         ) anyerror!Result,
         /// Executes a prepared query.
@@ -212,7 +360,7 @@ pub const Stmt = struct {
         query: *const fn (
             ctx: *anyopaque,
             io: std.Io,
-            args: []const Value,
+            args: []const NamedValue,
             deadline: Deadline,
         ) anyerror!Rows,
     };
@@ -225,12 +373,12 @@ pub const Stmt = struct {
         return self.vtable.numInput(self.ptr);
     }
 
-    pub fn exec(self: *Stmt, io: std.Io, args: []const Value, deadline: Deadline) !Result {
+    pub fn exec(self: *Stmt, io: std.Io, args: []const NamedValue, deadline: Deadline) !Result {
         try checkOperation(io, deadline);
         return self.vtable.exec(self.ptr, io, args, deadline);
     }
 
-    pub fn query(self: *Stmt, io: std.Io, args: []const Value, deadline: Deadline) !Rows {
+    pub fn query(self: *Stmt, io: std.Io, args: []const NamedValue, deadline: Deadline) !Rows {
         try checkOperation(io, deadline);
         return self.vtable.query(self.ptr, io, args, deadline);
     }
@@ -283,6 +431,15 @@ pub const Conn = struct {
             opts: TxOptions,
             deadline: Deadline,
         ) anyerror!Tx = null,
+        /// Optional: executes a query directly without preparing a statement object.
+        /// Drivers can optimize this to be zero-allocation (e.g. SQLite stack statement).
+        execDirect: ?*const fn (
+            ctx: *anyopaque,
+            io: std.Io,
+            query: []const u8,
+            args: []const NamedValue,
+            deadline: Deadline,
+        ) anyerror!Result = null,
         /// [Extension to standard Go driver.Conn]
         /// Optional: Interrupts any in-progress query on this connection (e.g. sqlite3_interrupt,
         /// PostgreSQL CancelRequest, MySQL KILL QUERY).
@@ -325,6 +482,24 @@ pub const Conn = struct {
     pub fn ping(self: *Conn, io: std.Io, deadline: Deadline) !void {
         try checkOperation(io, deadline);
         return self.vtable.ping(self.ptr, io, deadline);
+    }
+
+    /// ExecDirect executes a query directly without preparing a statement object.
+    /// Falls back to prepare -> exec -> close if the driver does not implement execDirect.
+    pub fn execDirect(
+        self: *Conn,
+        io: std.Io,
+        query: []const u8,
+        args: []const NamedValue,
+        deadline: Deadline,
+    ) !Result {
+        try checkOperation(io, deadline);
+        if (self.vtable.execDirect) |f| {
+            return f(self.ptr, io, query, args, deadline);
+        }
+        var stmt = try self.prepare(io, query, deadline);
+        defer stmt.close();
+        return stmt.exec(io, args, deadline);
     }
 
     /// Interrupt aborts any in-progress database operation on this connection out-of-band.

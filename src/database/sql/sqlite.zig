@@ -10,6 +10,7 @@ const driver_pkg = @import("driver.zig");
 const Deadline = @import("../../io/deadline.zig").Deadline;
 const Allocator = std.mem.Allocator;
 const Value = driver_pkg.Value;
+const NamedValue = driver_pkg.NamedValue;
 const Result = driver_pkg.Result;
 
 /// SQLiteDriver is the database/sql driver implementation for SQLite.
@@ -119,6 +120,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                 .begin = SQLiteConn.begin,
                 .beginTx = SQLiteConn.beginTx,
                 .ping = SQLiteConn.ping,
+                .execDirect = SQLiteConn.execDirect,
                 .interrupt = SQLiteConn.interrupt,
                 .lastError = SQLiteConn.lastError,
             },
@@ -250,6 +252,44 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             try driver_pkg.checkOperation(io, deadline);
         }
 
+        /// Executes a query directly on this connection without allocating SQLiteStmt.
+        fn execDirect(
+            ctx: *anyopaque,
+            io: std.Io,
+            query: []const u8,
+            args: []const NamedValue,
+            deadline: Deadline,
+        ) anyerror!Result {
+            try driver_pkg.checkOperation(io, deadline);
+            const self: *SQLiteConn = @ptrCast(@alignCast(ctx));
+            var progress: Progress = .{ .io = io, .deadline = deadline };
+            progress.start(self.db);
+            defer progress.stop(self.db);
+
+            var stmt: ?*c.sqlite3_stmt = null;
+            const rc = c.sqlite3_prepare_v2(self.db, query.ptr, @intCast(query.len), &stmt, null);
+            if (rc != c.SQLITE_OK) {
+                return progress.failure orelse error.SQLitePrepareFailed;
+            }
+            const non_null_stmt = stmt orelse return error.SQLiteEmptyStatement;
+            defer _ = c.sqlite3_finalize(non_null_stmt);
+
+            try SQLiteStmt.bindArgs(non_null_stmt, args);
+
+            const step_rc = c.sqlite3_step(non_null_stmt);
+            if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
+                return progress.failure orelse error.SQLiteExecFailed;
+            }
+
+            const last_id = c.sqlite3_last_insert_rowid(self.db);
+            const rows_affected = c.sqlite3_changes(self.db);
+
+            return Result{
+                .last_insert_id = last_id,
+                .rows_affected = rows_affected,
+            };
+        }
+
         /// Interrupts ongoing operation on this connection via native sqlite3_interrupt.
         /// Thread-safe per SQLite specification (may be called concurrently from another thread).
         fn interrupt(ctx: *anyopaque) void {
@@ -287,14 +327,52 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return c.sqlite3_bind_parameter_count(self.stmt);
         }
 
-        /// Resets bindings and binds positional parameters (?) to SQLite native types.
-        fn bindArgs(stmt: *c.sqlite3_stmt, args: []const Value) anyerror!void {
+        /// Resets bindings and binds positional (?) or named (:name, @name, $name) parameters.
+        fn bindArgs(stmt: *c.sqlite3_stmt, args: []const NamedValue) anyerror!void {
             _ = c.sqlite3_reset(stmt);
             _ = c.sqlite3_clear_bindings(stmt);
 
-            for (args, 1..) |arg, idx_usize| {
-                const idx: c_int = @intCast(idx_usize);
-                switch (arg) {
+            const param_count: usize = @intCast(c.sqlite3_bind_parameter_count(stmt));
+
+            // Strictly verify that the supplied argument count matches statement's parameters.
+            if (args.len != param_count) {
+                return error.SQLiteParameterCountMismatch;
+            }
+
+            var auto_pos: c_int = 1;
+
+            for (args) |arg| {
+                const idx: c_int = if (arg.name) |name| blk: {
+                    var buf: [64]u8 = undefined;
+                    // 1. Try :name
+                    const colon_name = std.fmt.bufPrint(&buf, ":{s}\x00", .{name}) catch
+                        return error.SQLiteParamNameTooLong;
+                    var param_idx = c.sqlite3_bind_parameter_index(stmt, colon_name.ptr);
+                    if (param_idx == 0) {
+                        // 2. Try @name
+                        const at_name = std.fmt.bufPrint(&buf, "@{s}\x00", .{name}) catch
+                            return error.SQLiteParamNameTooLong;
+                        param_idx = c.sqlite3_bind_parameter_index(stmt, at_name.ptr);
+                    }
+                    if (param_idx == 0) {
+                        // 3. Try $name
+                        const dollar_name = std.fmt.bufPrint(&buf, "${s}\x00", .{name}) catch
+                            return error.SQLiteParamNameTooLong;
+                        param_idx = c.sqlite3_bind_parameter_index(stmt, dollar_name.ptr);
+                    }
+                    if (param_idx == 0) return error.SQLiteUnknownNamedParameter;
+                    break :blk param_idx;
+                } else blk: {
+                    const p = auto_pos;
+                    auto_pos += 1;
+                    // Fail-fast if user passed positional argument for a named placeholder (:name)
+                    if (c.sqlite3_bind_parameter_name(stmt, p) != null) {
+                        return error.SQLitePositionalArgForNamedParam;
+                    }
+                    break :blk p;
+                };
+
+                switch (arg.value) {
                     .null => {
                         if (c.sqlite3_bind_null(stmt, idx) != c.SQLITE_OK) {
                             return error.SQLiteBindFailed;
@@ -345,7 +423,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         fn exec(
             ctx: *anyopaque,
             io: std.Io,
-            args: []const Value,
+            args: []const NamedValue,
             deadline: Deadline,
         ) anyerror!Result {
             try driver_pkg.checkOperation(io, deadline);
@@ -373,7 +451,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         fn query(
             ctx: *anyopaque,
             io: std.Io,
-            args: []const Value,
+            args: []const NamedValue,
             deadline: Deadline,
         ) anyerror!driver_pkg.Rows {
             try driver_pkg.checkOperation(io, deadline);
@@ -613,19 +691,19 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
     _ = try db.exec(ddl, &.{}, .none);
 
     // Insert
-    const res1 = try db.exec("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", &.{
-        Value{ .string = "Alice" },
-        Value{ .int = 30 },
-        Value{ .float = 100.50 },
-    }, .none);
+    const res1 = try db.exec(
+        "INSERT INTO users (name, age, balance) VALUES (?, ?, ?)",
+        .{ "Alice", 30, 100.50 },
+        .none,
+    );
     try testing.expectEqual(@as(i64, 1), res1.last_insert_id);
     try testing.expectEqual(@as(i64, 1), res1.rows_affected);
 
-    const res2 = try db.exec("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", &.{
-        Value{ .string = "Bob" },
-        Value{ .int = 25 },
-        Value{ .float = 50.00 },
-    }, .none);
+    const res2 = try db.exec(
+        "INSERT INTO users (name, age, balance) VALUES (?, ?, ?)",
+        .{ "Bob", 25, 50.00 },
+        .none,
+    );
     try testing.expectEqual(@as(i64, 2), res2.last_insert_id);
     try testing.expectEqual(@as(i64, 1), res2.rows_affected);
 
@@ -664,19 +742,18 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
     // Transaction Rollback
     {
         var tx = try db.begin(.none);
-        _ = try tx.exec("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", &.{
-            Value{ .string = "Charlie" },
-            Value{ .int = 40 },
-            Value{ .float = 0.0 },
-        }, .none);
+        _ = try tx.exec(
+            "INSERT INTO users (name, age, balance) VALUES (?, ?, ?)",
+            .{ "Charlie", 40, 0.0 },
+            .none,
+        );
         try tx.rollback(.none);
     }
 
     // Verify Charlie was not inserted
     {
-        var rows_after = try db.query("SELECT COUNT(*) FROM users WHERE name = ?", &.{
-            Value{ .string = "Charlie" },
-        }, .none);
+        const sel_q = "SELECT COUNT(*) FROM users WHERE name = ?";
+        var rows_after = try db.query(sel_q, .{"Charlie"}, .none);
         defer rows_after.close();
         var count_dest: [1]Value = undefined;
         try testing.expect(try rows_after.next(&count_dest, .none));
@@ -686,17 +763,18 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
     // Transaction Commit
     {
         var tx2 = try db.begin(.none);
-        _ = try tx2.exec("UPDATE users SET balance = balance + 10.0 WHERE name = ?", &.{
-            Value{ .string = "Alice" },
-        }, .none);
+        _ = try tx2.exec(
+            "UPDATE users SET balance = balance + 10.0 WHERE name = ?",
+            .{"Alice"},
+            .none,
+        );
         try tx2.commit(.none);
     }
 
     // Verify balance updated
     {
-        var rows_alice = try db.query("SELECT balance FROM users WHERE name = ?", &.{
-            Value{ .string = "Alice" },
-        }, .none);
+        const sel_alice = "SELECT balance FROM users WHERE name = ?";
+        var rows_alice = try db.query(sel_alice, .{"Alice"}, .none);
         defer rows_alice.close();
         var bal_dest: [1]Value = undefined;
         try testing.expect(try rows_alice.next(&bal_dest, .none));
@@ -745,7 +823,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
     {
         {
             const q = "SELECT balance FROM users WHERE name = ?";
-            var row = db.queryRow(q, &.{Value{ .string = "Alice" }}, .none);
+            var row = db.queryRow(q, .{"Alice"}, .none);
             defer row.close();
             var dest: [1]Value = undefined;
             try row.scan(&dest, .none);
@@ -754,7 +832,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
 
         {
             const q = "SELECT balance FROM users WHERE name = ?";
-            var empty_row = db.queryRow(q, &.{Value{ .string = "Nonexistent" }}, .none);
+            var empty_row = db.queryRow(q, .{"Nonexistent"}, .none);
             defer empty_row.close();
             var dest_empty: [1]Value = undefined;
             try testing.expectError(error.ErrNoRows, empty_row.scan(&dest_empty, .none));
@@ -769,14 +847,14 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         }, .none);
         defer tx.rollback(.none) catch {};
 
-        _ = try tx.exec("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", &.{
-            Value{ .string = "Dave" },
-            Value{ .int = 28 },
-            Value{ .float = 300.0 },
-        }, .none);
+        _ = try tx.exec(
+            "INSERT INTO users (name, age, balance) VALUES (?, ?, ?)",
+            .{ "Dave", 28, 300.0 },
+            .none,
+        );
 
         const q = "SELECT balance FROM users WHERE name = ?";
-        var tx_row = tx.queryRow(q, &.{Value{ .string = "Dave" }}, .none);
+        var tx_row = tx.queryRow(q, .{"Dave"}, .none);
         defer tx_row.close();
         var dave_dest: [1]Value = undefined;
         try tx_row.scan(&dave_dest, .none);
@@ -787,7 +865,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
 
     // Verify ColumnCountMismatch on buffer length mismatch
     {
-        var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", &.{}, .none);
+        var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", .{}, .none);
         defer rows.close();
         var short_dest: [2]Value = undefined;
         try testing.expectError(error.ColumnCountMismatch, rows.next(&short_dest, .none));
@@ -803,7 +881,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         };
 
         const sel_q = "SELECT id, name, age, balance FROM users ORDER BY id ASC";
-        var rows = try db.query(sel_q, &.{}, .none);
+        var rows = try db.query(sel_q, .{}, .none);
         defer rows.close();
 
         const user1 = (try rows.nextStruct(UserRecord, .none)).?;
@@ -817,7 +895,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
     {
         const BalanceOnly = struct { balance: f64 };
         const q = "SELECT balance FROM users WHERE name = ?";
-        var row = db.queryRow(q, &.{Value{ .string = "Alice" }}, .none);
+        var row = db.queryRow(q, .{"Alice"}, .none);
         defer row.close();
         const b = try row.scanStruct(BalanceOnly, .none);
         try testing.expectEqual(@as(f64, 110.50), b.balance);
@@ -828,18 +906,14 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         var stmt = try db.prepare("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", .none);
         defer stmt.close();
 
-        const ins_res = try stmt.exec(&.{
-            Value{ .string = "Eve" },
-            Value{ .int = 22 },
-            Value{ .float = 99.0 },
-        }, .none);
+        const ins_res = try stmt.exec(.{ "Eve", 22, 99.0 }, .none);
         try testing.expect((try ins_res.lastInsertId()) > 0);
         try testing.expectEqual(@as(i64, 1), try ins_res.rowsAffected());
 
         var q_stmt = try db.prepare("SELECT balance FROM users WHERE name = ?", .none);
         defer q_stmt.close();
 
-        var q_row = q_stmt.queryRow(&.{Value{ .string = "Eve" }}, .none);
+        var q_row = q_stmt.queryRow(.{"Eve"}, .none);
         defer q_row.close();
         const EveBal = struct { balance: f64 };
         const eb = try q_row.scanStruct(EveBal, .none);
@@ -853,34 +927,147 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         var tx_stmt = try tx.prepare(upd_q, .none);
         defer tx_stmt.close();
 
-        _ = try tx_stmt.exec(&.{Value{ .string = "Alice" }}, .none);
+        _ = try tx_stmt.exec(.{"Alice"}, .none);
 
         // Commit should cleanly succeed (statement is auto-closed before sqlite3_step("COMMIT"))
         try tx.commit(.none);
 
         // Subsequent exec must return error.TxDone
-        try testing.expectError(error.TxDone, tx_stmt.exec(&.{Value{ .string = "Alice" }}, .none));
+        try testing.expectError(error.TxDone, tx_stmt.exec(.{"Alice"}, .none));
     }
 
-    // Verify Rows.columnTypes in SQLite schema inspection
+    // Verify Rows.columnType indexed inspection in SQLite
     {
-        var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", &.{}, .none);
+        var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", .{}, .none);
         defer rows.close();
 
-        const types = try rows.columnTypes(testing.allocator);
-        defer testing.allocator.free(types);
+        try testing.expectEqual(@as(usize, 4), rows.columnCount());
 
-        try testing.expectEqual(@as(usize, 4), types.len);
-        try testing.expectEqualStrings("id", types[0].name());
-        try testing.expectEqualStrings("INTEGER", types[0].databaseTypeName().?);
+        const ct0 = try rows.columnType(0);
+        try testing.expectEqualStrings("id", ct0.name());
+        try testing.expectEqualStrings("INTEGER", ct0.databaseTypeName().?);
 
-        try testing.expectEqualStrings("name", types[1].name());
-        try testing.expectEqualStrings("TEXT", types[1].databaseTypeName().?);
+        const ct1 = try rows.columnType(1);
+        try testing.expectEqualStrings("name", ct1.name());
+        try testing.expectEqualStrings("TEXT", ct1.databaseTypeName().?);
 
-        try testing.expectEqualStrings("age", types[2].name());
-        try testing.expectEqualStrings("INTEGER", types[2].databaseTypeName().?);
+        const ct2 = try rows.columnType(2);
+        try testing.expectEqualStrings("age", ct2.name());
+        try testing.expectEqualStrings("INTEGER", ct2.databaseTypeName().?);
 
-        try testing.expectEqualStrings("balance", types[3].name());
-        try testing.expectEqualStrings("REAL", types[3].databaseTypeName().?);
+        const ct3 = try rows.columnType(3);
+        try testing.expectEqualStrings("balance", ct3.name());
+        try testing.expectEqualStrings("REAL", ct3.databaseTypeName().?);
+
+        try testing.expectError(error.ColumnIndexOutOfBounds, rows.columnType(4));
+    }
+
+    // Verify execDirect in SQLite
+    {
+        const upd_sql = "UPDATE users SET balance = balance + 5 WHERE id = 1";
+        const res = try db.exec(upd_sql, .{}, .none);
+        try testing.expectEqual(@as(i64, 1), try res.rowsAffected());
+    }
+
+    // Verify idiomatic struct and tuple arguments in SQLite
+    {
+        // 1. Insert via anonymous struct (named args :name, :age, :balance)
+        const ins_sql = "INSERT INTO users (name, age, balance) VALUES (:name, :age, :balance)";
+        const res_ins = try db.exec(ins_sql, .{
+            .name = "Frank",
+            .age = 40,
+            .balance = 888.88,
+        }, .none);
+        try testing.expect((try res_ins.lastInsertId()) > 0);
+
+        // 2. Query via anonymous struct
+        {
+            var row = db.queryRow(
+                "SELECT balance FROM users WHERE name = :name",
+                .{ .name = "Frank" },
+                .none,
+            );
+            defer row.close();
+            const FrankBal = struct { balance: f64 };
+            const bal = try row.scanStruct(FrankBal, .none);
+            try testing.expectEqual(@as(f64, 888.88), bal.balance);
+        }
+
+        // 3. Update via tuple (positional args ?)
+        const upd_tup = "UPDATE users SET balance = ? WHERE name = ?";
+        const res_upd = try db.exec(upd_tup, .{ 999.99, "Frank" }, .none);
+        try testing.expectEqual(@as(i64, 1), try res_upd.rowsAffected());
+
+        // 4. Verify fail-fast: tuple arguments for named placeholders (:name) are rejected
+        const fail_sql = "UPDATE users SET balance = 100 WHERE name = :name";
+        try testing.expectError(
+            error.SQLitePositionalArgForNamedParam,
+            db.exec(fail_sql, .{"Frank"}, .none),
+        );
+
+        // 5. Verify fail-fast: positional parameter count mismatch (too few or too many)
+        try testing.expectError(
+            error.SQLiteParameterCountMismatch,
+            db.exec("UPDATE users SET balance = ? WHERE name = ?", .{999.99}, .none),
+        );
+        try testing.expectError(
+            error.SQLiteParameterCountMismatch,
+            db.exec(
+                "UPDATE users SET balance = ? WHERE name = ?",
+                .{ 999.99, "Frank", 123 },
+                .none,
+            ),
+        );
+
+        // 6. Verify fail-fast: named parameter count mismatch (under-providing or over-providing)
+        const upd_named = "UPDATE users SET balance = :balance WHERE name = :name";
+        // Under-providing (missing :balance)
+        try testing.expectError(
+            error.SQLiteParameterCountMismatch,
+            db.exec(upd_named, .{ .name = "Frank" }, .none),
+        );
+        // Over-providing (extra field .age)
+        try testing.expectError(
+            error.SQLiteParameterCountMismatch,
+            db.exec(upd_named, .{ .name = "Frank", .balance = 50.0, .age = 30 }, .none),
+        );
+    }
+
+    // Verify raw BLOB storage and scanning via sql.Blob
+    {
+        _ = try db.exec(
+            \\CREATE TABLE IF NOT EXISTS files (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    name TEXT NOT NULL,
+            \\    payload BLOB NOT NULL
+            \\);
+        , .{}, .none);
+
+        const raw_bytes = "BIN\x00\xFF\xAA\x55";
+        const FileItem = struct {
+            name: []const u8,
+            payload: sql_db.Blob,
+        };
+
+        const ins = try db.exec(
+            "INSERT INTO files (name, payload) VALUES (:name, :payload)",
+            FileItem{
+                .name = "firmware.bin",
+                .payload = sql_db.blob(raw_bytes),
+            },
+            .none,
+        );
+        try testing.expect((try ins.lastInsertId()) > 0);
+
+        var row = db.queryRow(
+            "SELECT name, payload FROM files WHERE name = ?",
+            .{"firmware.bin"},
+            .none,
+        );
+        defer row.close();
+
+        const scanned = try row.scanStruct(FileItem, .none);
+        try testing.expectEqualStrings("firmware.bin", scanned.name);
+        try testing.expectEqualStrings(raw_bytes, scanned.payload.data);
     }
 }
