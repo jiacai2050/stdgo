@@ -181,6 +181,19 @@ pub fn marshal(allocator: Allocator, value: anytype) ![]u8 {
     return try buf.toOwnedSlice();
 }
 
+/// MarshalBuf formats the JSON encoding of value directly into buf using a fixed buffer writer.
+/// Returns the slice of buf containing the serialized JSON without any heap allocations.
+pub fn marshalBuf(buf: []u8, value: anytype) ![]u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var stringify: std.json.Stringify = .{
+        .writer = &w,
+        .options = .{ .whitespace = .minified },
+    };
+    try stringify.write(value);
+    try w.flush();
+    return buf[0..w.buffered().len];
+}
+
 /// MarshalIndent is like Marshal but applies Indent to format the output.
 pub fn marshalIndent(
     allocator: Allocator,
@@ -333,4 +346,27 @@ test "encoding.json: valid validator" {
     try testing.expect(valid(testing.allocator, "\"string\""));
     try testing.expect(!valid(testing.allocator, "{unquoted: 123}"));
     try testing.expect(!valid(testing.allocator, "[1, 2, "));
+}
+
+test "encoding.json: marshalBuf zero allocation" {
+    const testing = std.testing;
+
+    const Item = struct {
+        id: u32,
+        name: []const u8,
+        active: bool,
+    };
+    const item = Item{
+        .id = 42,
+        .name = "gadget",
+        .active = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    const res = try marshalBuf(&buf, item);
+    try testing.expectEqualStrings("{\"id\":42,\"name\":\"gadget\",\"active\":true}", res);
+    try testing.expect(valid(testing.allocator, res));
+
+    var small_buf: [4]u8 = undefined;
+    try testing.expectError(error.WriteFailed, marshalBuf(&small_buf, item));
 }

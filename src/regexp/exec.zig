@@ -12,6 +12,73 @@ pub const VM = struct {
     prog: *const Prog,
     allocator: Allocator,
 
+    pub const max_inline_insts = 64;
+
+    const Thread = struct {
+        pc: u32,
+        start_pos: usize,
+    };
+
+    const ThreadList = struct {
+        slice: []Thread,
+        len: usize = 0,
+        allocator: ?Allocator = null,
+
+        fn initSlice(buf: []Thread) ThreadList {
+            return .{
+                .slice = buf,
+                .len = 0,
+                .allocator = null,
+            };
+        }
+
+        fn initAlloc(allocator: Allocator, capacity: usize) Allocator.Error!ThreadList {
+            const buf = try allocator.alloc(Thread, capacity);
+            return .{
+                .slice = buf,
+                .len = 0,
+                .allocator = allocator,
+            };
+        }
+
+        fn deinit(self: *ThreadList) void {
+            if (self.allocator) |alloc| {
+                alloc.free(self.slice);
+                self.slice = &.{};
+            }
+        }
+
+        fn clearRetainingCapacity(self: *ThreadList) void {
+            self.len = 0;
+        }
+
+        fn items(self: *const ThreadList) []const Thread {
+            return self.slice[0..self.len];
+        }
+
+        fn append(self: *ThreadList, allocator: Allocator, thread: Thread) Allocator.Error!void {
+            if (self.len < self.slice.len) {
+                self.slice[self.len] = thread;
+                self.len += 1;
+                return;
+            }
+            if (self.allocator) |alloc| {
+                const new_cap = @max(self.slice.len * 2, 8);
+                self.slice = try alloc.realloc(self.slice, new_cap);
+                self.slice[self.len] = thread;
+                self.len += 1;
+                return;
+            }
+            const new_cap = @max(self.slice.len * 2, 8);
+            const new_slice = try allocator.alloc(Thread, new_cap);
+            @memcpy(new_slice[0..self.len], self.slice[0..self.len]);
+            self.slice = new_slice;
+            self.allocator = allocator;
+            self.slice[self.len] = thread;
+            self.len += 1;
+        }
+    };
+
     pub fn init(allocator: Allocator, prog: *const Prog) VM {
         return .{
             .prog = prog,
@@ -28,14 +95,27 @@ pub const VM = struct {
         const num_insts = self.prog.insts.items.len;
         if (num_insts == 0) return null;
 
-        const visited = try self.allocator.alloc(bool, num_insts);
-        defer self.allocator.free(visited);
+        var visited_buf: [max_inline_insts]bool = undefined;
+        const visited = if (num_insts <= max_inline_insts)
+            visited_buf[0..num_insts]
+        else
+            try self.allocator.alloc(bool, num_insts);
+        defer if (num_insts > max_inline_insts) self.allocator.free(visited);
 
-        var cur_threads = std.ArrayList(Thread).empty;
-        defer cur_threads.deinit(self.allocator);
+        var cur_buf: [max_inline_insts]Thread = undefined;
+        var next_buf: [max_inline_insts]Thread = undefined;
 
-        var next_threads = std.ArrayList(Thread).empty;
-        defer next_threads.deinit(self.allocator);
+        var cur_threads = if (num_insts <= max_inline_insts)
+            ThreadList.initSlice(&cur_buf)
+        else
+            try ThreadList.initAlloc(self.allocator, num_insts);
+        defer cur_threads.deinit();
+
+        var next_threads = if (num_insts <= max_inline_insts)
+            ThreadList.initSlice(&next_buf)
+        else
+            try ThreadList.initAlloc(self.allocator, num_insts);
+        defer next_threads.deinit();
 
         var best_match: ?MatchResult = null;
 
@@ -46,9 +126,9 @@ pub const VM = struct {
             try self.addThread(&cur_threads, self.prog.start, start_pos, text, visited, start_pos);
 
             var pos = start_pos;
-            while (cur_threads.items.len > 0) {
+            while (cur_threads.items().len > 0) {
                 // Check if any thread is at match
-                for (cur_threads.items) |t| {
+                for (cur_threads.items()) |t| {
                     if (self.prog.insts.items[t.pc].op == .match) {
                         const len = pos - t.start_pos;
                         const is_better = best_match == null or
@@ -65,7 +145,7 @@ pub const VM = struct {
                 @memset(visited, false);
                 next_threads.clearRetainingCapacity();
 
-                for (cur_threads.items) |t| {
+                for (cur_threads.items()) |t| {
                     const inst = self.prog.insts.items[t.pc];
                     var matched = false;
                     switch (inst.op) {
@@ -115,14 +195,9 @@ pub const VM = struct {
         return null;
     }
 
-    const Thread = struct {
-        pc: u32,
-        start_pos: usize,
-    };
-
     fn addThread(
         self: *const VM,
-        list: *std.ArrayList(Thread),
+        list: *ThreadList,
         pc: u32,
         pos: usize,
         text: []const u8,
@@ -158,3 +233,37 @@ pub const VM = struct {
         }
     }
 };
+
+test "VM stack scratch execution" {
+    const testing = std.testing;
+    var prog = Prog.init(testing.allocator);
+    defer prog.deinit();
+
+    // inst 0: char 'a', out: 1
+    // inst 1: match
+    try prog.insts.append(testing.allocator, .{ .op = .char, .c = 'a', .out = 1 });
+    try prog.insts.append(testing.allocator, .{ .op = .match });
+
+    const vm = VM.init(testing.allocator, &prog);
+    try testing.expect(try vm.match("a"));
+    try testing.expect(try vm.match("bac"));
+    try testing.expect(!(try vm.match("xyz")));
+}
+
+test "VM fallback to heap when insts > max_inline_insts" {
+    const testing = std.testing;
+    var prog = Prog.init(testing.allocator);
+    defer prog.deinit();
+
+    // Create 70 instructions: 69 jumps chaining together, ending in char 'z' then match
+    var i: u32 = 0;
+    while (i < 68) : (i += 1) {
+        try prog.insts.append(testing.allocator, .{ .op = .jump, .out = i + 1 });
+    }
+    try prog.insts.append(testing.allocator, .{ .op = .char, .c = 'z', .out = 69 });
+    try prog.insts.append(testing.allocator, .{ .op = .match });
+
+    const vm = VM.init(testing.allocator, &prog);
+    try testing.expect(try vm.match("z"));
+    try testing.expect(!(try vm.match("a")));
+}

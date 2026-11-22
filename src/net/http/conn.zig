@@ -116,6 +116,24 @@ pub const HttpConn = struct {
         }
     }
 
+    pub fn writer(self: *HttpConn) *std.Io.Writer {
+        if (self.is_tls) {
+            return &self.tls_client.?.writer;
+        } else {
+            return &self.stream_writer.interface;
+        }
+    }
+
+    pub fn flush(self: *HttpConn) !void {
+        try self.checkDeadline();
+        if (self.is_tls) {
+            self.tls_client.?.writer.flush() catch |err| return self.ioError(err);
+            self.stream_writer.interface.flush() catch |err| return self.ioError(err);
+        } else {
+            self.stream_writer.interface.flush() catch |err| return self.ioError(err);
+        }
+    }
+
     pub fn setDeadline(self: *HttpConn, deadline: Deadline) void {
         self.stream_reader.deadline = deadline;
         self.stream_writer.deadline = deadline;

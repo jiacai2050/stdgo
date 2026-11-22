@@ -4,14 +4,15 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 pub const Buffer = struct {
+    pub const small_buffer_size = 64;
+
     allocator: Allocator,
+    bootstrap: [small_buffer_size]u8 = undefined,
     storage: []u8,
     length: usize = 0,
     off: usize = 0,
     last_read_byte: bool = false,
     writer_inst: std.Io.Writer,
-
-    const small_buffer_size = 64;
 
     const writer_vtable: std.Io.Writer.VTable = .{
         .drain = drainImpl,
@@ -19,10 +20,15 @@ pub const Buffer = struct {
         .rebase = rebaseImpl,
     };
 
+    inline fn isBootstrap(self: *const Buffer) bool {
+        return @intFromPtr(self.storage.ptr) == @intFromPtr(&self.bootstrap);
+    }
+
     pub fn init(allocator: Allocator) Buffer {
         return .{
             .allocator = allocator,
-            .storage = &[_]u8{},
+            .bootstrap = undefined,
+            .storage = &.{},
             .length = 0,
             .off = 0,
             .last_read_byte = false,
@@ -35,10 +41,10 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
-        if (self.storage.len > 0) {
+        if (self.storage.len > 0 and !self.isBootstrap()) {
             self.allocator.free(self.storage);
-            self.storage = &[_]u8{};
         }
+        self.storage = &.{};
         self.length = 0;
         self.off = 0;
         self.last_read_byte = false;
@@ -78,9 +84,9 @@ pub const Buffer = struct {
             return &[_]u8{};
         }
         const unread = self.storage[self.off..total];
-        if (self.off == 0 and total == self.storage.len) {
+        if (self.off == 0 and total == self.storage.len and !self.isBootstrap()) {
             const s = self.storage;
-            self.storage = &[_]u8{};
+            self.storage = &.{};
             self.length = 0;
             self.off = 0;
             self.writer_inst.buffer = &.{};
@@ -132,8 +138,25 @@ pub const Buffer = struct {
             return;
         }
 
-        const needed = self.length + n;
+        const total = self.length + self.writer_inst.end;
+        const needed = total + n;
         if (needed <= self.storage.len) return;
+
+        if (self.storage.len == 0 or self.isBootstrap()) {
+            if (needed <= small_buffer_size) {
+                self.storage = &self.bootstrap;
+                self.writer_inst.buffer = self.storage[self.length..];
+                return;
+            }
+            const new_cap = @max(small_buffer_size * 2 + n, small_buffer_size);
+            const new_storage = try self.allocator.alloc(u8, new_cap);
+            if (total > 0) {
+                @memcpy(new_storage[0..total], self.storage[0..total]);
+            }
+            self.storage = new_storage;
+            self.writer_inst.buffer = self.storage[self.length..];
+            return;
+        }
 
         const new_cap = @max(self.storage.len * 2 + n, small_buffer_size);
         const new_storage = try self.allocator.realloc(self.storage, new_cap);
@@ -143,6 +166,10 @@ pub const Buffer = struct {
 
     pub fn write(self: *Buffer, p: []const u8) Allocator.Error!usize {
         self.last_read_byte = false;
+        if (self.writer_inst.end > 0) {
+            self.length += self.writer_inst.end;
+            self.writer_inst.end = 0;
+        }
         try self.grow(p.len);
         @memcpy(self.storage[self.length .. self.length + p.len], p);
         self.length += p.len;
@@ -197,6 +224,9 @@ pub const Buffer = struct {
     }
 
     pub fn writer(self: *Buffer) *std.Io.Writer {
+        if (self.storage.len == 0) {
+            self.storage = &self.bootstrap;
+        }
         self.writer_inst.buffer = self.storage[self.length..];
         self.writer_inst.end = 0;
         return &self.writer_inst;
@@ -304,4 +334,53 @@ test "bytes.Buffer writer and reader" {
     var r = b.reader();
     const data = try r.take(6);
     try testing.expectEqualStrings("std.Io", data);
+}
+
+test "bytes.Buffer bootstrap avoids heap allocation for <= 64 bytes" {
+    const testing = std.testing;
+    var failing_alloc = testing.FailingAllocator.init(
+        testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    const no_alloc = failing_alloc.allocator();
+
+    var b = Buffer.init(no_alloc);
+    defer b.deinit();
+
+    const data64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try testing.expectEqual(@as(usize, 64), data64.len);
+
+    _ = try b.write(data64);
+    try testing.expectEqualStrings(data64, b.string());
+    try testing.expectEqual(@as(usize, 64), b.cap());
+}
+
+test "bytes.Buffer grow beyond bootstrap switches to heap" {
+    const testing = std.testing;
+    var b = Buffer.init(testing.allocator);
+    defer b.deinit();
+
+    const data64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    _ = try b.write(data64);
+    try testing.expect(b.isBootstrap());
+
+    _ = try b.write("overflow");
+    try testing.expect(!b.isBootstrap());
+    try testing.expect(b.cap() >= 72);
+    try testing.expectEqualStrings(data64 ++ "overflow", b.string());
+}
+
+test "bytes.Buffer toOwnedSlice from bootstrap allocates owned slice" {
+    const testing = std.testing;
+    var b = Buffer.init(testing.allocator);
+    defer b.deinit();
+
+    _ = try b.write("short bootstrap slice");
+    try testing.expect(b.isBootstrap());
+
+    const owned = try b.toOwnedSlice();
+    defer testing.allocator.free(owned);
+
+    try testing.expectEqualStrings("short bootstrap slice", owned);
+    try testing.expectEqual(@as(usize, 0), b.len());
 }

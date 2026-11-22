@@ -242,6 +242,123 @@ pub const Transport = struct {
         }
     }
 
+    fn writeRequestHead(
+        conn: *HttpConn,
+        req: *Request,
+        target: anytype,
+        use_proxy: bool,
+        is_socks_proxy: bool,
+        proxy_auth_header: ?[]const u8,
+        options: TransportOptions,
+    ) !void {
+        var head_w = conn.writer();
+        try head_w.writeAll(req.method.asString());
+        try head_w.writeByte(' ');
+        if (use_proxy and !target.is_tls and !is_socks_proxy) {
+            // Forward proxy plain HTTP request uses absolute URI
+            const is_abs = std.mem.startsWith(u8, req.url, "http://") or
+                std.mem.startsWith(u8, req.url, "https://");
+            if (is_abs) {
+                try head_w.writeAll(req.url);
+            } else {
+                try head_w.writeAll("http://");
+                try head_w.writeAll(req.url);
+            }
+        } else {
+            if (!std.mem.startsWith(u8, target.request_target, "/")) {
+                try head_w.writeByte('/');
+            }
+            try head_w.writeAll(target.request_target);
+        }
+        try head_w.writeAll(" HTTP/1.1\r\n");
+
+        if (req.header.get("Host") == null) {
+            try head_w.writeAll("Host: ");
+            try head_w.writeAll(target.host);
+            const is_default_port = (!target.is_tls and target.port == 80) or
+                (target.is_tls and target.port == 443);
+            if (!is_default_port) {
+                var port_buf: [8]u8 = undefined;
+                const port_str = try std.fmt.bufPrint(&port_buf, ":{d}", .{target.port});
+                try head_w.writeAll(port_str);
+            }
+            try head_w.writeAll("\r\n");
+        }
+
+        if (use_proxy and !target.is_tls and !is_socks_proxy) {
+            if (req.header.get("Proxy-Connection") == null) {
+                try head_w.writeAll("Proxy-Connection: Keep-Alive\r\n");
+            }
+            if (proxy_auth_header) |auth| {
+                if (req.header.get("Proxy-Authorization") == null) {
+                    try head_w.writeAll("Proxy-Authorization: ");
+                    try head_w.writeAll(auth);
+                    try head_w.writeAll("\r\n");
+                }
+            }
+        }
+
+        if (req.header.get("User-Agent") == null) {
+            try head_w.writeAll("User-Agent: curl/8.7.1\r\n");
+        }
+        if (req.header.get("Accept") == null) {
+            try head_w.writeAll("Accept: */*\r\n");
+        }
+        if (!options.disable_compression and req.header.get("Accept-Encoding") == null) {
+            try head_w.writeAll("Accept-Encoding: gzip\r\n");
+        }
+        if (req.header.get("Connection") == null) {
+            if (options.max_idle_conns_per_host > 0) {
+                try head_w.writeAll("Connection: keep-alive\r\n");
+            } else {
+                try head_w.writeAll("Connection: close\r\n");
+            }
+        }
+
+        if (req.body) |b| {
+            const has_len = req.header.get("Content-Length") != null or
+                req.header.get("Transfer-Encoding") != null;
+            if (!has_len) {
+                var cl_buf: [32]u8 = undefined;
+                const cl_str = try std.fmt.bufPrint(
+                    &cl_buf,
+                    "Content-Length: {d}\r\n",
+                    .{b.len},
+                );
+                try head_w.writeAll(cl_str);
+            }
+        } else if (req.body_reader != null) {
+            if (req.content_length) |len| {
+                const has_len = req.header.get("Content-Length") != null or
+                    req.header.get("Transfer-Encoding") != null;
+                if (!has_len) {
+                    var cl_buf: [32]u8 = undefined;
+                    const cl_str = try std.fmt.bufPrint(
+                        &cl_buf,
+                        "Content-Length: {d}\r\n",
+                        .{len},
+                    );
+                    try head_w.writeAll(cl_str);
+                }
+            } else {
+                if (req.header.get("Transfer-Encoding") == null) {
+                    try head_w.writeAll("Transfer-Encoding: chunked\r\n");
+                }
+            }
+        }
+
+        for (req.header.entries.items) |entry| {
+            try head_w.writeAll(entry.name);
+            try head_w.writeAll(": ");
+            try head_w.writeAll(entry.value);
+            try head_w.writeAll("\r\n");
+        }
+        try head_w.writeAll("\r\n");
+
+        try head_w.flush();
+        try conn.flush();
+    }
+
     pub fn roundTrip(self: *Transport, req: *Request, deadline: deadline_mod.Deadline) !Response {
         try deadline.validate();
         return self.roundTripWithBudget(req, deadline);
@@ -465,115 +582,18 @@ pub const Transport = struct {
             conn.setDeadline(deadline);
             try conn.checkDeadline();
 
-            // Serialize HTTP/1.1 request
-            var req_buf = std.ArrayListUnmanaged(u8).empty;
-            defer req_buf.deinit(self.allocator);
-
-            try req_buf.appendSlice(self.allocator, req.method.asString());
-            try req_buf.append(self.allocator, ' ');
-            if (use_proxy and !target.is_tls and !is_socks_proxy) {
-                // Forward proxy plain HTTP request uses absolute URI
-                const is_abs = std.mem.startsWith(u8, req.url, "http://") or
-                    std.mem.startsWith(u8, req.url, "https://");
-                if (is_abs) {
-                    try req_buf.appendSlice(self.allocator, req.url);
-                } else {
-                    try req_buf.appendSlice(self.allocator, "http://");
-                    try req_buf.appendSlice(self.allocator, req.url);
-                }
-            } else {
-                if (!std.mem.startsWith(u8, target.request_target, "/")) {
-                    try req_buf.append(self.allocator, '/');
-                }
-                try req_buf.appendSlice(self.allocator, target.request_target);
-            }
-            try req_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
-
-            if (req.header.get("Host") == null) {
-                try req_buf.appendSlice(self.allocator, "Host: ");
-                try req_buf.appendSlice(self.allocator, target.host);
-                const is_default_port = (!target.is_tls and target.port == 80) or
-                    (target.is_tls and target.port == 443);
-                if (!is_default_port) {
-                    var port_buf: [8]u8 = undefined;
-                    const port_str = try std.fmt.bufPrint(&port_buf, ":{d}", .{target.port});
-                    try req_buf.appendSlice(self.allocator, port_str);
-                }
-                try req_buf.appendSlice(self.allocator, "\r\n");
-            }
-
-            if (use_proxy and !target.is_tls and !is_socks_proxy) {
-                if (req.header.get("Proxy-Connection") == null) {
-                    try req_buf.appendSlice(self.allocator, "Proxy-Connection: Keep-Alive\r\n");
-                }
-                if (proxy_auth_header) |auth| {
-                    if (req.header.get("Proxy-Authorization") == null) {
-                        try req_buf.appendSlice(self.allocator, "Proxy-Authorization: ");
-                        try req_buf.appendSlice(self.allocator, auth);
-                        try req_buf.appendSlice(self.allocator, "\r\n");
-                    }
-                }
-            }
-
-            if (req.header.get("User-Agent") == null) {
-                try req_buf.appendSlice(self.allocator, "User-Agent: curl/8.7.1\r\n");
-            }
-            if (req.header.get("Accept") == null) {
-                try req_buf.appendSlice(self.allocator, "Accept: */*\r\n");
-            }
-            if (!self.options.disable_compression and req.header.get("Accept-Encoding") == null) {
-                try req_buf.appendSlice(self.allocator, "Accept-Encoding: gzip\r\n");
-            }
-            if (req.header.get("Connection") == null) {
-                if (self.options.max_idle_conns_per_host > 0) {
-                    try req_buf.appendSlice(self.allocator, "Connection: keep-alive\r\n");
-                } else {
-                    try req_buf.appendSlice(self.allocator, "Connection: close\r\n");
-                }
-            }
-
-            if (req.body) |b| {
-                const has_len = req.header.get("Content-Length") != null or
-                    req.header.get("Transfer-Encoding") != null;
-                if (!has_len) {
-                    var cl_buf: [32]u8 = undefined;
-                    const cl_str = try std.fmt.bufPrint(
-                        &cl_buf,
-                        "Content-Length: {d}\r\n",
-                        .{b.len},
-                    );
-                    try req_buf.appendSlice(self.allocator, cl_str);
-                }
-            } else if (req.body_reader != null) {
-                if (req.content_length) |len| {
-                    const has_len = req.header.get("Content-Length") != null or
-                        req.header.get("Transfer-Encoding") != null;
-                    if (!has_len) {
-                        var cl_buf: [32]u8 = undefined;
-                        const cl_str = try std.fmt.bufPrint(
-                            &cl_buf,
-                            "Content-Length: {d}\r\n",
-                            .{len},
-                        );
-                        try req_buf.appendSlice(self.allocator, cl_str);
-                    }
-                } else {
-                    if (req.header.get("Transfer-Encoding") == null) {
-                        try req_buf.appendSlice(self.allocator, "Transfer-Encoding: chunked\r\n");
-                    }
-                }
-            }
-
-            for (req.header.entries.items) |entry| {
-                try req_buf.appendSlice(self.allocator, entry.name);
-                try req_buf.appendSlice(self.allocator, ": ");
-                try req_buf.appendSlice(self.allocator, entry.value);
-                try req_buf.appendSlice(self.allocator, "\r\n");
-            }
-            try req_buf.appendSlice(self.allocator, "\r\n");
-
-            const write_res = conn.writeAll(req_buf.items);
-            if (write_res) |_| {} else |err| {
+            // Serialize and stream HTTP/1.1 request head directly
+            const write_res = writeRequestHead(
+                conn,
+                req,
+                target,
+                use_proxy,
+                is_socks_proxy,
+                proxy_auth_header,
+                self.options,
+            );
+            if (write_res) |_| {} else |raw_err| {
+                const err = conn.ioError(raw_err);
                 const retryable_err = err != error.Timeout and err != error.Canceled;
                 if (pooled != null and req.body_reader == null and retryable_err) {
                     conn.close(self.io);

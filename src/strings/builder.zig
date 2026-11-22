@@ -73,3 +73,23 @@ test "strings.Builder writeString and runes" {
     try testing.expectEqual(@as(usize, 0), b.len());
     try testing.expectEqualStrings("", b.string());
 }
+
+test "strings.Builder bootstrap avoids heap allocation for <= 64 bytes" {
+    const testing = std.testing;
+    var failing_alloc = testing.FailingAllocator.init(
+        testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    const no_alloc = failing_alloc.allocator();
+
+    var b = Builder.init(no_alloc);
+    defer b.deinit();
+
+    _ = try b.writeString("Hello from strings.Builder! ");
+    try b.writeByte('@');
+    _ = try b.writeRune(0x2728);
+
+    try testing.expect(b.len() <= 64);
+    try testing.expectEqualStrings("Hello from strings.Builder! @✨", b.string());
+    try testing.expectEqual(@as(usize, 64), b.cap());
+}

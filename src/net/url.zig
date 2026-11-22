@@ -39,47 +39,84 @@ fn shouldEscape(c: u8, mode: EscapeMode) bool {
 }
 
 /// QueryEscape escapes the string, making it safe to be placed in a URL query.
-pub fn queryEscape(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
+/// Returns s directly without allocation if no escaping is needed.
+pub fn queryEscape(allocator: Allocator, s: []const u8) Allocator.Error![]const u8 {
     return escape(allocator, s, .query);
 }
 
 /// PathEscape escapes the string, making it safe to be placed in a URL path segment.
-pub fn pathEscape(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
+/// Returns s directly without allocation if no escaping is needed.
+pub fn pathEscape(allocator: Allocator, s: []const u8) Allocator.Error![]const u8 {
     return escape(allocator, s, .path);
 }
 
-fn escape(allocator: Allocator, s: []const u8, mode: EscapeMode) Allocator.Error![]u8 {
+/// QueryEscapeBuf escapes s into buf without heap allocation, returning the escaped slice.
+/// Returns s directly without touching buf if s requires no escaping.
+pub fn queryEscapeBuf(buf: []u8, s: []const u8) []const u8 {
+    return escapeBuf(buf, s, .query);
+}
+
+/// PathEscapeBuf escapes s into buf without heap allocation, returning the escaped slice.
+/// Returns s directly without touching buf if s requires no escaping.
+pub fn pathEscapeBuf(buf: []u8, s: []const u8) []const u8 {
+    return escapeBuf(buf, s, .path);
+}
+
+fn countEscapeExtra(s: []const u8, mode: EscapeMode, has_space_query: *bool) usize {
     var extra: usize = 0;
-    var has_space_query = false;
+    has_space_query.* = false;
     for (s) |c| {
         if (c == ' ' and mode == .query) {
-            has_space_query = true;
+            has_space_query.* = true;
         } else if (shouldEscape(c, mode)) {
             extra += 2;
         }
     }
-    if (extra == 0 and !has_space_query) {
-        return try allocator.dupe(u8, s);
-    }
+    return extra;
+}
 
-    const t = try allocator.alloc(u8, s.len + extra);
+fn escapeInto(dest: []u8, s: []const u8, mode: EscapeMode) void {
     var j: usize = 0;
     for (s) |c| {
         if (c == ' ' and mode == .query) {
-            t[j] = '+';
+            dest[j] = '+';
             j += 1;
         } else if (shouldEscape(c, mode)) {
-            t[j] = '%';
-            t[j + 1] = upper_hex[c >> 4];
-            t[j + 2] = upper_hex[c & 15];
+            dest[j] = '%';
+            dest[j + 1] = upper_hex[c >> 4];
+            dest[j + 2] = upper_hex[c & 15];
             j += 3;
         } else {
-            t[j] = c;
+            dest[j] = c;
             j += 1;
         }
     }
-    assert(j == t.len);
+    assert(j == dest.len);
+}
+
+fn escape(allocator: Allocator, s: []const u8, mode: EscapeMode) Allocator.Error![]const u8 {
+    var has_space_query = false;
+    const extra = countEscapeExtra(s, mode, &has_space_query);
+    if (extra == 0 and !has_space_query) {
+        return s;
+    }
+
+    const t = try allocator.alloc(u8, s.len + extra);
+    escapeInto(t, s, mode);
     return t;
+}
+
+fn escapeBuf(buf: []u8, s: []const u8, mode: EscapeMode) []const u8 {
+    var has_space_query = false;
+    const extra = countEscapeExtra(s, mode, &has_space_query);
+    if (extra == 0 and !has_space_query) {
+        return s;
+    }
+
+    const needed = s.len + extra;
+    assert(buf.len >= needed);
+    escapeInto(buf[0..needed], s, mode);
+    return buf[0..needed];
 }
 
 /// QueryUnescape does the inverse transformation of QueryEscape.
@@ -189,11 +226,11 @@ pub const Values = struct {
                 }
                 first = false;
                 const ek = try queryEscape(allocator, entry.key);
-                defer allocator.free(ek);
+                defer if (ek.ptr != entry.key.ptr) allocator.free(ek);
                 _ = try buf.write(ek);
                 try buf.writeByte('=');
                 const ev = try queryEscape(allocator, val);
-                defer allocator.free(ev);
+                defer if (ev.ptr != val.ptr) allocator.free(ev);
                 _ = try buf.write(ev);
             }
         }
@@ -298,12 +335,34 @@ test "net.url escape and unescape" {
 
     const raw = "hello world & foo=bar/baz";
     const q_esc = try queryEscape(testing.allocator, raw);
-    defer testing.allocator.free(q_esc);
+    defer if (q_esc.ptr != raw.ptr) testing.allocator.free(q_esc);
     try testing.expectEqualStrings("hello+world+%26+foo%3Dbar%2Fbaz", q_esc);
 
     const q_unesc = try queryUnescape(testing.allocator, q_esc);
     defer testing.allocator.free(q_unesc);
     try testing.expectEqualStrings(raw, q_unesc);
+}
+
+test "net.url escape zero allocation on clean input and buf variants" {
+    const testing = std.testing;
+
+    const clean = "simple_identifier_123";
+    const esc = try queryEscape(testing.allocator, clean);
+    try testing.expectEqual(clean.ptr, esc.ptr);
+
+    const path_clean = "/usr/local/bin";
+    const p_esc = try pathEscape(testing.allocator, path_clean);
+    try testing.expectEqual(path_clean.ptr, p_esc.ptr);
+
+    var buf: [64]u8 = undefined;
+    const q_buf = queryEscapeBuf(&buf, "hello world");
+    try testing.expectEqualStrings("hello+world", q_buf);
+
+    const q_clean_buf = queryEscapeBuf(&buf, clean);
+    try testing.expectEqual(clean.ptr, q_clean_buf.ptr);
+
+    const p_buf = pathEscapeBuf(&buf, "foo bar/baz");
+    try testing.expectEqualStrings("foo%20bar/baz", p_buf);
 }
 
 test "net.url parse diverse forms" {

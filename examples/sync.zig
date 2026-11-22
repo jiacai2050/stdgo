@@ -50,7 +50,10 @@ pub fn main(init: std.process.Init) !void {
     const Initializer = struct {
         fn initResource(counter: *usize) void {
             counter.* += 1;
-            std.debug.print("   *** Resource expensive setup executed! (Count: {d}) ***\n", .{counter.*});
+            std.debug.print(
+                "   *** Resource expensive setup executed! (Count: {d}) ***\n",
+                .{counter.*},
+            );
         }
     };
 
@@ -88,13 +91,16 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("   Acquired buf1 from pool, set len = {d}\n", .{buf1.len});
 
     // Return to pool
-    try pool.put(buf1);
+    pool.put(buf1);
     std.debug.print("   Returned buf1 to pool\n", .{});
 
     // Acquire again (should reuse)
     const buf2 = (try pool.get()).?;
-    std.debug.print("   Acquired buf2 from pool, reused same buffer? {any} (len={d})\n", .{ buf1 == buf2, buf2.len });
-    try pool.put(buf2);
+    std.debug.print(
+        "   Acquired buf2 from pool, reused same buffer? {any} (len={d})\n",
+        .{ buf1 == buf2, buf2.len },
+    );
+    pool.put(buf2);
 
     std.debug.print("\n=== sync demo completed successfully! ===\n", .{});
 }

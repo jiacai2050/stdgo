@@ -972,6 +972,7 @@ pub const Template = struct {
                 var out = std.ArrayList(u8).empty;
                 for (args) |arg| {
                     const s = try valueToString(allocator, arg);
+                    defer allocator.free(s);
                     try out.appendSlice(allocator, s);
                 }
                 return Value{ .string = try out.toOwnedSlice(allocator) };
@@ -982,6 +983,7 @@ pub const Template = struct {
                 for (args, 0..) |arg, i| {
                     if (i > 0) try out.append(allocator, ' ');
                     const s = try valueToString(allocator, arg);
+                    defer allocator.free(s);
                     try out.appendSlice(allocator, s);
                 }
                 try out.append(allocator, '\n');
@@ -1028,9 +1030,15 @@ pub const Template = struct {
                             arg_idx += 1;
                             switch (spec) {
                                 's' => {
+                                    var to_free: ?[]const u8 = null;
+                                    defer if (to_free) |f| allocator.free(f);
                                     const s = switch (arg) {
                                         .string => |str| str,
-                                        else => try valueToString(allocator, arg),
+                                        else => blk: {
+                                            const res = try valueToString(allocator, arg);
+                                            to_free = res;
+                                            break :blk res;
+                                        },
                                     };
                                     if (width) |w| {
                                         if (s.len < w) {
@@ -1080,6 +1088,7 @@ pub const Template = struct {
                                 },
                                 'v' => {
                                     const s = try valueToString(allocator, arg);
+                                    defer allocator.free(s);
                                     try out.appendSlice(allocator, s);
                                 },
                                 else => {
@@ -1258,8 +1267,9 @@ fn compareValues(a: Value, b: Value) ?std.math.Order {
 fn valueToString(allocator: Allocator, val: Value) anyerror![]const u8 {
     const bytes = @import("../bytes.zig");
     var buf = bytes.Buffer.init(allocator);
+    defer buf.deinit();
     try val.format(buf.writer());
-    return buf.string();
+    return try buf.toOwnedSlice();
 }
 
 /// Must is a helper that wraps a call to a function returning (*Template, error)

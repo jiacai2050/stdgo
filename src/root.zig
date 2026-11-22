@@ -268,7 +268,7 @@ test "stdgo integration: sync.Pool + math.rand" {
 
     try testing.expect(b.len() > 15);
     b.reset();
-    try pool.put(b);
+    pool.put(b);
 }
 
 test "stdgo integration: net.http Request and Header" {

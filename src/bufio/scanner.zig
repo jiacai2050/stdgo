@@ -36,7 +36,7 @@ pub const SplitFunc = *const fn (data: []const u8, at_eof: bool) anyerror!SplitR
 
 /// Scanner provides a convenient interface for reading tokenized data from an io.Reader.
 pub const Scanner = struct {
-    allocator: Allocator,
+    allocator: ?Allocator = null,
     r: *std.Io.Reader,
     split_fn: SplitFunc = scanLines,
 
@@ -76,10 +76,32 @@ pub const Scanner = struct {
         };
     }
 
+    /// Initializes a new Scanner reading from r using caller-provided buffer.
+    /// Does not allocate heap memory and avoids allocations when scanning.
+    pub fn initWithBuffer(r: *std.Io.Reader, buf: []u8, max_size: usize) Scanner {
+        return .{
+            .allocator = null,
+            .r = r,
+            .split_fn = scanLines,
+            .buf = buf,
+            .start = 0,
+            .end = 0,
+            .token_slice = null,
+            .err_val = null,
+            .empties = 0,
+            .scan_called = false,
+            .done = false,
+            .max_token_size = max_size,
+            .allocated_buf = false,
+        };
+    }
+
     /// Releases resources allocated by the Scanner.
     pub fn deinit(self: *Scanner) void {
         if (self.allocated_buf and self.buf.len > 0) {
-            self.allocator.free(self.buf);
+            if (self.allocator) |alloc| {
+                alloc.free(self.buf);
+            }
             self.buf = &.{};
         }
     }
@@ -156,13 +178,15 @@ pub const Scanner = struct {
 
             // 4. If buffer is full, reallocate up to max_token_size
             if (self.end == self.buf.len) {
-                if (self.buf.len >= self.max_token_size) {
+                if (!self.allocated_buf or self.allocator == null or
+                    self.buf.len >= self.max_token_size)
+                {
                     self.setErr(Error.TokenTooLong);
                     return false;
                 }
 
                 const new_size = @min(self.buf.len * 2, self.max_token_size);
-                const new_buf = self.allocator.realloc(self.buf, new_size) catch |e| {
+                const new_buf = self.allocator.?.realloc(self.buf, new_size) catch |e| {
                     self.setErr(e);
                     return false;
                 };
@@ -429,6 +453,25 @@ test "Scanner: token too long error" {
 
     try testing.expect(!scanner.scan());
     try testing.expectEqual(error.TokenTooLong, scanner.err().?);
+}
+
+test "Scanner: initWithBuffer zero allocation" {
+    const testing = std.testing;
+    const input = "alpha\nbeta\ngamma";
+    var r = stdgo_bytes_reader(input);
+
+    var buf: [64]u8 = undefined;
+    var scanner = Scanner.initWithBuffer(r.reader(), &buf, 64);
+    defer scanner.deinit();
+
+    const expected = [_][]const u8{ "alpha", "beta", "gamma" };
+    var count: usize = 0;
+    while (scanner.scan()) {
+        try testing.expectEqualStrings(expected[count], scanner.text());
+        count += 1;
+    }
+    try testing.expectEqual(expected.len, count);
+    try testing.expect(scanner.err() == null);
 }
 
 fn stdgo_bytes_reader(str: []const u8) @import("../bytes/reader.zig").Reader {
