@@ -90,11 +90,13 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             clean_dsn = clean_dsn["sqlite://".len..];
         }
 
+        if (std.mem.indexOfScalar(u8, clean_dsn, 0) != null) {
+            return error.SQLiteOpenFailed;
+        }
+
         var db: ?*c.sqlite3 = null;
-        const null_terminated_dsn = try self.allocator.alloc(u8, clean_dsn.len + 1);
+        const null_terminated_dsn = try self.allocator.dupeSentinel(u8, clean_dsn, 0);
         defer self.allocator.free(null_terminated_dsn);
-        @memcpy(null_terminated_dsn[0..clean_dsn.len], clean_dsn);
-        null_terminated_dsn[clean_dsn.len] = 0;
 
         // Open database with READWRITE, CREATE, and URI support
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_URI;
@@ -127,12 +129,85 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         };
     }
 
+    /// Maps SQLite C result codes consistently across prepare, exec, query, and tx operations.
+    fn mapSQLiteError(rc: c_int, progress_failure: ?anyerror, fallback: anyerror) anyerror {
+        if (progress_failure) |err| return err;
+        return switch (rc) {
+            c.SQLITE_INTERRUPT => error.Interrupted,
+            c.SQLITE_BUSY => error.Busy,
+            c.SQLITE_LOCKED => error.Locked,
+            c.SQLITE_NOMEM => error.OutOfMemory,
+            else => fallback,
+        };
+    }
+
+    /// Computes the remaining unparsed SQL suffix from a sqlite3_prepare_v2 pzTail pointer.
+    fn sliceTail(sql: []const u8, tail_ptr: [*c]const u8) []const u8 {
+        if (tail_ptr == null) return "";
+        const base_addr = @intFromPtr(sql.ptr);
+        const tail_addr = @intFromPtr(tail_ptr);
+        std.debug.assert(tail_addr >= base_addr);
+        const consumed = tail_addr - base_addr;
+        std.debug.assert(consumed <= sql.len);
+        return sql[consumed..];
+    }
+
+    /// Prepares exactly one executable SQL statement and rejects trailing executable statements.
+    /// Trailing whitespace, comments, and empty semicolons are permitted.
+    fn prepareSingleStatement(
+        db: *c.sqlite3,
+        query: []const u8,
+        progress: *const Progress,
+    ) anyerror!*c.sqlite3_stmt {
+        if (query.len == 0) return error.SQLiteEmptyStatement;
+        const query_len = std.math.cast(c_int, query.len) orelse return error.SQLitePrepareFailed;
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        var tail_ptr: [*c]const u8 = null;
+        const rc = c.sqlite3_prepare_v2(db, query.ptr, query_len, &stmt, &tail_ptr);
+        if (rc != c.SQLITE_OK) {
+            return mapSQLiteError(rc, progress.failure, error.SQLitePrepareFailed);
+        }
+
+        // Per SQLite C API specification: when the input query contains no executable VDBE
+        // bytecode (e.g. empty string, whitespace only, pure comments, or trailing/isolated
+        // semicolons), sqlite3_prepare_v2 returns SQLITE_OK (0) but sets *ppStmt to NULL.
+        const non_null_stmt = stmt orelse return error.SQLiteEmptyStatement;
+        errdefer _ = c.sqlite3_finalize(non_null_stmt);
+
+        var remaining = sliceTail(query, tail_ptr);
+        while (remaining.len > 0) {
+            var next_stmt: ?*c.sqlite3_stmt = null;
+            var next_tail: [*c]const u8 = null;
+            const next_rc = c.sqlite3_prepare_v2(
+                db,
+                remaining.ptr,
+                @intCast(remaining.len),
+                &next_stmt,
+                &next_tail,
+            );
+            if (next_stmt) |extra_stmt| {
+                _ = c.sqlite3_finalize(extra_stmt);
+                return error.SQLiteMultipleStatements;
+            }
+            if (next_rc != c.SQLITE_OK) {
+                return mapSQLiteError(next_rc, progress.failure, error.SQLitePrepareFailed);
+            }
+            const next_remaining = sliceTail(remaining, next_tail);
+            if (next_remaining.len >= remaining.len) break;
+            remaining = next_remaining;
+        }
+
+        return non_null_stmt;
+    }
+
     /// SQLiteConn wraps a live sqlite3 handle and implements driver_pkg.Conn.
     const SQLiteConn = struct {
         allocator: Allocator,
         db: *c.sqlite3,
 
-        /// Prepares a SQL query statement for execution.
+        /// Prepares a single SQL query statement for execution.
+        /// Rejects empty statements and multi-statement SQL strings.
         fn prepare(
             ctx: *anyopaque,
             io: std.Io,
@@ -145,17 +220,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             progress.start(self.db);
             defer progress.stop(self.db);
 
-            var stmt: ?*c.sqlite3_stmt = null;
-            const rc = c.sqlite3_prepare_v2(self.db, query.ptr, @intCast(query.len), &stmt, null);
-            if (rc != c.SQLITE_OK) {
-                return progress.failure orelse error.SQLitePrepareFailed;
-            }
-
-            // Per SQLite C API specification: when the input query contains no executable VDBE
-            // bytecode (e.g. empty string, whitespace only, pure comments, or trailing/isolated
-            // semicolons), sqlite3_prepare_v2 returns SQLITE_OK (0) but sets *ppStmt to NULL.
-            // Guard against null explicitly to eliminate unsafe unwrap (.?) panics.
-            const non_null_stmt = stmt orelse return error.SQLiteEmptyStatement;
+            const non_null_stmt = try prepareSingleStatement(self.db, query, &progress);
             errdefer _ = c.sqlite3_finalize(non_null_stmt);
             try driver_pkg.checkOperation(io, deadline);
 
@@ -190,6 +255,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         }
 
         /// Starts a new SQLite transaction observing TxOptions.
+        /// Note: SQLite defaults to serializable transactions. Writable `.serializable`
+        /// acquires the write lock eagerly via `BEGIN IMMEDIATE`; other levels and
+        /// `read_only = true` map to `BEGIN DEFERRED` (SQLite does not enforce read-only
+        /// semantics at the `BEGIN` statement level).
         fn beginTx(
             ctx: *anyopaque,
             io: std.Io,
@@ -215,9 +284,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                 => "BEGIN DEFERRED",
             };
             var errmsg: [*c]u8 = null;
-            if (c.sqlite3_exec(self.db, sql, null, null, &errmsg) != c.SQLITE_OK) {
+            const rc = c.sqlite3_exec(self.db, sql, null, null, &errmsg);
+            if (rc != c.SQLITE_OK) {
                 if (errmsg != null) c.sqlite3_free(errmsg);
-                return progress.failure orelse error.SQLiteTxBeginFailed;
+                return mapSQLiteError(rc, progress.failure, error.SQLiteTxBeginFailed);
             }
             tx.* = .{
                 .allocator = self.allocator,
@@ -241,18 +311,22 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             progress.start(self.db);
             defer progress.stop(self.db);
             var stmt: ?*c.sqlite3_stmt = null;
-            if (c.sqlite3_prepare_v2(self.db, "SELECT 1", -1, &stmt, null) != c.SQLITE_OK) {
-                return progress.failure orelse error.SQLitePingFailed;
+            const prep_rc = c.sqlite3_prepare_v2(self.db, "SELECT 1", -1, &stmt, null);
+            if (prep_rc != c.SQLITE_OK) {
+                return mapSQLiteError(prep_rc, progress.failure, error.SQLitePingFailed);
             }
             const non_null_stmt = stmt orelse return error.SQLitePingFailed;
             defer _ = c.sqlite3_finalize(non_null_stmt);
-            if (c.sqlite3_step(non_null_stmt) != c.SQLITE_ROW) {
-                return progress.failure orelse error.SQLitePingFailed;
+            const step_rc = c.sqlite3_step(non_null_stmt);
+            if (step_rc != c.SQLITE_ROW) {
+                return mapSQLiteError(step_rc, progress.failure, error.SQLitePingFailed);
             }
             try driver_pkg.checkOperation(io, deadline);
         }
 
-        /// Executes a query directly on this connection without allocating SQLiteStmt.
+        /// Executes one or more SQL statements directly on this connection without allocating
+        /// SQLiteStmt. Multi-statement SQL scripts (e.g. DDL migrations) are supported when
+        /// `args` is empty; parameterized calls strictly require a single statement.
         fn execDirect(
             ctx: *anyopaque,
             io: std.Io,
@@ -261,28 +335,57 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             deadline: Deadline,
         ) anyerror!Result {
             try driver_pkg.checkOperation(io, deadline);
+            if (query.len == 0) return error.SQLiteEmptyStatement;
+            if (std.math.cast(c_int, query.len) == null) return error.SQLitePrepareFailed;
+
             const self: *SQLiteConn = @ptrCast(@alignCast(ctx));
             var progress: Progress = .{ .io = io, .deadline = deadline };
             progress.start(self.db);
             defer progress.stop(self.db);
 
-            var stmt: ?*c.sqlite3_stmt = null;
-            const rc = c.sqlite3_prepare_v2(self.db, query.ptr, @intCast(query.len), &stmt, null);
-            if (rc != c.SQLITE_OK) {
-                return progress.failure orelse error.SQLitePrepareFailed;
+            if (args.len > 0) {
+                const non_null_stmt = try prepareSingleStatement(self.db, query, &progress);
+                defer _ = c.sqlite3_finalize(non_null_stmt);
+                try SQLiteStmt.bindArgs(non_null_stmt, args, .static);
+                return SQLiteStmt.stepToDoneAndResult(self.db, non_null_stmt, &progress);
             }
-            const non_null_stmt = stmt orelse return error.SQLiteEmptyStatement;
-            defer _ = c.sqlite3_finalize(non_null_stmt);
 
-            try SQLiteStmt.bindArgs(non_null_stmt, args, .static);
-
-            const step_rc = c.sqlite3_step(non_null_stmt);
-            if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
-                return progress.failure orelse error.SQLiteExecFailed;
+            const total_before = c.sqlite3_total_changes64(self.db);
+            var executed_count: usize = 0;
+            var remaining = query;
+            while (remaining.len > 0) {
+                var stmt: ?*c.sqlite3_stmt = null;
+                var tail_ptr: [*c]const u8 = null;
+                const rc = c.sqlite3_prepare_v2(
+                    self.db,
+                    remaining.ptr,
+                    @intCast(remaining.len),
+                    &stmt,
+                    &tail_ptr,
+                );
+                if (rc != c.SQLITE_OK) {
+                    return mapSQLiteError(rc, progress.failure, error.SQLitePrepareFailed);
+                }
+                if (stmt) |non_null_stmt| {
+                    defer _ = c.sqlite3_finalize(non_null_stmt);
+                    try SQLiteStmt.bindArgs(non_null_stmt, args, .static);
+                    try SQLiteStmt.stepToDone(non_null_stmt, &progress);
+                    executed_count += 1;
+                }
+                const next_remaining = sliceTail(remaining, tail_ptr);
+                if (next_remaining.len >= remaining.len) break;
+                remaining = next_remaining;
             }
+
+            if (executed_count == 0) return error.SQLiteEmptyStatement;
 
             const last_id = c.sqlite3_last_insert_rowid(self.db);
-            const rows_affected = c.sqlite3_changes(self.db);
+            var rows_affected: i64 = 0;
+            if (executed_count == 1) {
+                rows_affected = c.sqlite3_changes(self.db);
+            } else {
+                rows_affected = c.sqlite3_total_changes64(self.db) - total_before;
+            }
 
             return Result{
                 .last_insert_id = last_id,
@@ -346,10 +449,14 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             ptr: c.sqlite3_destructor_type,
         }{ .int = std.math.maxInt(usize) }).ptr;
 
-        /// Resets bindings and binds positional (?) or named (:name, @name, $name) parameters.
+        comptime {
+            std.debug.assert(@sizeOf(usize) == @sizeOf(c.sqlite3_destructor_type));
+        }
+
+        /// Binds positional (?) or named (:name, @name, $name) parameters on a reset statement.
+        /// Callers guarantee the statement is reset with cleared bindings before entry.
         fn bindArgs(stmt: *c.sqlite3_stmt, args: []const NamedValue, mode: BindMode) anyerror!void {
-            _ = c.sqlite3_reset(stmt);
-            _ = c.sqlite3_clear_bindings(stmt);
+            errdefer _ = c.sqlite3_clear_bindings(stmt);
 
             const param_count: usize = @intCast(c.sqlite3_bind_parameter_count(stmt));
 
@@ -384,9 +491,13 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                 } else blk: {
                     const p = auto_pos;
                     auto_pos += 1;
-                    // Fail-fast if user passed positional argument for a named placeholder (:name)
-                    if (c.sqlite3_bind_parameter_name(stmt, p) != null) {
-                        return error.SQLitePositionalArgForNamedParam;
+                    // Fail-fast if user passed positional argument for a named placeholder
+                    // (:name, @name, $name). Numbered positional placeholders (?1, ?2) start
+                    // with '?' and are allowed.
+                    if (c.sqlite3_bind_parameter_name(stmt, p)) |param_name| {
+                        if (param_name[0] != '?') {
+                            return error.SQLitePositionalArgForNamedParam;
+                        }
                     }
                     break :blk p;
                 };
@@ -414,29 +525,81 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                         }
                     },
                     .string => |s| {
-                        const destructor = if (mode == .transient) SQLITE_TRANSIENT else c.SQLITE_STATIC;
-                        const rc = c.sqlite3_bind_text(
-                            stmt,
-                            idx,
-                            s.ptr,
-                            @intCast(s.len),
-                            destructor,
-                        );
+                        // Empty slices may have undefined .ptr (e.g. ArrayList.empty.items);
+                        // substitute a valid static pointer instead of null (which binds SQL NULL).
+                        var rc: c_int = c.SQLITE_OK;
+                        if (s.len == 0) {
+                            rc = c.sqlite3_bind_text64(
+                                stmt,
+                                idx,
+                                "",
+                                0,
+                                c.SQLITE_STATIC,
+                                @intCast(c.SQLITE_UTF8),
+                            );
+                        } else {
+                            const destructor = if (mode == .transient)
+                                SQLITE_TRANSIENT
+                            else
+                                c.SQLITE_STATIC;
+                            rc = c.sqlite3_bind_text64(
+                                stmt,
+                                idx,
+                                s.ptr,
+                                @intCast(s.len),
+                                destructor,
+                                @intCast(c.SQLITE_UTF8),
+                            );
+                        }
                         if (rc != c.SQLITE_OK) return error.SQLiteBindFailed;
                     },
                     .bytes => |b| {
-                        const destructor = if (mode == .transient) SQLITE_TRANSIENT else c.SQLITE_STATIC;
-                        const rc = c.sqlite3_bind_blob(
-                            stmt,
-                            idx,
-                            b.ptr,
-                            @intCast(b.len),
-                            destructor,
-                        );
+                        var rc: c_int = c.SQLITE_OK;
+                        if (b.len == 0) {
+                            rc = c.sqlite3_bind_blob64(stmt, idx, "", 0, c.SQLITE_STATIC);
+                        } else {
+                            const destructor = if (mode == .transient)
+                                SQLITE_TRANSIENT
+                            else
+                                c.SQLITE_STATIC;
+                            rc = c.sqlite3_bind_blob64(
+                                stmt,
+                                idx,
+                                b.ptr,
+                                @intCast(b.len),
+                                destructor,
+                            );
+                        }
                         if (rc != c.SQLITE_OK) return error.SQLiteBindFailed;
                     },
                 }
             }
+        }
+
+        /// Steps a statement to SQLITE_DONE, draining any rows (e.g. RETURNING or PRAGMA).
+        /// SQLite only commits implicit autocommit transactions and flushes sqlite3_changes()
+        /// once the VDBE halts; progress_handler bounds execution against the deadline.
+        fn stepToDone(stmt: *c.sqlite3_stmt, progress: *const Progress) anyerror!void {
+            var step_rc = c.sqlite3_step(stmt);
+            while (step_rc == c.SQLITE_ROW) {
+                step_rc = c.sqlite3_step(stmt);
+            }
+            if (step_rc != c.SQLITE_DONE) {
+                return mapSQLiteError(step_rc, progress.failure, error.SQLiteExecFailed);
+            }
+        }
+
+        /// Steps a single statement to completion and returns its Result metadata.
+        fn stepToDoneAndResult(
+            db: *c.sqlite3,
+            stmt: *c.sqlite3_stmt,
+            progress: *const Progress,
+        ) anyerror!Result {
+            try stepToDone(stmt, progress);
+            return Result{
+                .last_insert_id = c.sqlite3_last_insert_rowid(db),
+                .rows_affected = c.sqlite3_changes(db),
+            };
         }
 
         /// Executes a prepared query that does not return rows (e.g., INSERT, UPDATE, DELETE).
@@ -448,23 +611,18 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         ) anyerror!Result {
             try driver_pkg.checkOperation(io, deadline);
             const self: *SQLiteStmt = @ptrCast(@alignCast(ctx));
+            defer {
+                // Reset VDBE and clear SQLITE_STATIC bindings before returning so the
+                // statement never retains dangling pointers or active cursors/locks.
+                _ = c.sqlite3_reset(self.stmt);
+                _ = c.sqlite3_clear_bindings(self.stmt);
+            }
             try bindArgs(self.stmt, args, .static);
             var progress: Progress = .{ .io = io, .deadline = deadline };
             progress.start(self.db);
             defer progress.stop(self.db);
 
-            const step_rc = c.sqlite3_step(self.stmt);
-            if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
-                return progress.failure orelse error.SQLiteExecFailed;
-            }
-
-            const last_id = c.sqlite3_last_insert_rowid(self.db);
-            const rows_affected = c.sqlite3_changes(self.db);
-
-            return Result{
-                .last_insert_id = last_id,
-                .rows_affected = rows_affected,
-            };
+            return stepToDoneAndResult(self.db, self.stmt, &progress);
         }
 
         /// Executes a query that returns rows (e.g., SELECT).
@@ -477,6 +635,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             try driver_pkg.checkOperation(io, deadline);
             const self: *SQLiteStmt = @ptrCast(@alignCast(ctx));
             try bindArgs(self.stmt, args, .transient);
+            errdefer _ = c.sqlite3_clear_bindings(self.stmt);
             try driver_pkg.checkOperation(io, deadline);
 
             const rows = try self.allocator.create(SQLiteRows);
@@ -516,7 +675,8 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         /// Returns the column name at the given 0-based index.
         fn columnName(ctx: *anyopaque, index: usize) []const u8 {
             const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
-            const name_ptr = c.sqlite3_column_name(self.stmt, @intCast(index));
+            const col_idx = std.math.cast(c_int, index) orelse return "";
+            const name_ptr = c.sqlite3_column_name(self.stmt, col_idx);
             if (name_ptr != null) {
                 return std.mem.span(name_ptr);
             }
@@ -526,7 +686,8 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         /// Returns the declared column type name from SQLite schema (e.g. "INTEGER", "TEXT").
         fn columnTypeDatabaseTypeName(ctx: *anyopaque, index: usize) ?[]const u8 {
             const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
-            const decl_ptr = c.sqlite3_column_decltype(self.stmt, @intCast(index));
+            const col_idx = std.math.cast(c_int, index) orelse return null;
+            const decl_ptr = c.sqlite3_column_decltype(self.stmt, col_idx);
             if (decl_ptr != null) {
                 return std.mem.span(decl_ptr);
             }
@@ -562,16 +723,38 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                         c.SQLITE_TEXT => blk: {
                             const text_ptr = c.sqlite3_column_text(self.stmt, col_idx);
                             const bytes_len = c.sqlite3_column_bytes(self.stmt, col_idx);
-                            if (bytes_len == 0) break :blk Value{ .string = "" };
-                            if (text_ptr == null) break :blk Value.null;
+                            if (bytes_len == 0) {
+                                if (text_ptr == null) {
+                                    if (c.sqlite3_errcode(self.db) == c.SQLITE_NOMEM) {
+                                        self.last_step_err = error.OutOfMemory;
+                                        return error.OutOfMemory;
+                                    }
+                                }
+                                break :blk Value{ .string = "" };
+                            }
+                            if (text_ptr == null) {
+                                self.last_step_err = error.OutOfMemory;
+                                return error.OutOfMemory;
+                            }
                             break :blk Value{ .string = text_ptr[0..@intCast(bytes_len)] };
                         },
                         c.SQLITE_BLOB => blk: {
                             const blob_raw = c.sqlite3_column_blob(self.stmt, col_idx);
                             const blob_ptr: [*c]const u8 = @ptrCast(blob_raw);
                             const bytes_len = c.sqlite3_column_bytes(self.stmt, col_idx);
-                            if (bytes_len == 0) break :blk Value{ .bytes = &.{} };
-                            if (blob_ptr == null) break :blk Value.null;
+                            if (bytes_len == 0) {
+                                if (blob_ptr == null) {
+                                    if (c.sqlite3_errcode(self.db) == c.SQLITE_NOMEM) {
+                                        self.last_step_err = error.OutOfMemory;
+                                        return error.OutOfMemory;
+                                    }
+                                }
+                                break :blk Value{ .bytes = &.{} };
+                            }
+                            if (blob_ptr == null) {
+                                self.last_step_err = error.OutOfMemory;
+                                return error.OutOfMemory;
+                            }
                             break :blk Value{ .bytes = blob_ptr[0..@intCast(bytes_len)] };
                         },
                         c.SQLITE_NULL => Value.null,
@@ -582,13 +765,11 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             }
 
             if (rc != c.SQLITE_DONE) {
-                self.last_step_err = progress.failure orelse switch (rc) {
-                    c.SQLITE_INTERRUPT => error.Interrupted,
-                    c.SQLITE_BUSY => error.Busy,
-                    c.SQLITE_LOCKED => error.Locked,
-                    c.SQLITE_NOMEM => error.OutOfMemory,
-                    else => error.SQLiteStepFailed,
-                };
+                self.last_step_err = mapSQLiteError(
+                    rc,
+                    progress.failure,
+                    error.SQLiteStepFailed,
+                );
                 return self.last_step_err.?;
             }
             return false;
@@ -600,10 +781,11 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return self.last_step_err;
         }
 
-        /// Resets statement cursor and releases row memory.
+        /// Resets statement cursor, clears bindings, and releases row memory.
         fn close(ctx: *anyopaque) void {
             const self: *SQLiteRows = @ptrCast(@alignCast(ctx));
             _ = c.sqlite3_reset(self.stmt);
+            _ = c.sqlite3_clear_bindings(self.stmt);
             self.allocator.destroy(self);
         }
     };
@@ -622,9 +804,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             progress.start(self.db);
             defer progress.stop(self.db);
             var errmsg: [*c]u8 = null;
-            if (c.sqlite3_exec(self.db, "COMMIT", null, null, &errmsg) != c.SQLITE_OK) {
+            const rc = c.sqlite3_exec(self.db, "COMMIT", null, null, &errmsg);
+            if (rc != c.SQLITE_OK) {
                 if (errmsg != null) c.sqlite3_free(errmsg);
-                return progress.failure orelse error.SQLiteCommitFailed;
+                return mapSQLiteError(rc, progress.failure, error.SQLiteCommitFailed);
             }
         }
 
@@ -639,9 +822,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             }
             defer if (!deadline.isNone()) progress.stop(self.db);
             var errmsg: [*c]u8 = null;
-            if (c.sqlite3_exec(self.db, "ROLLBACK", null, null, &errmsg) != c.SQLITE_OK) {
+            const rc = c.sqlite3_exec(self.db, "ROLLBACK", null, null, &errmsg);
+            if (rc != c.SQLITE_OK) {
                 if (errmsg != null) c.sqlite3_free(errmsg);
-                return progress.failure orelse error.SQLiteRollbackFailed;
+                return mapSQLiteError(rc, progress.failure, error.SQLiteRollbackFailed);
             }
         }
     };
@@ -1171,5 +1355,253 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         var dest: [1]sql_db.Value = undefined;
         try testing.expect(try rows.next(&dest, .none));
         try testing.expectEqualStrings("firmware.bin", dest[0].string);
+    }
+
+    // Verify exec/execDirect with RETURNING (consumes SQLITE_ROW until SQLITE_DONE)
+    // and resets/clears SQLITE_STATIC bindings before returning.
+    {
+        var ret_stmt = try db.prepare(
+            "INSERT INTO files (name, payload) VALUES (?, ?) RETURNING id",
+            .none,
+        );
+        defer ret_stmt.close();
+
+        var ret_name: [10]u8 = "ret_a_file".*;
+        const r_stmt = try ret_stmt.exec(.{ ret_name[0..], sql_db.blob("ABC") }, .none);
+        @memset(&ret_name, 'Z');
+        try testing.expectEqual(@as(i64, 1), try r_stmt.rowsAffected());
+        try testing.expect((try r_stmt.lastInsertId()) > 0);
+
+        const r_direct = try db.exec(
+            "INSERT INTO files (name, payload) VALUES (?, ?) RETURNING id",
+            .{ "ret_b_file", sql_db.blob("XYZ") },
+            .none,
+        );
+        try testing.expectEqual(@as(i64, 1), try r_direct.rowsAffected());
+        try testing.expect((try r_direct.lastInsertId()) > 0);
+
+        // Subsequent DDL/query must not hit locked cursors or stale static bindings.
+        _ = try db.exec("CREATE TABLE tmp_check (v TEXT)", .{}, .none);
+        {
+            var check_row = db.queryRow(
+                "SELECT COUNT(*) FROM files WHERE name IN (?, ?)",
+                .{ "ret_a_file", "ret_b_file" },
+                .none,
+            );
+            defer check_row.close();
+            var cnt_dest: [1]sql_db.Value = undefined;
+            try check_row.scan(&cnt_dest, .none);
+            try testing.expectEqual(@as(i64, 2), cnt_dest[0].int);
+        }
+        _ = try db.exec("DROP TABLE tmp_check", .{}, .none);
+    }
+
+    // Verify dynamic zero-length slices (undefined .ptr) bind cleanly in both static and transient
+    {
+        var empty_list: std.ArrayList(u8) = .empty;
+        defer empty_list.deinit(testing.allocator);
+
+        const zero_alloc = try testing.allocator.alloc(u8, 0);
+        defer testing.allocator.free(zero_alloc);
+
+        _ = try db.exec(
+            "DELETE FROM files WHERE name = ?",
+            .{""},
+            .none,
+        );
+        _ = try db.exec(
+            "INSERT INTO files (name, payload) VALUES (?, ?)",
+            .{ empty_list.items, sql_db.blob(zero_alloc) },
+            .none,
+        );
+
+        var rows = try db.query(
+            "SELECT name, payload FROM files WHERE name = ? AND payload = ?",
+            .{ zero_alloc, sql_db.blob(empty_list.items) },
+            .none,
+        );
+        defer rows.close();
+
+        const EmptyDynItem = struct {
+            name: []const u8,
+            payload: sql_db.Blob,
+        };
+        const item = (try rows.nextStruct(EmptyDynItem, .none)).?;
+        try testing.expectEqualStrings("", item.name);
+        try testing.expectEqual(@as(usize, 0), item.payload.data.len);
+    }
+
+    // Verify Tx.prepare + Stmt.query with early tx_stmt.close() before rows.close() and commit
+    {
+        var tx = try db.begin(.none);
+        var rows = blk: {
+            var tx_stmt = try tx.prepare("SELECT id, name FROM users WHERE name = ?", .none);
+            defer tx_stmt.close();
+            break :blk try tx_stmt.query(.{"Alice"}, .none);
+        };
+        defer rows.close();
+
+        try tx.commit(.none);
+
+        var dest: [2]sql_db.Value = undefined;
+        try testing.expectError(error.TxDone, rows.next(&dest, .none));
+    }
+
+    // Verify DB.prepare + Stmt.query with early stmt.close() before rows.close()
+    {
+        var rows = blk: {
+            var stmt = try db.prepare("SELECT id, name FROM users WHERE name = ?", .none);
+            defer stmt.close();
+            break :blk try stmt.query(.{"Alice"}, .none);
+        };
+        defer rows.close();
+
+        try testing.expectEqual(@as(usize, 0), rows.columnCount());
+        try testing.expectError(error.DBClosed, rows.columnType(0));
+        var dest: [2]sql_db.Value = undefined;
+        try testing.expectError(error.DBClosed, rows.next(&dest, .none));
+    }
+
+    // Verify reentrant Stmt.query() and Stmt.exec() on SQLite without closing prior Rows
+    {
+        var stmt = try db.prepare("SELECT name FROM users WHERE name = ?", .none);
+        defer stmt.close();
+
+        var rows1 = try stmt.query(.{"Alice"}, .none);
+        defer rows1.close();
+
+        var rows2 = try stmt.query(.{"Bob"}, .none);
+        defer rows2.close();
+
+        var dest: [1]sql_db.Value = undefined;
+        try testing.expect(!try rows1.next(&dest, .none));
+        try testing.expect(rows1.err() == null);
+
+        try testing.expect(try rows2.next(&dest, .none));
+        try testing.expectEqualStrings("Bob", dest[0].string);
+        try testing.expect(!try rows2.next(&dest, .none));
+
+        var rows3 = try stmt.query(.{"Alice"}, .none);
+        defer rows3.close();
+
+        var upd_stmt = try db.prepare("UPDATE users SET age = age + 1 WHERE name = ?", .none);
+        defer upd_stmt.close();
+
+        const res = try stmt.exec(.{"Alice"}, .none);
+        try testing.expect((try res.rowsAffected()) >= 0);
+        try testing.expect(!try rows3.next(&dest, .none));
+
+        const upd_res = try upd_stmt.exec(.{"Alice"}, .none);
+        try testing.expectEqual(@as(i64, 1), try upd_res.rowsAffected());
+    }
+
+    // Verify Tx returned by value with live Rows and Stmt avoids dangling Tx pointers
+    {
+        const Bundle = struct {
+            tx: sql_db.Tx,
+            rows: sql_db.Rows,
+            stmt: sql_db.Stmt,
+        };
+        const Helper = struct {
+            fn start(d: *sql_db.DB) !Bundle {
+                var tx = try d.begin(.none);
+                errdefer tx.rollback(.none) catch {};
+                var rows = try tx.query("SELECT name FROM users WHERE name = ?", .{"Alice"}, .none);
+                errdefer rows.close();
+                const stmt = try tx.prepare(
+                    "UPDATE users SET age = age + 1 WHERE name = ?",
+                    .none,
+                );
+                return .{
+                    .tx = tx,
+                    .rows = rows,
+                    .stmt = stmt,
+                };
+            }
+        };
+
+        var bundle = try Helper.start(db);
+        defer bundle.rows.close();
+        defer bundle.stmt.close();
+
+        var dest: [1]sql_db.Value = undefined;
+        try testing.expect(try bundle.rows.next(&dest, .none));
+        try testing.expectEqualStrings("Alice", dest[0].string);
+        bundle.rows.close();
+
+        _ = try bundle.stmt.exec(.{"Alice"}, .none);
+        try bundle.tx.commit(.none);
+    }
+
+    // Verify multi-statement exec (unparameterized) and fail-fast rejection on prepare/args
+    {
+        const script =
+            \\CREATE TABLE multi_items (id INTEGER PRIMARY KEY, label TEXT NOT NULL);
+            \\INSERT INTO multi_items (label) VALUES ('one');
+            \\INSERT INTO multi_items (label) VALUES ('two');
+            \\CREATE INDEX idx_multi_label ON multi_items (label);
+            \\-- trailing comment
+            \\;;;
+        ;
+        const multi_res = try db.exec(script, .{}, .none);
+        try testing.expectEqual(@as(i64, 2), try multi_res.rowsAffected());
+        try testing.expect((try multi_res.lastInsertId()) > 0);
+
+        // Parameterized multi-statement exec must fail fast without executing the first statement
+        const param_multi_sql =
+            "INSERT INTO multi_items (label) VALUES (?); " ++
+            "INSERT INTO multi_items (label) VALUES ('x')";
+        try testing.expectError(
+            error.SQLiteMultipleStatements,
+            db.exec(param_multi_sql, .{"should_not_insert"}, .none),
+        );
+
+        var cnt_row = db.queryRow("SELECT COUNT(*) FROM multi_items; -- trailing\n;;", .{}, .none);
+        defer cnt_row.close();
+        var cnt_dest: [1]sql_db.Value = undefined;
+        try cnt_row.scan(&cnt_dest, .none);
+        try testing.expectEqual(@as(i64, 2), cnt_dest[0].int);
+
+        // prepare() rejects multi-statement SQL (including separated by empty semicolons)
+        try testing.expectError(
+            error.SQLiteMultipleStatements,
+            db.prepare("SELECT 1; SELECT 2", .none),
+        );
+        try testing.expectError(
+            error.SQLiteMultipleStatements,
+            db.prepare("SELECT 1; ; SELECT 2", .none),
+        );
+
+        // Dynamic empty SQL slice (undefined .ptr) returns SQLiteEmptyStatement
+        var empty_sql: std.ArrayList(u8) = .empty;
+        defer empty_sql.deinit(testing.allocator);
+        try testing.expectError(error.SQLiteEmptyStatement, db.exec(empty_sql.items, .{}, .none));
+        try testing.expectError(error.SQLiteEmptyStatement, db.prepare(empty_sql.items, .none));
+    }
+
+    // Verify numbered positional placeholders (?1, ?2), huge columnName index, and NUL in DSN
+    {
+        var row = db.queryRow(
+            "SELECT label FROM multi_items WHERE id = ?1 AND label = ?2",
+            .{ 1, "one" },
+            .none,
+        );
+        defer row.close();
+        var dest: [1]sql_db.Value = undefined;
+        try row.scan(&dest, .none);
+        try testing.expectEqualStrings("one", dest[0].string);
+
+        var rows = try db.query("SELECT id FROM multi_items LIMIT 1", .{}, .none);
+        defer rows.close();
+        try testing.expectEqualStrings("", rows.columnName(std.math.maxInt(usize)));
+
+        const bad_db = try sql_db.DB.open(
+            testing.allocator,
+            io,
+            sq_driver.driver(),
+            "bad\x00.db",
+        );
+        defer bad_db.close();
+        try testing.expectError(error.SQLiteOpenFailed, bad_db.ping(.none));
     }
 }

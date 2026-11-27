@@ -28,10 +28,7 @@ const sql = stdgo.database.sql;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = init.io;
 
     // 1. 初始化驱动（以 SQLite 为例，亦可使用内置 MockDriver）
     var sqlite_drv = sql.sqlite.SQLiteDriver.init(allocator);
@@ -176,7 +173,10 @@ try tx.commit(.none);
 ### 2.7 预编译语句（Stmt）
 
 ```zig
-var stmt = try db.prepare("INSERT INTO users (name, age, balance) VALUES (?, ?, ?)", .none);
+var stmt = try db.prepare(
+    "INSERT INTO users (name, age, balance) VALUES (:name, :age, :balance)",
+    .none,
+);
 defer stmt.close();
 
 const batch = [_]struct { name: []const u8, age: i64, balance: f64 }{
@@ -188,6 +188,12 @@ for (batch) |item| {
     _ = try stmt.exec(item, .none);
 }
 ```
+
+> [!NOTE]
+> **参数生命周期与多语句约定（SQLite 驱动）**：
+> - `exec()` 绑定切片参数采用零拷贝（`SQLITE_STATIC`），并在返回前自动复位语句与清空绑定；无参数调用（`.{}`）支持顺序执行多条 SQL（如建表/迁移脚本）。
+> - `query()` 绑定切片参数会由驱动拷贝（`SQLITE_TRANSIENT`），调用方的临时缓冲区无需存活到 `rows.close()`；`prepare()` 与带参数的 `exec()` 严格要求单条 SQL，尾部存在多余可执行语句时返回 `error.SQLiteMultipleStatements`。
+> - `Tx.commit()` / `Tx.rollback()` 或提前 `stmt.close()` 会自动关闭并失效关联的 `Rows` 与 `Stmt`，避免悬空游标与 use-after-free。
 
 ---
 

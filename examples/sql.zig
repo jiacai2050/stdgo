@@ -29,10 +29,7 @@ const ProductSummary = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = init.io;
 
     const have_sqlite = @hasDecl(sql.sqlite, "SQLiteDriver");
 
@@ -295,6 +292,7 @@ fn runDatabaseDemo(
             .isolation = .serializable,
             .read_only = false,
         }, .none);
+        defer tx.rollback(.none) catch {};
 
         _ = try tx.exec("UPDATE products SET price = price * 0.9 WHERE id = 1", .{}, .none);
         try tx.commit(.none);
@@ -302,6 +300,7 @@ fn runDatabaseDemo(
 
         // Demonstrating clean rollback on error
         var tx_abort = try db.begin(.none);
+        defer tx_abort.rollback(.none) catch {};
         _ = try tx_abort.exec("DELETE FROM products", .{}, .none);
         try tx_abort.rollback(.none);
         std.debug.print("   -> Transaction #2 rolled back cleanly on error!\n\n", .{});
