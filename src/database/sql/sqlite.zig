@@ -274,7 +274,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             const non_null_stmt = stmt orelse return error.SQLiteEmptyStatement;
             defer _ = c.sqlite3_finalize(non_null_stmt);
 
-            try SQLiteStmt.bindArgs(non_null_stmt, args);
+            try SQLiteStmt.bindArgs(non_null_stmt, args, .static);
 
             const step_rc = c.sqlite3_step(non_null_stmt);
             if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
@@ -327,8 +327,27 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return c.sqlite3_bind_parameter_count(self.stmt);
         }
 
+        const BindMode = enum {
+            /// Zero-copy (SQLITE_STATIC): caller args must stay valid for the entire
+            /// statement execution. Safe for exec/execDirect where sqlite3_step finishes
+            /// before the call returns.
+            static,
+            /// Defensive copy (SQLITE_TRANSIENT): required for query because SQLite keeps
+            /// reading bound arguments across Rows.next() until Rows.close(). Using
+            /// SQLITE_STATIC here would require caller buffers to stay live until Rows.close().
+            transient,
+        };
+
+        /// SQLite C API sentinel value: ((sqlite3_destructor_type)-1).
+        /// Zig forbids @ptrFromInt on unaligned function pointers, so we use
+        /// an extern union for valid C ABI type-punning.
+        const SQLITE_TRANSIENT: c.sqlite3_destructor_type = (extern union {
+            int: usize,
+            ptr: c.sqlite3_destructor_type,
+        }{ .int = std.math.maxInt(usize) }).ptr;
+
         /// Resets bindings and binds positional (?) or named (:name, @name, $name) parameters.
-        fn bindArgs(stmt: *c.sqlite3_stmt, args: []const NamedValue) anyerror!void {
+        fn bindArgs(stmt: *c.sqlite3_stmt, args: []const NamedValue, mode: BindMode) anyerror!void {
             _ = c.sqlite3_reset(stmt);
             _ = c.sqlite3_clear_bindings(stmt);
 
@@ -395,23 +414,24 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                         }
                     },
                     .string => |s| {
-                        // SQLITE_STATIC is safe because args stay valid for sqlite3_step.
+                        const destructor = if (mode == .transient) SQLITE_TRANSIENT else c.SQLITE_STATIC;
                         const rc = c.sqlite3_bind_text(
                             stmt,
                             idx,
                             s.ptr,
                             @intCast(s.len),
-                            c.SQLITE_STATIC,
+                            destructor,
                         );
                         if (rc != c.SQLITE_OK) return error.SQLiteBindFailed;
                     },
                     .bytes => |b| {
+                        const destructor = if (mode == .transient) SQLITE_TRANSIENT else c.SQLITE_STATIC;
                         const rc = c.sqlite3_bind_blob(
                             stmt,
                             idx,
                             b.ptr,
                             @intCast(b.len),
-                            c.SQLITE_STATIC,
+                            destructor,
                         );
                         if (rc != c.SQLITE_OK) return error.SQLiteBindFailed;
                     },
@@ -428,7 +448,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         ) anyerror!Result {
             try driver_pkg.checkOperation(io, deadline);
             const self: *SQLiteStmt = @ptrCast(@alignCast(ctx));
-            try bindArgs(self.stmt, args);
+            try bindArgs(self.stmt, args, .static);
             var progress: Progress = .{ .io = io, .deadline = deadline };
             progress.start(self.db);
             defer progress.stop(self.db);
@@ -456,7 +476,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         ) anyerror!driver_pkg.Rows {
             try driver_pkg.checkOperation(io, deadline);
             const self: *SQLiteStmt = @ptrCast(@alignCast(ctx));
-            try bindArgs(self.stmt, args);
+            try bindArgs(self.stmt, args, .transient);
             try driver_pkg.checkOperation(io, deadline);
 
             const rows = try self.allocator.create(SQLiteRows);
@@ -542,6 +562,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                         c.SQLITE_TEXT => blk: {
                             const text_ptr = c.sqlite3_column_text(self.stmt, col_idx);
                             const bytes_len = c.sqlite3_column_bytes(self.stmt, col_idx);
+                            if (bytes_len == 0) break :blk Value{ .string = "" };
                             if (text_ptr == null) break :blk Value.null;
                             break :blk Value{ .string = text_ptr[0..@intCast(bytes_len)] };
                         },
@@ -549,6 +570,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                             const blob_raw = c.sqlite3_column_blob(self.stmt, col_idx);
                             const blob_ptr: [*c]const u8 = @ptrCast(blob_raw);
                             const bytes_len = c.sqlite3_column_bytes(self.stmt, col_idx);
+                            if (bytes_len == 0) break :blk Value{ .bytes = &.{} };
                             if (blob_ptr == null) break :blk Value.null;
                             break :blk Value{ .bytes = blob_ptr[0..@intCast(bytes_len)] };
                         },
@@ -936,6 +958,40 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         try testing.expectError(error.TxDone, tx_stmt.exec(.{"Alice"}, .none));
     }
 
+    // Verify Tx.query in SQLite: unclosed rows are finalized on commit, subsequent next returns TxDone
+    {
+        var tx = try db.begin(.none);
+        var rows = try tx.query("SELECT id, name FROM users", .{}, .none);
+        defer rows.close();
+
+        try tx.commit(.none);
+
+        // Verification of safe behavior after commit without UAF
+        try testing.expectEqual(@as(usize, 0), rows.columnCount());
+        try testing.expectEqualStrings("", rows.columnName(0));
+        try testing.expectError(error.TxDone, rows.columnType(0));
+        try testing.expectEqual(error.TxDone, rows.err().?);
+        try testing.expect(rows.lastError() == null);
+
+        var dest: [2]sql_db.Value = undefined;
+        try testing.expectError(error.TxDone, rows.next(&dest, .none));
+    }
+
+    // Verify Tx.prepare + Stmt.query in SQLite: rows are reset before stmt is finalized on commit
+    {
+        var tx = try db.begin(.none);
+        var tx_stmt = try tx.prepare("SELECT id, name FROM users WHERE name = ?", .none);
+        defer tx_stmt.close();
+
+        var rows = try tx_stmt.query(.{"Alice"}, .none);
+        defer rows.close();
+
+        try tx.commit(.none);
+
+        var dest: [2]sql_db.Value = undefined;
+        try testing.expectError(error.TxDone, rows.next(&dest, .none));
+    }
+
     // Verify Rows.columnType indexed inspection in SQLite
     {
         var rows = try db.query("SELECT id, name, age, balance FROM users LIMIT 1", .{}, .none);
@@ -1069,5 +1125,51 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         const scanned = try row.scanStruct(FileItem, .none);
         try testing.expectEqualStrings("firmware.bin", scanned.name);
         try testing.expectEqualStrings(raw_bytes, scanned.payload.data);
+    }
+
+    // Verify empty/zero-length BLOB and empty string round-trip
+    {
+        _ = try db.exec(
+            "INSERT INTO files (name, payload) VALUES (?, ?)",
+            .{ "", sql_db.blob("") },
+            .none,
+        );
+
+        var row = db.queryRow(
+            "SELECT name, payload FROM files WHERE name = ?",
+            .{""},
+            .none,
+        );
+        defer row.close();
+
+        const EmptyItem = struct {
+            name: []const u8,
+            payload: sql_db.Blob,
+        };
+        const scanned = try row.scanStruct(EmptyItem, .none);
+        try testing.expectEqualStrings("", scanned.name);
+        try testing.expectEqual(@as(usize, 0), scanned.payload.data.len);
+    }
+
+    // Verify SQLITE_TRANSIENT in query: mutating/overwriting caller buffer after query()
+    // must not affect subsequent Rows iteration.
+    {
+        var name_buf: [12]u8 = "firmware.bin".*;
+        var blob_buf: [7]u8 = "BIN\x00\xFF\xAA\x55".*;
+
+        var rows = try db.query(
+            "SELECT name FROM files WHERE name = ? AND payload = ?",
+            .{ name_buf[0..], sql_db.blob(blob_buf[0..]) },
+            .none,
+        );
+        defer rows.close();
+
+        // Clobber the original stack buffers before stepping Rows
+        @memset(&name_buf, 'X');
+        @memset(&blob_buf, 0);
+
+        var dest: [1]sql_db.Value = undefined;
+        try testing.expect(try rows.next(&dest, .none));
+        try testing.expectEqualStrings("firmware.bin", dest[0].string);
     }
 }
