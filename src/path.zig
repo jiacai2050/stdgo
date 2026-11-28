@@ -1,4 +1,4 @@
-pub const match_mod = @import("path/match.zig");
+const match_mod = @import("path/match.zig");
 pub const match = match_mod.match;
 pub const Error = match_mod.Error;
 

@@ -126,8 +126,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    const docs_lib = b.addLibrary(.{
+        .name = "stdgo",
+        .root_module = mod,
+    });
+
     const install_docs = b.addInstallDirectory(.{
-        .source_dir = mod_tests.getEmittedDocs(),
+        .source_dir = docs_lib.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });

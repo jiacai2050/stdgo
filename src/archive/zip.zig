@@ -1,4 +1,4 @@
-pub const struct_mod = @import("zip/struct.zig");
+const struct_mod = @import("zip/struct.zig");
 pub const reader = @import("zip/reader.zig");
 pub const writer = @import("zip/writer.zig");
 

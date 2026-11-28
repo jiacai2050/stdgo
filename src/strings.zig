@@ -2,8 +2,8 @@ const std = @import("std");
 const bytes = @import("bytes.zig");
 const Allocator = std.mem.Allocator;
 
-pub const builder_mod = @import("strings/builder.zig");
-pub const reader_mod = @import("strings/reader.zig");
+const builder_mod = @import("strings/builder.zig");
+const reader_mod = @import("strings/reader.zig");
 
 pub const Builder = builder_mod.Builder;
 pub const Reader = reader_mod.Reader;
@@ -184,4 +184,9 @@ test "strings utility functions" {
     const up = try toUpper(testing.allocator, "zig lang");
     defer testing.allocator.free(up);
     try testing.expectEqualStrings("ZIG LANG", up);
+}
+
+test {
+    _ = builder_mod;
+    _ = reader_mod;
 }
