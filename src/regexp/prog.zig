@@ -17,11 +17,14 @@ pub const Range = struct {
     hi: u8,
 };
 
+/// Sentinel instruction index indicating an unpatched transition target.
+pub const unpatched: u32 = std.math.maxInt(u32);
+
 pub const Inst = struct {
     op: InstOp,
     c: u8 = 0,
-    out: u32 = 0,
-    out1: u32 = 0,
+    out: u32 = unpatched,
+    out1: u32 = unpatched,
     ranges: []const Range = &[_]Range{},
     negated: bool = false,
 };

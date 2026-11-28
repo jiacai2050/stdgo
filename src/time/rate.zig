@@ -194,7 +194,17 @@ pub const Limiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (n > self.burst_val and !std.math.isInf(self.limit_val)) {
+        if (std.math.isInf(self.limit_val)) {
+            return .{
+                .ok = true,
+                .lim = self,
+                .tokens = n,
+                .time_to_act = now,
+                .limit = self.limit_val,
+            };
+        }
+
+        if (n > self.burst_val) {
             return .{
                 .ok = false,
                 .lim = self,
@@ -220,7 +230,7 @@ pub const Limiter = struct {
             };
         }
 
-        if (std.math.isInf(self.limit_val) or self.limit_val <= 0) {
+        if (self.limit_val <= 0) {
             return .{
                 .ok = false,
                 .lim = self,
@@ -273,9 +283,30 @@ pub const Limiter = struct {
         try io.checkCancel();
         try deadline.check(io);
 
+        {
+            self.mutex.lock();
+            const lim = self.limit_val;
+            const b = self.burst_val;
+            self.mutex.unlock();
+            if (n > b and !std.math.isInf(lim)) {
+                return RateError.ExceedsBurst;
+            }
+        }
+
         const now = Time.now(io);
-        var res = self.reserveN(now, n);
-        if (!res.ok) return RateError.ExceedsBurst;
+        const max_future_reserve: ?Duration = if (deadline.timestamp) |end| blk: {
+            const awake_now = std.Io.Clock.awake.now(io).nanoseconds;
+            const rem_ns = end.raw.nanoseconds - awake_now;
+            if (rem_ns <= 0) return error.Timeout;
+            const clamped: i64 = @intCast(@min(rem_ns, std.math.maxInt(i64)));
+            break :blk @fromBackingInt(clamped);
+        } else null;
+
+        var res = self.reserveNInternal(now, n, max_future_reserve);
+        if (!res.ok) {
+            if (max_future_reserve != null) return error.Timeout;
+            return RateError.ExceedsBurst;
+        }
 
         const d = res.delayFrom(now);
         if (d.nanoseconds() <= 0) return;
@@ -284,12 +315,6 @@ pub const Limiter = struct {
             io,
             .fromNanoseconds(d.nanoseconds()),
         ).timestamp.?;
-        if (deadline.timestamp) |end| {
-            if (ready_at.compare(.gt, end)) {
-                res.cancelAt(Time.now(io));
-                return error.Timeout;
-            }
-        }
         ready_at.wait(io) catch |err| {
             res.cancelAt(Time.now(io));
             return err;
@@ -404,4 +429,25 @@ test "rate.Limiter wait with deadline and std.Io" {
 
     // Should fail with deadline exceeded because deadline is already in the past
     try testing.expectError(error.Timeout, lim.wait(io, deadlines.Deadline.after(io, .zero)));
+}
+
+test "rate.Limiter inf allows any n with zero burst and waitN timeout preserves tokens" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var inf_lim = Limiter.init(inf, 0);
+    const t0 = Time.unix(3000, 0);
+    try testing.expect(inf_lim.allowN(t0, 100));
+    try inf_lim.waitN(io, 50, .none);
+
+    // 1 token/sec, burst 1: drain burst then wait with short deadline (10ms < 1s).
+    // Tokens must not be leaked by the timed-out reservation.
+    var lim = Limiter.init(1, 1);
+    try lim.wait(io, .none);
+    const tokens_before = lim.tokens;
+    try testing.expectError(
+        error.Timeout,
+        lim.wait(io, deadlines.Deadline.after(io, .fromMilliseconds(10))),
+    );
+    try testing.expect(lim.tokens >= tokens_before);
 }

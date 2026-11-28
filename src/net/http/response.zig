@@ -189,8 +189,7 @@ pub const ResponseBodyReader = struct {
                 const to_read = @min(buf.len, self.remaining_bytes);
                 const n = try self.readDirect(buf[0..to_read]);
                 if (n == 0) {
-                    self.raw_eof = true;
-                    return 0;
+                    return error.UnexpectedEof;
                 }
                 self.remaining_bytes -= n;
                 if (self.remaining_bytes == 0) {
@@ -209,8 +208,8 @@ pub const ResponseBodyReader = struct {
                 while (self.chunk_remaining == 0) {
                     const chunk_size = try self.readChunkHeader();
                     if (chunk_size == 0) {
+                        try self.consumeChunkTrailers();
                         self.raw_eof = true;
-                        try self.consumeCrlf();
                         return 0;
                     }
                     self.chunk_remaining = chunk_size;
@@ -219,8 +218,7 @@ pub const ResponseBodyReader = struct {
                 const to_read = @min(buf.len, self.chunk_remaining);
                 const n = try self.readDirect(buf[0..to_read]);
                 if (n == 0) {
-                    self.raw_eof = true;
-                    return 0;
+                    return error.UnexpectedEof;
                 }
                 self.chunk_remaining -= n;
                 if (self.chunk_remaining == 0) {
@@ -246,7 +244,7 @@ pub const ResponseBodyReader = struct {
     fn readByte(self: *ResponseBodyReader) !u8 {
         var b: [1]u8 = undefined;
         const n = try self.readDirect(&b);
-        if (n == 0) return error.EndOfStream;
+        if (n == 0) return error.UnexpectedEof;
         return b[0];
     }
 
@@ -254,6 +252,27 @@ pub const ResponseBodyReader = struct {
         const c1 = try self.readByte();
         const c2 = try self.readByte();
         if (c1 != '\r' or c2 != '\n') return error.MalformedChunk;
+    }
+
+    fn consumeChunkTrailers(self: *ResponseBodyReader) !void {
+        const max_trailer_lines: usize = 128;
+        const max_line_len: usize = 8192;
+        var lines: usize = 0;
+        while (lines < max_trailer_lines) : (lines += 1) {
+            var line_len: usize = 0;
+            while (line_len < max_line_len) : (line_len += 1) {
+                const c = try self.readByte();
+                if (c == '\r') {
+                    const lf = try self.readByte();
+                    if (lf != '\n') return error.MalformedChunk;
+                    if (line_len == 0) return;
+                    break;
+                }
+            } else {
+                return error.ChunkHeaderTooLarge;
+            }
+        }
+        return error.MalformedChunk;
     }
 
     fn readChunkHeader(self: *ResponseBodyReader) !usize {
@@ -331,20 +350,24 @@ pub const Response = struct {
 
         if (self.pool) |pool| {
             if (self.can_keep_alive and self.pool_host != null) {
-                // If EOF not yet reached, drain remaining small fixed-size body
-                // so connection can be reused
-                const is_drainable = !body_ptr.eof_reached and
+                // If raw EOF not yet reached, drain remaining small fixed-size body
+                // so the connection can be safely reused.
+                const is_drainable = !body_ptr.raw_eof and
+                    body_ptr.read_err == null and
                     body_ptr.mode == .fixed and
                     body_ptr.remaining_bytes <= 16 * 1024;
                 if (is_drainable) {
                     var drain_buf: [1024]u8 = undefined;
-                    while (!body_ptr.eof_reached) {
-                        const n = body_ptr.read(&drain_buf) catch break;
+                    while (!body_ptr.raw_eof) {
+                        const n = body_ptr.readRaw(&drain_buf) catch |err| {
+                            body_ptr.read_err = err;
+                            break;
+                        };
                         if (n == 0) break;
                     }
                 }
 
-                if (body_ptr.eof_reached and body_ptr.read_err == null) {
+                if (body_ptr.raw_eof and body_ptr.read_err == null) {
                     pool.release(
                         body_ptr.io,
                         self.pool_host.?,
@@ -460,4 +483,19 @@ test "ResponseBodyReader.reader streams into writers with an empty buffer" {
     var want: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("hello world", &want, .{});
     try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "ResponseBodyReader skips chunked trailers and detects premature EOF" {
+    const testing = std.testing;
+    const io = testing.io;
+    var conn: HttpConn = undefined;
+    conn.stream_reader = .init(io, undefined, &.{}, .none);
+    var out: [64]u8 = undefined;
+
+    const with_trailers = "5\r\nhello\r\n0\r\nX-Trailer: val\r\nX-Two: 2\r\n\r\n";
+    var chunked = ResponseBodyReader.init(io, &conn, .chunked, 0, with_trailers);
+    const n1 = try chunked.readRaw(&out);
+    try testing.expectEqualStrings("hello", out[0..n1]);
+    try testing.expectEqual(@as(usize, 0), try chunked.readRaw(&out));
+    try testing.expect(chunked.raw_eof);
 }

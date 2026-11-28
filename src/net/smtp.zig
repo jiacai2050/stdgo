@@ -15,10 +15,10 @@ pub const cramMD5Auth = auth.cramMD5Auth;
 pub const Client = client.Client;
 pub const SmtpError = client.SmtpError;
 
-/// SendMail connects to the server at addr, switches to TLS if
-/// possible, authenticates with the optional mechanism a if possible,
-/// and then sends an email from address from, to addresses to, with
-/// message msg. The addr must include a port, as in "mail.example.com:smtp".
+/// Connects to the SMTP server at `addr` over plain TCP (TLS/STARTTLS is not yet
+/// supported), authenticates with the optional mechanism `a` if provided, and sends
+/// an email from `from` to `to` with message body `msg`.
+/// The `addr` must include a port, as in `"mail.example.com:25"`.
 pub fn sendMail(
     allocator: Allocator,
     io: std.Io,
@@ -32,7 +32,10 @@ pub fn sendMail(
     const host = hp.host;
 
     const c = try conn_mod.dial(allocator, io, "tcp", addr, .none);
-    const cl = try Client.init(allocator, c, host);
+    const cl = Client.init(allocator, c, host) catch |err| {
+        c.close();
+        return err;
+    };
     defer cl.close();
 
     // 1. Greet with EHLO
@@ -153,4 +156,19 @@ test "smtp client and mock server workflow with PLAIN auth" {
         &recipients,
         email_body,
     );
+}
+
+test "smtp rejects CRLF command injection in arguments" {
+    const testing = std.testing;
+    const pair = try conn_mod.pipe(testing.allocator, testing.io);
+    defer pair.conn2.close();
+
+    _ = try pair.conn2.write("220 mock.smtp Ready\r\n");
+    const cl = try Client.init(testing.allocator, pair.conn1, "mock.smtp");
+    defer cl.close();
+
+    try testing.expectError(error.InvalidSmtpArgument, cl.ehlo("host\r\nRSET"));
+    try testing.expectError(error.InvalidSmtpArgument, cl.hello("host\nRSET"));
+    try testing.expectError(error.InvalidSmtpArgument, cl.mail("a@b.com>\r\nDATA"));
+    try testing.expectError(error.InvalidSmtpArgument, cl.rcpt("b@c.com\nQUIT"));
 }

@@ -68,13 +68,12 @@ pub const Encoding = struct {
             return n / 8 * 5;
         }
         return n / 8 * 5 + switch (n % 8) {
-            0 => @as(usize, 0),
-            1 => @as(usize, 0),
-            2 => @as(usize, 1),
+            0, 1 => @as(usize, 0),
+            2, 3 => @as(usize, 1),
             4 => @as(usize, 2),
-            5 => @as(usize, 3),
+            5, 6 => @as(usize, 3),
             7 => @as(usize, 4),
-            else => n / 8 * 5,
+            else => unreachable,
         };
     }
 
@@ -166,17 +165,29 @@ pub const Encoding = struct {
     }
 
     /// Decodes src into dst. Returns the number of bytes written to dst.
+    /// Strictly validates padding count and position in padded mode.
     pub fn decode(self: Encoding, dst: []u8, src: []const u8) !usize {
         var dlen: usize = 0;
         var buf: [8]u8 = undefined;
         var buf_len: usize = 0;
+        var in_padding = false;
+        var pad_seen: usize = 0;
 
         for (src) |c| {
             if (c == '\r' or c == '\n') continue;
             if (self.pad_char != null and c == self.pad_char.?) {
-                // Padding reached
+                if (!in_padding) {
+                    if (buf_len != 2 and buf_len != 4 and buf_len != 5 and buf_len != 7) {
+                        return Error.CorruptInput;
+                    }
+                    in_padding = true;
+                }
+                pad_seen += 1;
+                if (buf_len + pad_seen > 8) return Error.CorruptInput;
                 continue;
             }
+
+            if (in_padding) return Error.CorruptInput;
 
             const val = self.decode_table[c];
             if (val == 0xFF) return Error.CorruptInput;
@@ -190,6 +201,12 @@ pub const Encoding = struct {
                 dlen += 5;
                 buf_len = 0;
             }
+        }
+
+        if (in_padding) {
+            if (buf_len + pad_seen != 8) return Error.CorruptInput;
+        } else if (buf_len > 0 and self.pad_char != null) {
+            return Error.CorruptInput;
         }
 
         if (buf_len > 0) {
@@ -313,4 +330,21 @@ test "Base32: NoPadding" {
     const decoded = try enc_no_pad.decodeString(testing.allocator, encoded);
     defer testing.allocator.free(decoded);
     try testing.expectEqualStrings(raw, decoded);
+}
+
+test "Base32: strict padding validation and decodedLen" {
+    const testing = std.testing;
+
+    // Unpadded input in padded mode -> CorruptInput
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "MY"));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "MY="));
+    // Excess / stray padding -> CorruptInput
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "MY======="));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "MY=A===="));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "========"));
+
+    // decodedLen in unpadded mode should not double-count
+    const no_pad = std_encoding.noPadding();
+    try testing.expectEqual(@as(usize, 6), no_pad.decodedLen(11));
+    try testing.expectEqual(@as(usize, 8), no_pad.decodedLen(14));
 }

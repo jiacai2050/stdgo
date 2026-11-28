@@ -183,18 +183,24 @@ pub fn List(comptime T: type) type {
         /// PushBackList inserts a copy of another list at the back of list l.
         pub fn pushBackList(self: *Self, other: *Self) Allocator.Error!void {
             self.lazyInit();
+            var i = other.len();
             var curr = other.front();
-            while (curr) |e| : (curr = e.nextElement()) {
+            while (i > 0) : (i -= 1) {
+                const e = curr orelse break;
                 _ = try self.pushBack(e.value);
+                curr = e.nextElement();
             }
         }
 
         /// PushFrontList inserts a copy of another list at the front of list l.
         pub fn pushFrontList(self: *Self, other: *Self) Allocator.Error!void {
             self.lazyInit();
+            var i = other.len();
             var curr = other.back();
-            while (curr) |e| : (curr = e.prevElement()) {
+            while (i > 0) : (i -= 1) {
+                const e = curr orelse break;
                 _ = try self.pushFront(e.value);
+                curr = e.prevElement();
             }
         }
 
@@ -292,4 +298,10 @@ test "container.list pushBackList and pushFrontList" {
         try testing.expectEqualStrings(expected[idx], node.value);
         idx += 1;
     }
+
+    // Self-append must not infinite-loop
+    try l2.pushBackList(&l2);
+    try testing.expectEqual(@as(usize, 4), l2.len());
+    try l2.pushFrontList(&l2);
+    try testing.expectEqual(@as(usize, 8), l2.len());
 }

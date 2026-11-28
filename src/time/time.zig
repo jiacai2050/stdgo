@@ -308,22 +308,23 @@ pub const Time = struct {
             } else if (std.mem.startsWith(u8, layout[i..], "pm")) {
                 try w.writeAll(if (c.h >= 12) "pm" else "am");
                 i += 2;
-            } else if (std.mem.startsWith(u8, layout[i..], ".000000000") or
-                std.mem.startsWith(u8, layout[i..], ".999999999"))
-            {
-                try w.print(".{d:0>9}", .{self.nanosecond()});
+            } else if (std.mem.startsWith(u8, layout[i..], ".000000000")) {
+                try formatFrac(w, self.nanosecond(), 9, false);
                 i += 10;
-            } else if (std.mem.startsWith(u8, layout[i..], ".000000") or
-                std.mem.startsWith(u8, layout[i..], ".999999"))
-            {
-                const micros: u32 = @divFloor(self.nanosecond(), 1000);
-                try w.print(".{d:0>6}", .{micros});
+            } else if (std.mem.startsWith(u8, layout[i..], ".999999999")) {
+                try formatFrac(w, self.nanosecond(), 9, true);
+                i += 10;
+            } else if (std.mem.startsWith(u8, layout[i..], ".000000")) {
+                try formatFrac(w, self.nanosecond(), 6, false);
                 i += 7;
-            } else if (std.mem.startsWith(u8, layout[i..], ".000") or
-                std.mem.startsWith(u8, layout[i..], ".999"))
-            {
-                const millis: u32 = @divFloor(self.nanosecond(), 1_000_000);
-                try w.print(".{d:0>3}", .{millis});
+            } else if (std.mem.startsWith(u8, layout[i..], ".999999")) {
+                try formatFrac(w, self.nanosecond(), 6, true);
+                i += 7;
+            } else if (std.mem.startsWith(u8, layout[i..], ".000")) {
+                try formatFrac(w, self.nanosecond(), 3, false);
+                i += 4;
+            } else if (std.mem.startsWith(u8, layout[i..], ".999")) {
+                try formatFrac(w, self.nanosecond(), 3, true);
                 i += 4;
             } else if (std.mem.startsWith(u8, layout[i..], "Z07:00")) {
                 if (self.loc.offset_sec == 0) {
@@ -371,6 +372,20 @@ pub const Time = struct {
         }
     }
 };
+
+fn formatFrac(w: *std.Io.Writer, nsec: u32, digits: usize, strip_zeros: bool) !void {
+    var buf: [9]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{d:0>9}", .{nsec}) catch unreachable;
+    var len = digits;
+    if (strip_zeros) {
+        while (len > 0 and buf[len - 1] == '0') {
+            len -= 1;
+        }
+        if (len == 0) return;
+    }
+    try w.writeByte('.');
+    try w.writeAll(buf[0..len]);
+}
 
 fn formatOffset(offset_sec: i32, with_colon: bool, w: *std.Io.Writer) !void {
     var off = offset_sec;
@@ -439,6 +454,27 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
     var vi: usize = 0;
 
     while (li < layout.len) {
+        // Optional trailing-zero fractional tokens may be omitted even at end of value.
+        if (std.mem.startsWith(u8, layout[li..], ".999999999")) {
+            li += 10;
+            if (vi < value.len and value[vi] == '.') {
+                nsec = try parseFracDigits(value, &vi, 9);
+            }
+            continue;
+        } else if (std.mem.startsWith(u8, layout[li..], ".999999")) {
+            li += 7;
+            if (vi < value.len and value[vi] == '.') {
+                nsec = try parseFracDigits(value, &vi, 6);
+            }
+            continue;
+        } else if (std.mem.startsWith(u8, layout[li..], ".999")) {
+            li += 4;
+            if (vi < value.len and value[vi] == '.') {
+                nsec = try parseFracDigits(value, &vi, 3);
+            }
+            continue;
+        }
+
         if (vi >= value.len) return ParseError.InvalidFormat;
 
         if (std.mem.startsWith(u8, layout[li..], "2006")) {
@@ -524,13 +560,20 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             if (d < 1 or d > 31) return ParseError.ValueOutOfRange;
             li += 2;
             vi += 2;
-        } else if (std.mem.startsWith(u8, layout[li..], "15") or
-            std.mem.startsWith(u8, layout[li..], "03"))
-        {
+        } else if (std.mem.startsWith(u8, layout[li..], "15")) {
             if (vi + 2 > value.len) return ParseError.InvalidFormat;
             hour = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
                 return ParseError.InvalidFormat;
             };
+            if (hour > 23) return ParseError.ValueOutOfRange;
+            li += 2;
+            vi += 2;
+        } else if (std.mem.startsWith(u8, layout[li..], "03")) {
+            if (vi + 2 > value.len) return ParseError.InvalidFormat;
+            hour = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
+                return ParseError.InvalidFormat;
+            };
+            if (hour < 1 or hour > 12) return ParseError.ValueOutOfRange;
             li += 2;
             vi += 2;
         } else if (std.mem.startsWith(u8, layout[li..], "04")) {
@@ -538,6 +581,7 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             min = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
                 return ParseError.InvalidFormat;
             };
+            if (min > 59) return ParseError.ValueOutOfRange;
             li += 2;
             vi += 2;
         } else if (std.mem.startsWith(u8, layout[li..], "05")) {
@@ -545,6 +589,7 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             sec = std.fmt.parseInt(u8, value[vi .. vi + 2], 10) catch {
                 return ParseError.InvalidFormat;
             };
+            if (sec > 59) return ParseError.ValueOutOfRange;
             li += 2;
             vi += 2;
         } else if (std.mem.startsWith(u8, layout[li..], "PM") or
@@ -558,43 +603,20 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             } else return ParseError.InvalidFormat;
             li += 2;
             vi += 2;
-        } else if (std.mem.startsWith(u8, layout[li..], ".000000000") or
-            std.mem.startsWith(u8, layout[li..], ".999999999"))
-        {
+        } else if (std.mem.startsWith(u8, layout[li..], ".000000000")) {
             li += 10;
             if (vi < value.len and value[vi] == '.') {
-                vi += 1;
-                var count: usize = 0;
-                var ns: u32 = 0;
-                while (vi < value.len and value[vi] >= '0' and value[vi] <= '9' and count < 9) : ({
-                    vi += 1;
-                    count += 1;
-                }) {
-                    ns = ns * 10 + (value[vi] - '0');
-                }
-                while (count < 9) : (count += 1) {
-                    ns *= 10;
-                }
-                nsec = ns;
+                nsec = try parseFracDigits(value, &vi, 9);
             }
-        } else if (std.mem.startsWith(u8, layout[li..], ".000") or
-            std.mem.startsWith(u8, layout[li..], ".999"))
-        {
+        } else if (std.mem.startsWith(u8, layout[li..], ".000000")) {
+            li += 7;
+            if (vi < value.len and value[vi] == '.') {
+                nsec = try parseFracDigits(value, &vi, 6);
+            }
+        } else if (std.mem.startsWith(u8, layout[li..], ".000")) {
             li += 4;
             if (vi < value.len and value[vi] == '.') {
-                vi += 1;
-                var count: usize = 0;
-                var ms: u32 = 0;
-                while (vi < value.len and value[vi] >= '0' and value[vi] <= '9' and count < 3) : ({
-                    vi += 1;
-                    count += 1;
-                }) {
-                    ms = ms * 10 + (value[vi] - '0');
-                }
-                while (count < 3) : (count += 1) {
-                    ms *= 10;
-                }
-                nsec = ms * 1_000_000;
+                nsec = try parseFracDigits(value, &vi, 3);
             }
         } else if (std.mem.startsWith(u8, layout[li..], "Z07:00") or
             std.mem.startsWith(u8, layout[li..], "-07:00"))
@@ -666,6 +688,27 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
             if (std.mem.eql(u8, zone_name, "UTC") or std.mem.eql(u8, zone_name, "GMT")) {
                 offset_sec = 0;
             }
+        } else if (std.mem.startsWith(u8, layout[li..], "1")) {
+            const month_num = try parse1Or2Digits(value, &vi);
+            if (month_num < 1 or month_num > 12) return ParseError.ValueOutOfRange;
+            m = @fromBackingInt(@intCast(month_num));
+            li += 1;
+        } else if (std.mem.startsWith(u8, layout[li..], "2")) {
+            d = try parse1Or2Digits(value, &vi);
+            if (d < 1 or d > 31) return ParseError.ValueOutOfRange;
+            li += 1;
+        } else if (std.mem.startsWith(u8, layout[li..], "3")) {
+            hour = try parse1Or2Digits(value, &vi);
+            if (hour < 1 or hour > 12) return ParseError.ValueOutOfRange;
+            li += 1;
+        } else if (std.mem.startsWith(u8, layout[li..], "4")) {
+            min = try parse1Or2Digits(value, &vi);
+            if (min > 59) return ParseError.ValueOutOfRange;
+            li += 1;
+        } else if (std.mem.startsWith(u8, layout[li..], "5")) {
+            sec = try parse1Or2Digits(value, &vi);
+            if (sec > 59) return ParseError.ValueOutOfRange;
+            li += 1;
         } else {
             if (layout[li] != value[vi]) return ParseError.InvalidFormat;
             li += 1;
@@ -676,6 +719,7 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
     if (vi != value.len) return ParseError.InvalidFormat;
 
     if (pm) |is_pm| {
+        if (hour > 12) return ParseError.ValueOutOfRange;
         if (is_pm and hour < 12) {
             hour += 12;
         } else if (!is_pm and hour == 12) {
@@ -683,8 +727,42 @@ pub fn parse(layout: []const u8, value: []const u8) ParseError!Time {
         }
     }
 
+    if (hour > 23 or min > 59 or sec > 59) return ParseError.ValueOutOfRange;
+
     const loc = Location.fixedZone(zone_name, offset_sec);
     return date(y, m, d, hour, min, sec, nsec, loc);
+}
+
+fn parse1Or2Digits(value: []const u8, vi: *usize) ParseError!u8 {
+    if (vi.* >= value.len or value[vi.*] < '0' or value[vi.*] > '9') {
+        return ParseError.InvalidFormat;
+    }
+    var val: u8 = value[vi.*] - '0';
+    vi.* += 1;
+    if (vi.* < value.len and value[vi.*] >= '0' and value[vi.*] <= '9') {
+        val = val * 10 + (value[vi.*] - '0');
+        vi.* += 1;
+    }
+    return val;
+}
+
+fn parseFracDigits(value: []const u8, vi: *usize, max_digits: usize) ParseError!u32 {
+    std.debug.assert(vi.* < value.len and value[vi.*] == '.');
+    vi.* += 1;
+    var count: usize = 0;
+    var frac: u32 = 0;
+    while (vi.* < value.len and value[vi.*] >= '0' and value[vi.*] <= '9' and count < max_digits) : ({
+        vi.* += 1;
+        count += 1;
+    }) {
+        frac = frac * 10 + (value[vi.*] - '0');
+    }
+    if (count == 0) return ParseError.InvalidFormat;
+    var scale_remaining = 9 - count;
+    while (scale_remaining > 0) : (scale_remaining -= 1) {
+        frac *= 10;
+    }
+    return frac;
 }
 
 pub fn sleep(io: std.Io, d: Duration) !void {
@@ -792,4 +870,23 @@ test "time format and parse standard layouts" {
     try testing.expectEqual(@as(u16, 1), t_jan1.yearDay());
     const t_feb1 = date(2026, .February, 1, 0, 0, 0, 0, null);
     try testing.expectEqual(@as(u16, 32), t_feb1.yearDay());
+
+    // RFC3339Nano strips trailing zeros (and omits dot when nsec == 0)
+    const s_nano = try t0.format(RFC3339Nano, &buf);
+    try testing.expectEqualStrings("2026-11-15T14:30:45.123+08:00", s_nano);
+    const s_nano_zero = try t_morning.format(RFC3339Nano, &buf);
+    try testing.expectEqualStrings("2026-11-15T09:05:00Z", s_nano_zero);
+
+    // Parse Kitchen and microsecond layouts
+    const t_kitchen = try parse(Kitchen, "2:30PM");
+    try testing.expectEqual(@as(u8, 14), t_kitchen.hour());
+    try testing.expectEqual(@as(u8, 30), t_kitchen.minute());
+
+    const t_micro = try parse(StampMicro, "Nov 15 14:30:45.123456");
+    try testing.expectEqual(@as(u32, 123_456_000), t_micro.nanosecond());
+
+    // Range validation
+    try testing.expectError(ParseError.ValueOutOfRange, parse(TimeOnly, "25:00:00"));
+    try testing.expectError(ParseError.ValueOutOfRange, parse(TimeOnly, "12:60:00"));
+    try testing.expectError(ParseError.ValueOutOfRange, parse(TimeOnly, "12:00:60"));
 }

@@ -276,8 +276,9 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
             const decoded_indices = try allocator.alloc(u8, total_pixels);
             defer allocator.free(decoded_indices);
 
+            if (lit_width < 2 or lit_width > 8) return error.CorruptGIFData;
             var in_stream = bytes.Reader.init(lzw_bytes.items);
-            const min_code_size: u4 = @intCast(@max(2, lit_width));
+            const min_code_size: u4 = @intCast(lit_width);
             var lzw_r = lzw.Reader.init(
                 in_stream.reader(),
                 .LSB,
@@ -346,9 +347,13 @@ pub fn decodeAll(allocator: Allocator, data: []const u8) !GIF {
                 }
             }
 
-            try result.images.append(allocator, frame);
-            try result.delays.append(allocator, gc_delay);
-            try result.disposals.append(allocator, gc_disposal);
+            try result.images.ensureUnusedCapacity(allocator, 1);
+            try result.delays.ensureUnusedCapacity(allocator, 1);
+            try result.disposals.ensureUnusedCapacity(allocator, 1);
+
+            result.images.appendAssumeCapacity(frame);
+            result.delays.appendAssumeCapacity(gc_delay);
+            result.disposals.appendAssumeCapacity(gc_disposal);
 
             // Reset Graphic Control state for next frame
             gc_transparent = null;
@@ -369,10 +374,13 @@ pub fn encode(allocator: Allocator, img: *const RGBAImage) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
-    const w: u16 = @intCast(@max(0, img.rect.dx()));
-    const h: u16 = @intCast(@max(0, img.rect.dy()));
-
-    if (w == 0 or h == 0) return error.InvalidDimensions;
+    const dx = img.rect.dx();
+    const dy = img.rect.dy();
+    if (dx <= 0 or dy <= 0 or dx > std.math.maxInt(u16) or dy > std.math.maxInt(u16)) {
+        return error.InvalidDimensions;
+    }
+    const w: u16 = @intCast(dx);
+    const h: u16 = @intCast(dy);
 
     // 1. Header: "GIF89a"
     try out.appendSlice(allocator, "GIF89a");
@@ -399,7 +407,10 @@ pub fn encode(allocator: Allocator, img: *const RGBAImage) ![]u8 {
     var idx: usize = 0;
     for (0..h) |y| {
         for (0..w) |x| {
-            const c = img.at(@intCast(x), @intCast(y));
+            const c = img.at(
+                img.rect.min.x + @as(i32, @intCast(x)),
+                img.rect.min.y + @as(i32, @intCast(y)),
+            );
             // Find existing color
             var found_idx: ?usize = null;
             for (0..unique_count) |p_i| {
@@ -538,4 +549,35 @@ test "gif decode invalid header" {
 
     const invalid = "NOTAGIF";
     try testing.expectError(error.BadGIFHeader, decode(allocator, invalid));
+}
+
+test "gif rejects invalid lit_width and encodes subImage with non-zero origin" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Crafted minimal GIF89a with lit_width = 99 (invalid, must be 2..8)
+    const bad_lit = [_]u8{
+        'G',  'I',  'F',  '8',  '9',  'a',
+        0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 99,
+        0x00, 0x3B,
+    };
+    try testing.expectError(error.CorruptGIFData, decode(allocator, &bad_lit));
+
+    // Encode a subImage with non-zero min origin
+    const img = try RGBAImage.init(allocator, Rectangle.rect(0, 0, 8, 8));
+    defer img.deinit();
+    const green = color.RGBA{ .r = 0, .g = 255, .b = 0, .a = 255 };
+    img.set(5, 6, green);
+
+    var sub = img.subImage(Rectangle.rect(4, 5, 8, 8));
+    const encoded = try encode(allocator, &sub);
+    defer allocator.free(encoded);
+
+    const decoded = try decode(allocator, encoded);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(i32, 4), decoded.rect.dx());
+    try testing.expectEqual(@as(i32, 3), decoded.rect.dy());
+    try testing.expectEqual(@as(u8, 255), decoded.at(1, 1).g);
 }

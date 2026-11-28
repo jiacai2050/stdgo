@@ -106,22 +106,22 @@ pub const File = struct {
         var sections = try allocator.alloc(Section, sect_meta.len);
         errdefer allocator.free(sections);
 
-        var cur_offset: u32 = @intCast(hdr_size);
+        var cur_offset: u64 = hdr_size;
         for (sect_meta, 0..) |m, i| {
             const start = cur_offset;
-            const end = start + m.size;
+            const end = std.math.add(u64, start, m.size) catch return error.Overflow;
             const sect_data = if (start >= bytes.len)
                 &[_]u8{}
             else if (end <= bytes.len)
-                bytes[start..end]
+                bytes[@intCast(start)..@intCast(end)]
             else
-                bytes[start..bytes.len];
+                bytes[@intCast(start)..bytes.len];
 
             sections[i] = Section{
                 .header = .{
                     .name = m.name,
                     .size = m.size,
-                    .offset = start,
+                    .offset = std.math.cast(u32, start) orelse return error.Overflow,
                 },
                 .data = sect_data,
             };
@@ -195,8 +195,10 @@ fn walksymtab(
 
         switch (typ) {
             'z', 'Z' => {
+                if (p.len < i + nnul) return error.UnexpectedEof;
                 p = p[i + nnul ..];
                 i = 0;
+                nnul = 0;
                 while (i + 2 <= p.len) : (i += 2) {
                     if (p[i] == 0 and p[i + 1] == 0) {
                         nnul = 2;
@@ -256,7 +258,8 @@ const DecodeContext = struct {
         errdefer self.allocator.free(final_name);
 
         if (s.typ == 'f') {
-            try self.fname.put(@intCast(s.value), final_name);
+            const key = std.math.cast(u16, s.value) orelse return error.BadFilenameCode;
+            try self.fname.put(key, final_name);
         }
 
         try self.syms.append(self.allocator, Sym{

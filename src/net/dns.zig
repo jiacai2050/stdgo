@@ -120,6 +120,9 @@ pub fn decodeDomainName(
             continue;
         }
 
+        // Reject reserved DNS label lengths (64..191, i.e., high bits 01 or 10).
+        if ((len_byte & 0xC0) != 0) return error.DnsFormatError;
+
         // Regular label
         const label_len: usize = len_byte;
         cur += 1;
@@ -142,7 +145,7 @@ pub fn decodeDomainName(
 
 /// Builds a DNS query packet for `name` and `qtype`.
 pub fn buildQuery(id: u16, name: []const u8, qtype: RecordType, buf: []u8) !usize {
-    std.debug.assert(name.len > 0);
+    if (name.len == 0) return error.InvalidDomainName;
     if (buf.len < 12) return error.DnsPacketTooShort;
 
     // Header (12 bytes)
@@ -176,7 +179,7 @@ pub const Resolver = struct {
         io: std.Io,
         host: []const u8,
     ) ![][]const u8 {
-        std.debug.assert(host.len > 0);
+        if (host.len == 0) return error.InvalidDomainName;
         const ips = try self.lookupIP(allocator, io, host);
         defer allocator.free(ips);
 
@@ -189,7 +192,9 @@ pub const Resolver = struct {
         for (ips) |ip| {
             var buf: [46]u8 = undefined;
             const s = ip.stringBuf(&buf);
-            try list.append(allocator, try allocator.dupe(u8, s));
+            const dup = try allocator.dupe(u8, s);
+            errdefer allocator.free(dup);
+            try list.append(allocator, dup);
         }
 
         return list.toOwnedSlice(allocator);
@@ -197,7 +202,7 @@ pub const Resolver = struct {
 
     /// Look up host addresses returning IP structs.
     pub fn lookupIP(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![]IP {
-        std.debug.assert(host.len > 0);
+        if (host.len == 0) return error.InvalidDomainName;
         const deadline_value = self.deadline(io);
         var list: std.ArrayListUnmanaged(IP) = .empty;
         errdefer list.deinit(allocator);
@@ -260,7 +265,7 @@ pub const Resolver = struct {
         io: std.Io,
         host: []const u8,
     ) ![]const u8 {
-        std.debug.assert(host.len > 0);
+        if (host.len == 0) return error.InvalidDomainName;
         const records = try self.queryRaw(allocator, io, host, .CNAME, self.deadline(io));
         defer {
             for (records) |r| allocator.free(r.data);
@@ -283,7 +288,7 @@ pub const Resolver = struct {
         io: std.Io,
         host: []const u8,
     ) ![][]const u8 {
-        std.debug.assert(host.len > 0);
+        if (host.len == 0) return error.InvalidDomainName;
         const records = try self.queryRaw(allocator, io, host, .TXT, self.deadline(io));
         defer {
             for (records) |r| allocator.free(r.data);
@@ -298,7 +303,9 @@ pub const Resolver = struct {
 
         for (records) |r| {
             if (r.rtype == .TXT) {
-                try list.append(allocator, try allocator.dupe(u8, r.data));
+                const dup = try allocator.dupe(u8, r.data);
+                errdefer allocator.free(dup);
+                try list.append(allocator, dup);
             }
         }
 
@@ -308,7 +315,7 @@ pub const Resolver = struct {
 
     /// Look up MX records sorted by preference.
     pub fn lookupMX(self: Resolver, allocator: Allocator, io: std.Io, host: []const u8) ![]MX {
-        std.debug.assert(host.len > 0);
+        if (host.len == 0) return error.InvalidDomainName;
         const records = try self.queryRaw(allocator, io, host, .MX, self.deadline(io));
         defer {
             for (records) |r| allocator.free(r.data);
@@ -325,6 +332,7 @@ pub const Resolver = struct {
             if (r.rtype == .MX and r.data.len >= 2) {
                 const pref = std.mem.readInt(u16, r.data[0..][0..2], .big);
                 const mx_host = try allocator.dupe(u8, r.data[2..]);
+                errdefer allocator.free(mx_host);
                 try list.append(allocator, .{ .host = mx_host, .pref = pref });
             }
         }
@@ -362,7 +370,7 @@ pub const Resolver = struct {
         qtype: RecordType,
         deadline_value: Deadline,
     ) ![]RawRecord {
-        std.debug.assert(host.len > 0);
+        if (host.len == 0) return error.InvalidDomainName;
         const uc = try udp_mod.dialUDP(allocator, io, "udp", null, self.nameserver);
         defer uc.close();
 
@@ -387,11 +395,15 @@ pub const Resolver = struct {
         if ((flags & 0x8000) == 0) return error.DnsNotResponse;
         const rcode = flags & 0x0F;
 
-        if (rcode == 1) return error.DnsFormatError;
-        if (rcode == 2) return error.DnsServerFailure;
-        if (rcode == 3) return error.DnsNameError; // NXDOMAIN
-        if (rcode == 4) return error.DnsNotImplemented;
-        if (rcode == 5) return error.DnsRefused;
+        switch (rcode) {
+            0 => {},
+            1 => return error.DnsFormatError,
+            2 => return error.DnsServerFailure,
+            3 => return error.DnsNameError, // NXDOMAIN
+            4 => return error.DnsNotImplemented,
+            5 => return error.DnsRefused,
+            else => return error.DnsServerFailure,
+        }
 
         const qdcount = std.mem.readInt(u16, packet[4..6], .big);
         const ancount = std.mem.readInt(u16, packet[6..8], .big);
@@ -402,6 +414,7 @@ pub const Resolver = struct {
         while (q_idx < qdcount and offset < packet.len) : (q_idx += 1) {
             const dec_name = try decodeDomainName(allocator, packet, offset, &offset);
             allocator.free(dec_name);
+            if (offset + 4 > packet.len) return error.DnsPacketTooShort;
             offset += 4; // QTYPE (2) + QCLASS (2)
         }
 
@@ -429,6 +442,7 @@ pub const Resolver = struct {
             switch (rtype) {
                 .A, .AAAA => {
                     const data_copy = try allocator.dupe(u8, rdata);
+                    errdefer allocator.free(data_copy);
                     try results.append(allocator, .{
                         .rtype = rtype,
                         .ttl = ttl,
@@ -437,6 +451,7 @@ pub const Resolver = struct {
                 },
                 .CNAME => {
                     const cname_host = try decodeDomainName(allocator, packet, offset, null);
+                    errdefer allocator.free(cname_host);
                     try results.append(allocator, .{
                         .rtype = rtype,
                         .ttl = ttl,
@@ -449,7 +464,8 @@ pub const Resolver = struct {
                         const mx_host = try decodeDomainName(allocator, packet, offset + 2, null);
                         defer allocator.free(mx_host);
 
-                        var mx_buf = try allocator.alloc(u8, 2 + mx_host.len);
+                        const mx_buf = try allocator.alloc(u8, 2 + mx_host.len);
+                        errdefer allocator.free(mx_buf);
                         std.mem.writeInt(u16, mx_buf[0..][0..2], pref, .big);
                         @memcpy(mx_buf[2..], mx_host);
                         try results.append(allocator, .{
@@ -473,6 +489,7 @@ pub const Resolver = struct {
                         } else break;
                     }
                     const txt_data = try txt_res.toOwnedSlice(allocator);
+                    errdefer allocator.free(txt_data);
                     try results.append(allocator, .{
                         .rtype = rtype,
                         .ttl = ttl,
@@ -541,4 +558,27 @@ test "net.dns: resolver timeout bounds an unresponsive nameserver" {
     };
     const res = resolver.lookupIP(testing.allocator, io, "example.test");
     try testing.expectError(error.Timeout, res);
+}
+
+test "net.dns: empty host returns InvalidDomainName and reserved label lengths rejected" {
+    const testing = std.testing;
+    const io = testing.io;
+    const resolver = Resolver{};
+
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.InvalidDomainName, buildQuery(1, "", .A, &buf));
+    try testing.expectError(error.InvalidDomainName, resolver.lookupIP(testing.allocator, io, ""));
+    try testing.expectError(error.InvalidDomainName, resolver.lookupHost(testing.allocator, io, ""));
+
+    // Reserved label length 0x40 (64) and 0x80 (128) must be rejected.
+    const bad_label_64 = [_]u8{ 0x40, 'a', 0x00 };
+    try testing.expectError(
+        error.DnsFormatError,
+        decodeDomainName(testing.allocator, &bad_label_64, 0, null),
+    );
+    const bad_label_128 = [_]u8{ 0x80, 'a', 0x00 };
+    try testing.expectError(
+        error.DnsFormatError,
+        decodeDomainName(testing.allocator, &bad_label_128, 0, null),
+    );
 }

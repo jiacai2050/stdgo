@@ -19,17 +19,30 @@ pub fn Pool(comptime T: type) type {
         count: usize = 0,
         mutex: Mutex = .{},
 
+        /// Initializes a Pool with an allocator and optional factory function.
+        /// For automatic cleanup of overflow items on `put`, use `initWithDestroy`.
         pub fn init(allocator: Allocator, new_fn: ?*const fn (Allocator) Allocator.Error!*T) Self {
+            return initWithDestroy(allocator, new_fn, null);
+        }
+
+        /// Initializes a Pool with an allocator, optional factory function, and optional
+        /// destructor invoked on overflow during `put` and on remaining items during `deinit`.
+        pub fn initWithDestroy(
+            allocator: Allocator,
+            new_fn: ?*const fn (Allocator) Allocator.Error!*T,
+            destroy_fn: ?*const fn (Allocator, *T) void,
+        ) Self {
             return .{
                 .allocator = allocator,
                 .new_fn = new_fn,
-                .destroy_fn = null,
+                .destroy_fn = destroy_fn,
                 .items = undefined,
                 .count = 0,
                 .mutex = .{},
             };
         }
 
+        /// Releases all items currently stored in the pool using destroy_fn (or the pool's default destroy_fn).
         pub fn deinit(self: *Self, destroy_fn: ?*const fn (Allocator, *T) void) void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -43,6 +56,7 @@ pub fn Pool(comptime T: type) type {
             self.count = 0;
         }
 
+        /// Retrieves a pooled item, or creates a new one via new_fn if the pool is empty.
         pub fn get(self: *Self) Allocator.Error!?*T {
             self.mutex.lock();
             if (self.count > 0) {
@@ -59,16 +73,23 @@ pub fn Pool(comptime T: type) type {
             return null;
         }
 
-        pub fn put(self: *Self, item: *T) void {
+        /// Attempts to return item to the pool without invoking destroy_fn on overflow.
+        /// Returns true if stored in the pool, or false if the pool is full (caller retains ownership).
+        pub fn tryPut(self: *Self, item: *T) bool {
             self.mutex.lock();
+            defer self.mutex.unlock();
             if (self.count < capacity) {
                 self.items[self.count] = item;
                 self.count += 1;
-                self.mutex.unlock();
-                return;
+                return true;
             }
-            self.mutex.unlock();
+            return false;
+        }
 
+        /// Returns item to the pool. If the pool is full and destroy_fn is configured,
+        /// destroy_fn is invoked immediately to prevent leaks.
+        pub fn put(self: *Self, item: *T) void {
+            if (self.tryPut(item)) return;
             if (self.destroy_fn) |df| {
                 df(self.allocator, item);
             }
@@ -136,9 +157,8 @@ test "sync.Pool capacity overflow discards or destroys excess items" {
     };
 
     Context.destroyed_count = 0;
-    var pool = Pool(TestObj).init(testing.allocator, Context.create);
-    pool.destroy_fn = Context.destroy;
-    defer pool.deinit(Context.destroy);
+    var pool = Pool(TestObj).initWithDestroy(testing.allocator, Context.create, Context.destroy);
+    defer pool.deinit(null);
 
     // Allocate capacity + 10 items
     const total_items = Pool(TestObj).capacity + 10;

@@ -242,24 +242,29 @@ pub const IPNet = struct {
     }
 };
 
+fn parseIPv4Bytes(s: []const u8) ?[4]u8 {
+    var parts: [4]u8 = undefined;
+    var part_idx: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '.');
+    while (it.next()) |seg| {
+        if (part_idx >= 4 or seg.len == 0 or seg.len > 3) return null;
+        // No leading zero if length > 1
+        if (seg.len > 1 and seg[0] == '0') return null;
+        const val = std.fmt.parseInt(u8, seg, 10) catch return null;
+        parts[part_idx] = val;
+        part_idx += 1;
+    }
+    if (part_idx != 4) return null;
+    return parts;
+}
+
 /// ParseIP parses s as an IPv4 dotted-decimal or IPv6 address.
 pub fn parseIp(s: []const u8) ?IP {
     if (s.len == 0) return null;
 
     // Check for IPv4
     if (std.mem.indexOfScalar(u8, s, '.') != null and std.mem.indexOfScalar(u8, s, ':') == null) {
-        var parts: [4]u8 = undefined;
-        var part_idx: usize = 0;
-        var it = std.mem.splitScalar(u8, s, '.');
-        while (it.next()) |seg| {
-            if (part_idx >= 4 or seg.len == 0 or seg.len > 3) return null;
-            // No leading zero if length > 1
-            if (seg.len > 1 and seg[0] == '0') return null;
-            const val = std.fmt.parseInt(u8, seg, 10) catch return null;
-            parts[part_idx] = val;
-            part_idx += 1;
-        }
-        if (part_idx != 4) return null;
+        const parts = parseIPv4Bytes(s) orelse return null;
         return IP{ .v4 = parts };
     }
 
@@ -272,6 +277,25 @@ pub fn parseIp(s: []const u8) ?IP {
 }
 
 fn parseIPv6(s: []const u8) ?IP {
+    // Support IPv4-mapped / mixed IPv6 dotted-quad suffix (e.g. "::ffff:10.0.0.1")
+    // by converting the trailing dotted-quad into two hex groups.
+    if (std.mem.indexOfScalar(u8, s, '.') != null) {
+        const last_colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+        const v4 = parseIPv4Bytes(s[last_colon + 1 ..]) orelse return null;
+        const w6: u16 = (@as(u16, v4[0]) << 8) | v4[1];
+        const w7: u16 = (@as(u16, v4[2]) << 8) | v4[3];
+        var rewritten_buf: [64]u8 = undefined;
+        const rewritten = std.fmt.bufPrint(
+            &rewritten_buf,
+            "{s}{x}:{x}",
+            .{ s[0 .. last_colon + 1], w6, w7 },
+        ) catch return null;
+        return parseIPv6Hex(rewritten);
+    }
+    return parseIPv6Hex(s);
+}
+
+fn parseIPv6Hex(s: []const u8) ?IP {
     var raw: [16]u8 = @splat(0);
     const dcolon_pos = std.mem.indexOf(u8, s, "::");
 
@@ -433,4 +457,12 @@ test "net.ip: IP format matches stringBuf" {
     }
     const v4_v6_fmt = try std.fmt.bufPrint(&fmt_buf, "{f}", .{v4_in_v6});
     try testing.expectEqualStrings("::ffff:10.0.0.1", v4_v6_fmt);
+
+    // Round-trip IPv4-mapped IPv6 dotted-quad suffix through parseIp
+    const parsed = parseIp("::ffff:10.0.0.1").?;
+    try testing.expect(parsed.equal(v4_in_v6));
+    try testing.expectEqual([4]u8{ 10, 0, 0, 1 }, parsed.to4().?);
+    const parsed_full = parseIp("0:0:0:0:0:ffff:192.0.2.128").?;
+    try testing.expectEqual([4]u8{ 192, 0, 2, 128 }, parsed_full.to4().?);
+    try testing.expect(parseIp("::ffff:999.0.0.1") == null);
 }

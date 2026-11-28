@@ -143,7 +143,8 @@ pub const Decoder = struct {
     r: *std.Io.Reader,
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
-    peeked: ?u8,
+    peek_buf: [8]u8 = undefined,
+    peek_len: usize = 0,
     pending_end: ?EndElement,
     open_tags: std.ArrayListUnmanaged(Name),
 
@@ -152,7 +153,8 @@ pub const Decoder = struct {
             .r = rd,
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .peeked = null,
+            .peek_buf = undefined,
+            .peek_len = 0,
             .pending_end = null,
             .open_tags = .empty,
         };
@@ -164,9 +166,9 @@ pub const Decoder = struct {
     }
 
     fn readByte(self: *Decoder) !?u8 {
-        if (self.peeked) |b| {
-            self.peeked = null;
-            return b;
+        if (self.peek_len > 0) {
+            self.peek_len -= 1;
+            return self.peek_buf[self.peek_len];
         }
 
         const b = self.r.takeByte() catch |err| {
@@ -177,7 +179,9 @@ pub const Decoder = struct {
     }
 
     fn unreadByte(self: *Decoder, b: u8) void {
-        self.peeked = b;
+        std.debug.assert(self.peek_len < self.peek_buf.len);
+        self.peek_buf[self.peek_len] = b;
+        self.peek_len += 1;
     }
 
     pub fn token(self: *Decoder) !?Token {
@@ -189,7 +193,10 @@ pub const Decoder = struct {
         const arena_alloc = self.arena.allocator();
 
         while (true) {
-            const first = (try self.readByte()) orelse return null;
+            const first = (try self.readByte()) orelse {
+                if (self.open_tags.items.len > 0) return SyntaxError.UnclosedTag;
+                return null;
+            };
 
             if (first == '<') {
                 const next_char = (try self.readByte()) orelse return SyntaxError.UnexpectedEOF;
@@ -230,30 +237,42 @@ pub const Decoder = struct {
                                 .comment = try arena_alloc.dupe(u8, comment_text),
                             };
                         }
+                        self.unreadByte(c4);
+                        self.unreadByte(c3);
+                    } else {
+                        self.unreadByte(c3);
                     }
 
-                    self.unreadByte(c3);
-                    // Check CDATA
-                    var match_cdata = false;
+                    // Check CDATA ("<![CDATA["), stopping immediately on mismatch or '>'
+                    const cdata_prefix = "[CDATA[";
                     var cdata_check: [7]u8 = undefined;
                     var read_cnt: usize = 0;
-                    while (read_cnt < 7) {
-                        if (try self.readByte()) |b| {
-                            cdata_check[read_cnt] = b;
-                            read_cnt += 1;
-                        } else break;
-                    }
-                    if (read_cnt == 7 and mem.eql(u8, cdata_check[0..7], "[CDATA[")) {
-                        match_cdata = true;
+                    var match_cdata = true;
+                    while (read_cnt < cdata_prefix.len) {
+                        const b = (try self.readByte()) orelse {
+                            match_cdata = false;
+                            break;
+                        };
+                        if (b == '>') {
+                            match_cdata = false;
+                            self.unreadByte(b);
+                            break;
+                        }
+                        cdata_check[read_cnt] = b;
+                        read_cnt += 1;
+                        if (b != cdata_prefix[read_cnt - 1]) {
+                            match_cdata = false;
+                            break;
+                        }
                     }
 
-                    if (match_cdata) {
+                    if (match_cdata and read_cnt == cdata_prefix.len) {
                         const cdata_content = try self.readUntilString("]]>");
                         return Token{
                             .char_data = try arena_alloc.dupe(u8, cdata_content),
                         };
                     } else {
-                        // Put back read_cnt bytes and read Directive until '>'
+                        // Read remaining Directive until '>'
                         var directive_buf: std.ArrayListUnmanaged(u8) = .empty;
                         defer directive_buf.deinit(self.allocator);
                         try directive_buf.appendSlice(self.allocator, cdata_check[0..read_cnt]);
@@ -282,7 +301,7 @@ pub const Decoder = struct {
                 } else {
                     // StartElement: <name attr="val" ... /?>
                     self.unreadByte(next_char);
-                    const raw_tag = try self.readUntil('>');
+                    const raw_tag = try self.readTagContent();
                     var self_closing = false;
                     var tag_body = raw_tag;
                     if (tag_body.len > 0 and tag_body[tag_body.len - 1] == '/') {
@@ -354,6 +373,29 @@ pub const Decoder = struct {
                 else => {},
             }
         }
+    }
+
+    fn readTagContent(self: *Decoder) ![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.allocator);
+
+        var in_quote: ?u8 = null;
+        while (true) {
+            const b = (try self.readByte()) orelse return SyntaxError.UnexpectedEOF;
+            if (in_quote) |q| {
+                if (b == q) {
+                    in_quote = null;
+                }
+            } else {
+                if (b == '"' or b == '\'') {
+                    in_quote = b;
+                } else if (b == '>') {
+                    break;
+                }
+            }
+            try out.append(self.allocator, b);
+        }
+        return self.arena.allocator().dupe(u8, out.items);
     }
 
     fn readUntil(self: *Decoder, delim: u8) ![]const u8 {
@@ -661,4 +703,54 @@ test "xml skip subtree" {
     // Next must be 'd'
     const t3 = (try dec.token()).?;
     try testing.expectEqualStrings("d", t3.start_element.name.local);
+}
+
+test "xml quoted > in attribute, short directives, and unclosed tag EOF" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // 1. '>' inside quoted attribute value
+    {
+        var reader = bytes.Reader.init("<a expr=\"x > 1\">ok</a>");
+        var dec = Decoder.init(alloc, reader.reader());
+        defer dec.deinit();
+
+        const t1 = (try dec.token()).?;
+        try testing.expectEqualStrings("a", t1.start_element.name.local);
+        try testing.expectEqual(@as(usize, 1), t1.start_element.attr.len);
+        try testing.expectEqualStrings("x > 1", t1.start_element.attr[0].value);
+        const t2 = (try dec.token()).?;
+        try testing.expectEqualStrings("ok", t2.char_data);
+        const t3 = (try dec.token()).?;
+        try testing.expectEqualStrings("a", t3.end_element.name.local);
+        try testing.expectEqual(@as(?Token, null), try dec.token());
+    }
+
+    // 2. Short directive <!x> and <!-x> without losing bytes
+    {
+        var reader = bytes.Reader.init("<!x><!-y><a/>");
+        var dec = Decoder.init(alloc, reader.reader());
+        defer dec.deinit();
+
+        const d1 = (try dec.token()).?;
+        try testing.expectEqualStrings("x", d1.directive);
+        const d2 = (try dec.token()).?;
+        try testing.expectEqualStrings("-y", d2.directive);
+        const s1 = (try dec.token()).?;
+        try testing.expectEqualStrings("a", s1.start_element.name.local);
+        const e1 = (try dec.token()).?;
+        try testing.expectEqualStrings("a", e1.end_element.name.local);
+        try testing.expectEqual(@as(?Token, null), try dec.token());
+    }
+
+    // 3. Unclosed tag on EOF returns SyntaxError.UnclosedTag
+    {
+        var reader = bytes.Reader.init("<a><b>");
+        var dec = Decoder.init(alloc, reader.reader());
+        defer dec.deinit();
+
+        _ = (try dec.token()).?;
+        _ = (try dec.token()).?;
+        try testing.expectError(SyntaxError.UnclosedTag, dec.token());
+    }
 }

@@ -39,23 +39,31 @@ pub const Whitespace = @TypeOf(@as(std.json.Stringify.Options, undefined).whites
 pub const Decoder = struct {
     allocator: Allocator,
     json_reader: std.json.Reader,
+    token_arena: std.heap.ArenaAllocator,
 
+    /// Initializes a JSON Decoder reading from `r`.
     pub fn init(allocator: Allocator, r: *io.Reader) Decoder {
         return .{
             .allocator = allocator,
             .json_reader = std.json.Reader.init(allocator, r),
+            .token_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
+    /// Releases all resources owned by the Decoder, including any memory allocated for tokens.
     pub fn deinit(self: *Decoder) void {
+        self.token_arena.deinit();
         self.json_reader.deinit();
     }
 
     /// Token returns the next JSON token in the input stream.
     /// At the end of the input stream, Token returns null.
+    /// Slices returned in `.string` and `.number` tokens are owned by the Decoder
+    /// and remain valid only until the next call to `token()` or `deinit()`.
     pub fn token(self: *Decoder) !?Token {
+        _ = self.token_arena.reset(.retain_capacity);
         const raw_tok = self.json_reader.nextAlloc(
-            self.allocator,
+            self.token_arena.allocator(),
             .alloc_if_needed,
         ) catch |err| switch (err) {
             error.EndOfStream => return null,
@@ -323,6 +331,22 @@ test "encoding.json: streaming Token and more()" {
 
     const eof = try dec.token();
     try testing.expectEqual(@as(?Token, null), eof);
+}
+
+test "encoding.json: Decoder.token escaped strings do not leak" {
+    const testing = std.testing;
+
+    const input = "[\"hello\\nworld\", \"quote\\\"here\", \"\\u0041\"]";
+    var r = bytes_mod.Reader.init(input);
+    var dec = Decoder.init(testing.allocator, r.reader());
+    defer dec.deinit();
+
+    try testing.expectEqual(Delim.array_begin, (try dec.token()).?.delim);
+    try testing.expectEqualStrings("hello\nworld", (try dec.token()).?.string);
+    try testing.expectEqualStrings("quote\"here", (try dec.token()).?.string);
+    try testing.expectEqualStrings("A", (try dec.token()).?.string);
+    try testing.expectEqual(Delim.array_end, (try dec.token()).?.delim);
+    try testing.expectEqual(@as(?Token, null), try dec.token());
 }
 
 test "encoding.json: streaming Encoder" {

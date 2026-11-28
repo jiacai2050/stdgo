@@ -81,6 +81,7 @@ pub const Transport = struct {
     options: TransportOptions,
     pool: ConnPool,
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    ca_lock: std.Io.RwLock = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: TransportOptions) Transport {
         var opts = options;
@@ -101,6 +102,7 @@ pub const Transport = struct {
             .options = opts,
             .pool = pool,
             .ca_bundle = null,
+            .ca_lock = .init,
         };
     }
 
@@ -110,6 +112,65 @@ pub const Transport = struct {
             bundle.deinit(self.allocator);
             self.ca_bundle = null;
         }
+    }
+
+    fn ensureCaBundle(self: *Transport) !*std.crypto.Certificate.Bundle {
+        if (self.options.ca_bundle) |bundle| return bundle;
+
+        try self.ca_lock.lockShared(self.io);
+        if (self.ca_bundle != null) {
+            self.ca_lock.unlockShared(self.io);
+            return &self.ca_bundle.?;
+        }
+        self.ca_lock.unlockShared(self.io);
+
+        try self.ca_lock.lock(self.io);
+        defer self.ca_lock.unlock(self.io);
+
+        if (self.ca_bundle == null) {
+            var bundle: std.crypto.Certificate.Bundle = .empty;
+            errdefer bundle.deinit(self.allocator);
+            const now = std.Io.Timestamp.now(self.io, .real);
+            try bundle.rescan(self.allocator, self.io, now);
+            self.ca_bundle = bundle;
+        }
+        return &self.ca_bundle.?;
+    }
+
+    fn initTlsConn(
+        self: *Transport,
+        stream: std.Io.net.Stream,
+        host: []const u8,
+        deadline: deadline_mod.Deadline,
+    ) !*HttpConn {
+        const tls_limit = durationDeadline(
+            self.io,
+            self.options.tls_handshake_timeout,
+        );
+        const tls_deadline = deadline.earlier(tls_limit);
+        if (self.options.insecure_skip_verify) {
+            return HttpConn.initTls(
+                self.allocator,
+                self.io,
+                stream,
+                host,
+                null,
+                null,
+                true,
+                tls_deadline,
+            );
+        }
+        const ca_bundle = try self.ensureCaBundle();
+        return HttpConn.initTls(
+            self.allocator,
+            self.io,
+            stream,
+            host,
+            ca_bundle,
+            &self.ca_lock,
+            false,
+            tls_deadline,
+        );
     }
 
     /// closeIdleConnections closes any connections which were previously
@@ -186,6 +247,36 @@ pub const Transport = struct {
         return false;
     }
 
+    fn headerHasToken(headers: *const @import("header.zig").Header, name: []const u8, token: []const u8) bool {
+        for (headers.entries.items) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+            var it = std.mem.splitScalar(u8, entry.value, ',');
+            while (it.next()) |part| {
+                const trimmed = std.mem.trim(u8, part, " \t");
+                if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn writeHostPort(w: *std.Io.Writer, host: []const u8, port: u16) !void {
+        const is_ipv6 = std.mem.indexOfScalar(u8, host, ':') != null;
+        if (is_ipv6) try w.writeByte('[');
+        try w.writeAll(host);
+        if (is_ipv6) try w.writeByte(']');
+        var port_buf: [8]u8 = undefined;
+        const port_str = try std.fmt.bufPrint(&port_buf, ":{d}", .{port});
+        try w.writeAll(port_str);
+    }
+
+    fn isConnectSuccessStatusLine(status_line: []const u8) bool {
+        if (!std.mem.startsWith(u8, status_line, "HTTP/1.")) return false;
+        var parts = std.mem.splitScalar(u8, status_line, ' ');
+        _ = parts.next() orelse return false;
+        const code = parts.next() orelse return false;
+        return std.mem.eql(u8, code, "200");
+    }
+
     fn establishConnectTunnel(
         io: std.Io,
         stream: std.Io.net.Stream,
@@ -198,23 +289,19 @@ pub const Transport = struct {
         var stream_w: io_util.SocketWriter = .init(io, stream, &write_buf, deadline);
         const w = &stream_w.interface;
 
-        var req_buf: [512]u8 = undefined;
-        const req_str = if (auth) |a|
-            try std.fmt.bufPrint(
-                &req_buf,
-                "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
-                    "User-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n" ++
-                    "Proxy-Authorization: {s}\r\n\r\n",
-                .{ host, port, host, port, a },
-            )
-        else
-            try std.fmt.bufPrint(
-                &req_buf,
-                "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
-                    "User-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n\r\n",
-                .{ host, port, host, port },
-            );
-        w.writeAll(req_str) catch |err| return stream_w.err orelse err;
+        w.writeAll("CONNECT ") catch |err| return stream_w.err orelse err;
+        writeHostPort(w, host, port) catch |err| return stream_w.err orelse err;
+        w.writeAll(" HTTP/1.1\r\nHost: ") catch |err| return stream_w.err orelse err;
+        writeHostPort(w, host, port) catch |err| return stream_w.err orelse err;
+        w.writeAll("\r\nUser-Agent: curl/8.7.1\r\nProxy-Connection: Keep-Alive\r\n") catch |err| {
+            return stream_w.err orelse err;
+        };
+        if (auth) |a| {
+            w.writeAll("Proxy-Authorization: ") catch |err| return stream_w.err orelse err;
+            w.writeAll(a) catch |err| return stream_w.err orelse err;
+            w.writeAll("\r\n") catch |err| return stream_w.err orelse err;
+        }
+        w.writeAll("\r\n") catch |err| return stream_w.err orelse err;
         w.flush() catch |err| return stream_w.err orelse err;
 
         var read_buf: [1024]u8 = undefined;
@@ -226,7 +313,8 @@ pub const Transport = struct {
             const buffered = r.buffered();
             if (std.mem.indexOf(u8, buffered, "\r\n\r\n")) |idx| {
                 const head = buffered[0..idx];
-                if (std.mem.indexOf(u8, head, " 200") == null) {
+                const first_line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+                if (!isConnectSuccessStatusLine(head[0..first_line_end])) {
                     return error.ProxyConnectionRefused;
                 }
                 r.toss(idx + 4);
@@ -274,7 +362,10 @@ pub const Transport = struct {
 
         if (req.header.get("Host") == null) {
             try head_w.writeAll("Host: ");
+            const is_ipv6 = std.mem.indexOfScalar(u8, target.host, ':') != null;
+            if (is_ipv6) try head_w.writeByte('[');
             try head_w.writeAll(target.host);
+            if (is_ipv6) try head_w.writeByte(']');
             const is_default_port = (!target.is_tls and target.port == 80) or
                 (target.is_tls and target.port == 443);
             if (!is_default_port) {
@@ -492,20 +583,7 @@ pub const Transport = struct {
                             return err;
                         };
                         if (target.is_tls) {
-                            const tls_limit = durationDeadline(
-                                self.io,
-                                self.options.tls_handshake_timeout,
-                            );
-                            const tls_deadline = deadline.earlier(tls_limit);
-                            break :blk try HttpConn.initTls(
-                                self.allocator,
-                                self.io,
-                                stream,
-                                target.host,
-                                self.options.ca_bundle,
-                                self.options.insecure_skip_verify,
-                                tls_deadline,
-                            );
+                            break :blk try self.initTlsConn(stream, target.host, deadline);
                         } else {
                             break :blk try HttpConn.initPlain(
                                 self.allocator,
@@ -523,20 +601,7 @@ pub const Transport = struct {
                             proxy_auth_header,
                             deadline,
                         );
-                        const tls_limit = durationDeadline(
-                            self.io,
-                            self.options.tls_handshake_timeout,
-                        );
-                        const tls_deadline = deadline.earlier(tls_limit);
-                        break :blk try HttpConn.initTls(
-                            self.allocator,
-                            self.io,
-                            stream,
-                            target.host,
-                            self.options.ca_bundle,
-                            self.options.insecure_skip_verify,
-                            tls_deadline,
-                        );
+                        break :blk try self.initTlsConn(stream, target.host, deadline);
                     } else {
                         break :blk try HttpConn.initPlain(
                             self.allocator,
@@ -551,20 +616,7 @@ pub const Transport = struct {
                     try deadline.check(self.io);
 
                     if (target.is_tls) {
-                        const tls_limit = durationDeadline(
-                            self.io,
-                            self.options.tls_handshake_timeout,
-                        );
-                        const tls_deadline = deadline.earlier(tls_limit);
-                        break :blk try HttpConn.initTls(
-                            self.allocator,
-                            self.io,
-                            stream,
-                            target.host,
-                            self.options.ca_bundle,
-                            self.options.insecure_skip_verify,
-                            tls_deadline,
-                        );
+                        break :blk try self.initTlsConn(stream, target.host, deadline);
                     } else {
                         break :blk try HttpConn.initPlain(
                             self.allocator,
@@ -761,21 +813,32 @@ pub const Transport = struct {
             var content_length: u64 = 0;
             var can_keep_alive = sent_body;
 
-            if (head.headers.get("Transfer-Encoding")) |te| {
-                if (std.mem.indexOf(u8, te, "chunked") != null) {
+            const no_body_response = req.method == .HEAD or
+                head.status_code == 204 or
+                head.status_code == 304 or
+                (head.status_code >= 100 and head.status_code < 200);
+
+            if (no_body_response) {
+                mode = .fixed;
+                content_length = 0;
+            } else if (head.headers.get("Transfer-Encoding") != null) {
+                if (headerHasToken(&head.headers, "Transfer-Encoding", "chunked")) {
                     mode = .chunked;
                 }
             } else if (head.headers.get("Content-Length")) |cl| {
-                content_length = std.fmt.parseInt(u64, cl, 10) catch {
+                const trimmed_cl = std.mem.trim(u8, cl, " \t");
+                content_length = std.fmt.parseInt(u64, trimmed_cl, 10) catch {
                     return error.InvalidContentLength;
                 };
                 mode = .fixed;
             }
 
-            if (head.headers.get("Connection")) |conn_hdr| {
-                if (std.ascii.eqlIgnoreCase(conn_hdr, "close")) {
-                    can_keep_alive = false;
-                }
+            if (mode == .close_eof) {
+                can_keep_alive = false;
+            }
+
+            if (headerHasToken(&head.headers, "Connection", "close")) {
+                can_keep_alive = false;
             }
 
             const leftover: []const u8 = &.{};
@@ -804,7 +867,7 @@ pub const Transport = struct {
                 .uncompressed = false,
             };
 
-            if (!self.options.disable_compression and req.method != .HEAD) {
+            if (!self.options.disable_compression and !no_body_response) {
                 if (resp.header.get("Content-Encoding")) |enc| {
                     if (std.ascii.eqlIgnoreCase(enc, "gzip")) {
                         try resp.body.enableGzip(self.allocator);
@@ -819,3 +882,19 @@ pub const Transport = struct {
         }
     }
 };
+
+test "Transport: CONNECT status line and header token parsing" {
+    const testing = std.testing;
+    try testing.expect(Transport.isConnectSuccessStatusLine("HTTP/1.1 200 Connection Established"));
+    try testing.expect(Transport.isConnectSuccessStatusLine("HTTP/1.0 200 OK"));
+    try testing.expect(!Transport.isConnectSuccessStatusLine("HTTP/1.1 407 Proxy Auth Required"));
+    try testing.expect(!Transport.isConnectSuccessStatusLine("X-Header: 200 OK"));
+
+    var h = @import("header.zig").Header.init(testing.allocator);
+    defer h.deinit();
+    try h.add("Transfer-Encoding", "gzip, CHUNKED");
+    try h.add("Connection", "keep-alive, Close");
+    try testing.expect(Transport.headerHasToken(&h, "Transfer-Encoding", "chunked"));
+    try testing.expect(Transport.headerHasToken(&h, "Connection", "close"));
+    try testing.expect(!Transport.headerHasToken(&h, "Connection", "upgrade"));
+}

@@ -68,23 +68,20 @@ pub const Regexp = struct {
         const vm = exec_mod.VM.init(self.allocator, &self.prog);
 
         while (cursor <= src.len) {
-            if (try vm.find(src[cursor..])) |sub_res| {
-                const match_start = cursor + sub_res.start;
-                const match_end = cursor + sub_res.end;
-
-                _ = try buf.write(src[cursor..match_start]);
+            if (try vm.findAt(src, cursor)) |res| {
+                _ = try buf.write(src[cursor..res.start]);
                 _ = try buf.write(repl);
 
-                if (match_end == cursor) {
+                if (res.end == res.start) {
                     // Avoid zero-length match infinite loop
-                    if (cursor < src.len) {
-                        try buf.writeByte(src[cursor]);
-                        cursor += 1;
+                    if (res.end < src.len) {
+                        try buf.writeByte(src[res.end]);
+                        cursor = res.end + 1;
                     } else {
                         break;
                     }
                 } else {
-                    cursor = match_end;
+                    cursor = res.end;
                 }
             } else {
                 _ = try buf.write(src[cursor..]);
@@ -144,4 +141,17 @@ test "regexp anchors, optional quantifier, mustCompile" {
     var re_mc = Regexp.mustCompile(testing.allocator, "\\w+@\\w+");
     defer re_mc.deinit();
     try testing.expect(re_mc.matchString("user@domain"));
+
+    // Test replaceAllString preserves ^ anchor semantics
+    var re_start = try Regexp.compile(testing.allocator, "^a");
+    defer re_start.deinit();
+    const rep_anchor = try re_start.replaceAllString(testing.allocator, "aaa", "X");
+    defer testing.allocator.free(rep_anchor);
+    try testing.expectEqualStrings("Xaa", rep_anchor);
+
+    // Test quantifier on first atom (inst index 0) with unpatched sentinel
+    var re_star = try Regexp.compile(testing.allocator, "a*b");
+    defer re_star.deinit();
+    try testing.expectEqualStrings("aaab", re_star.findString("xxaaabyy").?);
+    try testing.expectEqualStrings("b", re_star.findString("b").?);
 }

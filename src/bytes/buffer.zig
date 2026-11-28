@@ -24,6 +24,14 @@ pub const Buffer = struct {
         return @intFromPtr(self.storage.ptr) == @intFromPtr(&self.bootstrap);
     }
 
+    fn commitWriter(self: *Buffer) void {
+        if (self.writer_inst.end > 0) {
+            self.length += self.writer_inst.end;
+            self.writer_inst.end = 0;
+            self.writer_inst.buffer = self.storage[self.length..];
+        }
+    }
+
     pub fn init(allocator: Allocator) Buffer {
         return .{
             .allocator = allocator,
@@ -109,6 +117,7 @@ pub const Buffer = struct {
 
     /// Truncate discards all but the first n unread bytes.
     pub fn truncate(self: *Buffer, n: usize) void {
+        self.commitWriter();
         if (n == 0) {
             self.reset();
             return;
@@ -123,6 +132,7 @@ pub const Buffer = struct {
     /// Grow grows the buffer's capacity, if necessary, to guarantee space for
     /// another n bytes.
     pub fn grow(self: *Buffer, n: usize) Allocator.Error!void {
+        self.commitWriter();
         const m = self.len();
         // If buffer is empty, reset to recover space.
         if (m == 0 and self.off != 0) {
@@ -138,8 +148,8 @@ pub const Buffer = struct {
             return;
         }
 
-        const total = self.length + self.writer_inst.end;
-        const needed = total + n;
+        const total = self.length;
+        const needed = std.math.add(usize, total, n) catch return error.OutOfMemory;
         if (needed <= self.storage.len) return;
 
         if (self.storage.len == 0 or self.isBootstrap()) {
@@ -166,10 +176,7 @@ pub const Buffer = struct {
 
     pub fn write(self: *Buffer, p: []const u8) Allocator.Error!usize {
         self.last_read_byte = false;
-        if (self.writer_inst.end > 0) {
-            self.length += self.writer_inst.end;
-            self.writer_inst.end = 0;
-        }
+        self.commitWriter();
         try self.grow(p.len);
         @memcpy(self.storage[self.length .. self.length + p.len], p);
         self.length += p.len;
@@ -187,6 +194,7 @@ pub const Buffer = struct {
     }
 
     pub fn read(self: *Buffer, p: []u8) io.Error!usize {
+        self.commitWriter();
         self.last_read_byte = false;
         if (self.off >= self.length) {
             self.reset();
@@ -201,6 +209,7 @@ pub const Buffer = struct {
     }
 
     pub fn readByte(self: *Buffer) io.Error!u8 {
+        self.commitWriter();
         if (self.off >= self.length) {
             self.reset();
             return io.Error.EndOfStream;
@@ -224,6 +233,7 @@ pub const Buffer = struct {
     }
 
     pub fn writer(self: *Buffer) *std.Io.Writer {
+        self.commitWriter();
         if (self.storage.len == 0) {
             self.storage = &self.bootstrap;
         }
@@ -243,6 +253,7 @@ pub const Buffer = struct {
 
     /// writeTo writes data to w until the buffer is drained.
     pub fn writeTo(self: *Buffer, w: *std.Io.Writer) anyerror!u64 {
+        self.commitWriter();
         const remaining = self.length - self.off;
         if (remaining == 0) return 0;
         try w.writeAll(self.storage[self.off..self.length]);
@@ -287,11 +298,10 @@ pub const Buffer = struct {
     fn rebaseImpl(w: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
         const self: *Buffer = @alignCast(@fieldParentPtr("writer_inst", w));
         const to_preserve = @min(preserve, w.end);
-        const committed = w.end - to_preserve;
-        self.length += committed;
-        w.end = to_preserve;
         self.grow(capacity + @max(preserve, to_preserve)) catch return error.WriteFailed;
+        self.length -= to_preserve;
         w.buffer = self.storage[self.length..];
+        w.end = to_preserve;
     }
 };
 
@@ -383,4 +393,40 @@ test "bytes.Buffer toOwnedSlice from bootstrap allocates owned slice" {
 
     try testing.expectEqualStrings("short bootstrap slice", owned);
     try testing.expectEqual(@as(usize, 0), b.len());
+}
+
+test "bytes.Buffer unflushed writer committed before read/truncate/grow/writeTo" {
+    const testing = std.testing;
+    var b = Buffer.init(testing.allocator);
+    defer b.deinit();
+
+    const w = b.writer();
+    try w.writeAll("hello world");
+    // Read without explicit flush
+    var tmp: [5]u8 = undefined;
+    const n = try b.read(&tmp);
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqualStrings("hello", &tmp);
+
+    // Write again via writer() without flush, then grow and readByte
+    const w2 = b.writer();
+    try w2.writeAll("!");
+    try b.grow(32);
+    try testing.expectEqualStrings(" world!", b.string());
+    try testing.expectEqual(@as(u8, ' '), try b.readByte());
+
+    // Truncate with unflushed writer bytes
+    const w3 = b.writer();
+    try w3.writeAll("extra");
+    b.truncate(6);
+    try testing.expectEqualStrings("world!", b.string());
+
+    // writeTo with unflushed writer bytes
+    const w4 = b.writer();
+    try w4.writeAll("!!");
+    var dst = Buffer.init(testing.allocator);
+    defer dst.deinit();
+    const written = try b.writeTo(dst.writer());
+    try testing.expectEqual(@as(u64, 8), written);
+    try testing.expectEqualStrings("world!!!", dst.string());
 }

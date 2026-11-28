@@ -50,6 +50,7 @@ pub const FlagSet = struct {
         self.actual_args.deinit(self.allocator);
     }
 
+    /// Defines a bool flag with specified name, default value, and usage string.
     pub fn boolVar(
         self: *FlagSet,
         ptr: *bool,
@@ -59,14 +60,17 @@ pub const FlagSet = struct {
     ) Allocator.Error!void {
         ptr.* = def_val;
         const def_str = if (def_val) "true" else "false";
+        const owned_def = try self.allocator.dupe(u8, def_str);
+        errdefer self.allocator.free(owned_def);
         try self.flags.append(self.allocator, .{
             .name = name,
             .usage = usage,
             .val = .{ .bool_val = ptr },
-            .def_val = try self.allocator.dupe(u8, def_str),
+            .def_val = owned_def,
         });
     }
 
+    /// Defines an int64 flag with specified name, default value, and usage string.
     pub fn intVar(
         self: *FlagSet,
         ptr: *i64,
@@ -77,14 +81,17 @@ pub const FlagSet = struct {
         ptr.* = def_val;
         var buf: [32]u8 = undefined;
         const def_str = std.fmt.bufPrint(&buf, "{d}", .{def_val}) catch "0";
+        const owned_def = try self.allocator.dupe(u8, def_str);
+        errdefer self.allocator.free(owned_def);
         try self.flags.append(self.allocator, .{
             .name = name,
             .usage = usage,
             .val = .{ .int_val = ptr },
-            .def_val = try self.allocator.dupe(u8, def_str),
+            .def_val = owned_def,
         });
     }
 
+    /// Defines a string flag with specified name, default value, and usage string.
     pub fn stringVar(
         self: *FlagSet,
         ptr: *[]const u8,
@@ -93,14 +100,17 @@ pub const FlagSet = struct {
         usage: []const u8,
     ) Allocator.Error!void {
         ptr.* = def_val;
+        const owned_def = try self.allocator.dupe(u8, def_val);
+        errdefer self.allocator.free(owned_def);
         try self.flags.append(self.allocator, .{
             .name = name,
             .usage = usage,
             .val = .{ .str_val = ptr },
-            .def_val = try self.allocator.dupe(u8, def_val),
+            .def_val = owned_def,
         });
     }
 
+    /// Defines a float64 flag with specified name, default value, and usage string.
     pub fn floatVar(
         self: *FlagSet,
         ptr: *f64,
@@ -111,15 +121,19 @@ pub const FlagSet = struct {
         ptr.* = def_val;
         var buf: [32]u8 = undefined;
         const def_str = std.fmt.bufPrint(&buf, "{d}", .{def_val}) catch "0.0";
+        const owned_def = try self.allocator.dupe(u8, def_str);
+        errdefer self.allocator.free(owned_def);
         try self.flags.append(self.allocator, .{
             .name = name,
             .usage = usage,
             .val = .{ .float_val = ptr },
-            .def_val = try self.allocator.dupe(u8, def_str),
+            .def_val = owned_def,
         });
     }
 
+    /// Parses flag definitions from the argument list.
     pub fn parse(self: *FlagSet, arguments: []const []const u8) anyerror!void {
+        self.actual_args.clearRetainingCapacity();
         self.parsed = true;
         var i: usize = 0;
         while (i < arguments.len) {
@@ -146,11 +160,6 @@ pub const FlagSet = struct {
                 flag_slice = flag_slice[1..];
             }
 
-            // Check for help flag
-            if (std.mem.eql(u8, flag_slice, "h") or std.mem.eql(u8, flag_slice, "help")) {
-                return Error.HelpRequested;
-            }
-
             // Check for -flag=value syntax
             var name = flag_slice;
             var inline_val: ?[]const u8 = null;
@@ -159,7 +168,12 @@ pub const FlagSet = struct {
                 inline_val = flag_slice[eq + 1 ..];
             }
 
-            const flag_ptr = self.lookup(name) orelse return Error.UnknownFlag;
+            const flag_ptr = self.lookup(name) orelse {
+                if (std.mem.eql(u8, name, "h") or std.mem.eql(u8, name, "help")) {
+                    return Error.HelpRequested;
+                }
+                return Error.UnknownFlag;
+            };
 
             switch (flag_ptr.val) {
                 .bool_val => |b_ptr| {
@@ -305,4 +319,24 @@ test "flag.FlagSet help request" {
 
     const argv = [_][]const u8{"--help"};
     try testing.expectError(Error.HelpRequested, fs.parse(&argv));
+}
+
+test "flag.FlagSet custom -h flag and repeated parse clears args" {
+    const testing = std.testing;
+
+    var fs = FlagSet.init(testing.allocator, "test");
+    defer fs.deinit();
+
+    var host: []const u8 = "default";
+    try fs.stringVar(&host, "h", "default", "custom host flag");
+
+    try fs.parse(&.{ "-h", "db.local", "pos1" });
+    try testing.expectEqualStrings("db.local", host);
+    try testing.expectEqual(@as(usize, 1), fs.nArg());
+    try testing.expectEqualStrings("pos1", fs.arg(0).?);
+
+    // Re-parsing must clear previous positional arguments.
+    try fs.parse(&.{"pos2"});
+    try testing.expectEqual(@as(usize, 1), fs.nArg());
+    try testing.expectEqualStrings("pos2", fs.arg(0).?);
 }

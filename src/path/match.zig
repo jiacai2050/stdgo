@@ -126,6 +126,7 @@ fn matchChunk(chunk_in: []const u8, s_in: []const u8) Error!MatchChunkResult {
             '[' => {
                 var r: u21 = 0;
                 if (!failed) {
+                    failed = (s[0] == '/');
                     const utf8_len = std.unicode.utf8ByteSequenceLength(s[0]) catch 1;
                     if (s.len >= utf8_len) {
                         r = std.unicode.utf8Decode(s[0..utf8_len]) catch s[0];
@@ -263,6 +264,9 @@ test "path.match Go official table tests" {
         .{ .pattern = "*[a-ζ]", .s = "A", .matched = false },
         .{ .pattern = "a?b", .s = "a/b", .matched = false },
         .{ .pattern = "a*b", .s = "a/b", .matched = false },
+        .{ .pattern = "a[/]b", .s = "a/b", .matched = false },
+        .{ .pattern = "a[^x]b", .s = "a/b", .matched = false },
+        .{ .pattern = "a[.-0]b", .s = "a/b", .matched = false },
         .{ .pattern = "[\\]a]", .s = "]", .matched = true },
         .{ .pattern = "[\\-]", .s = "-", .matched = true },
         .{ .pattern = "[x\\-]", .s = "x", .matched = true },

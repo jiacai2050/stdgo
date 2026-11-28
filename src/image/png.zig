@@ -52,9 +52,11 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !*RGBAImage {
         const chunk_type = bytes[pos .. pos + 4];
         pos += 4;
 
-        if (pos + length + 4 > bytes.len) return error.UnexpectedEof;
-        const chunk_data = bytes[pos .. pos + length];
-        pos += length;
+        const data_end = std.math.add(usize, pos, length) catch return error.UnexpectedEof;
+        const crc_end = std.math.add(usize, data_end, 4) catch return error.UnexpectedEof;
+        if (crc_end > bytes.len) return error.UnexpectedEof;
+        const chunk_data = bytes[pos..data_end];
+        pos = data_end;
         const chunk_crc = mem.readInt(u32, bytes[pos..][0..4], .big);
         pos += 4;
 
@@ -85,7 +87,9 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !*RGBAImage {
     }
 
     const hdr = header_opt orelse return error.NoIHDR;
-    if (hdr.width == 0 or hdr.height == 0) return error.InvalidDimensions;
+    if (hdr.width == 0 or hdr.height == 0 or hdr.width > 10000 or hdr.height > 10000) {
+        return error.InvalidDimensions;
+    }
     if (hdr.bit_depth != 8) return error.UnsupportedBitDepth;
 
     const bpp: usize = switch (hdr.color_type) {
@@ -95,37 +99,31 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !*RGBAImage {
         else => return error.UnsupportedColorType,
     };
 
-    // Decompress IDAT via zlib
-    var idat_reader = std.Io.Reader.fixed(idat_buf.items);
-    var z_reader = try zlib.newReader(allocator, &idat_reader);
-    defer z_reader.deinit();
-
-    var decomp_buf = std.ArrayList(u8).empty;
-    defer decomp_buf.deinit(allocator);
-
-    var chunk_buf: [1024]u8 = undefined;
-    while (true) {
-        var w = std.Io.Writer.fixed(&chunk_buf);
-        const n = z_reader.reader().stream(&w, .unlimited) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => |e| return e,
-        };
-        if (n == 0) break;
-        try decomp_buf.appendSlice(allocator, chunk_buf[0..n]);
-    }
-    const decompressed = decomp_buf.items;
-
-    if (hdr.width > 10000 or hdr.height > 10000) return error.InvalidDimensions;
     const stride = std.math.mul(usize, @as(usize, hdr.width), bpp) catch {
         return error.InvalidDimensions;
     };
-    const scanline_len = stride + 1;
+    const scanline_len = std.math.add(usize, stride, 1) catch return error.InvalidDimensions;
     const total_scanline_bytes = std.math.mul(
         usize,
         @as(usize, hdr.height),
         scanline_len,
     ) catch return error.InvalidDimensions;
-    if (decompressed.len < total_scanline_bytes) {
+
+    // Decompress IDAT via zlib up to expected total_scanline_bytes (guards against decompression bombs)
+    var idat_reader = std.Io.Reader.fixed(idat_buf.items);
+    var z_reader = try zlib.newReader(allocator, &idat_reader);
+    defer z_reader.deinit();
+
+    const decompressed = try allocator.alloc(u8, total_scanline_bytes);
+    defer allocator.free(decompressed);
+
+    var total_read: usize = 0;
+    while (total_read < total_scanline_bytes) {
+        const n = try z_reader.reader().readSliceShort(decompressed[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+    }
+    if (total_read < total_scanline_bytes) {
         return error.UnexpectedEof;
     }
 
@@ -219,8 +217,11 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !*RGBAImage {
 
 /// Encode writes the Image img to w in PNG format using 8-bit RGBA color and zlib compression.
 pub fn encode(allocator: Allocator, writer: *std.Io.Writer, img: *const RGBAImage) !void {
-    const width = @as(u32, @intCast(img.rect.dx()));
-    const height = @as(u32, @intCast(img.rect.dy()));
+    const dx = img.rect.dx();
+    const dy = img.rect.dy();
+    if (dx <= 0 or dy <= 0) return error.InvalidDimensions;
+    const width: u32 = @intCast(dx);
+    const height: u32 = @intCast(dy);
 
     // 1. Write PNG Signature
     try writer.writeAll(&png_magic);
@@ -250,7 +251,10 @@ pub fn encode(allocator: Allocator, writer: *std.Io.Writer, img: *const RGBAImag
 
         var x: u32 = 0;
         while (x < width) : (x += 1) {
-            const c = img.at(@intCast(x), @intCast(y));
+            const c = img.at(
+                img.rect.min.x + @as(i32, @intCast(x)),
+                img.rect.min.y + @as(i32, @intCast(y)),
+            );
             const px = row_offset + 1 + @as(usize, x) * 4;
             raw_data[px] = c.r;
             raw_data[px + 1] = c.g;
@@ -326,4 +330,39 @@ test "image/png encode and decode roundtrip" {
     try testing.expectEqual(color.RGBA{ .r = 0, .g = 0, .b = 255, .a = 255 }, decoded.at(2, 2));
     try testing.expectEqual(color.RGBA{ .r = 255, .g = 255, .b = 0, .a = 128 }, decoded.at(3, 3));
     try testing.expectEqual(color.RGBA{ .r = 0, .g = 0, .b = 0, .a = 0 }, decoded.at(0, 1));
+}
+
+test "image/png decode >1024B image and encode subImage with non-zero origin" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const bytes_mod = @import("../bytes.zig");
+
+    // 24x24 RGBA = 24 * (1 + 96) = 2328 bytes (> 1024B)
+    var big = try RGBAImage.init(allocator, Rectangle.rect(0, 0, 24, 24));
+    defer big.deinit();
+
+    const marker = color.RGBA{ .r = 12, .g = 34, .b = 56, .a = 255 };
+    big.set(20, 22, marker);
+    big.set(5, 6, color.RGBA{ .r = 200, .g = 100, .b = 50, .a = 255 });
+
+    var png_buf = bytes_mod.Buffer.init(allocator);
+    defer png_buf.deinit();
+    try encode(allocator, png_buf.writer(), big);
+
+    var dec_big = try decode(allocator, png_buf.bytes());
+    defer dec_big.deinit();
+    try testing.expectEqual(marker, dec_big.at(20, 22));
+
+    // Encode a subImage starting at (4, 5)
+    var sub = big.subImage(Rectangle.rect(4, 5, 8, 9));
+    var sub_buf = bytes_mod.Buffer.init(allocator);
+    defer sub_buf.deinit();
+    try encode(allocator, sub_buf.writer(), &sub);
+
+    var dec_sub = try decode(allocator, sub_buf.bytes());
+    defer dec_sub.deinit();
+    try testing.expectEqual(@as(i32, 4), dec_sub.rect.dx());
+    try testing.expectEqual(@as(i32, 4), dec_sub.rect.dy());
+    // Original (5, 6) maps to (1, 1) in decoded subImage
+    try testing.expectEqual(color.RGBA{ .r = 200, .g = 100, .b = 50, .a = 255 }, dec_sub.at(1, 1));
 }

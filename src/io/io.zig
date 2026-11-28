@@ -105,9 +105,19 @@ pub fn copyBuffer(dst: *Writer, src: *Reader, buf: ?[]u8) anyerror!u64 {
 /// copyN copies n bytes (or until an error) from src to dst.
 pub fn copyN(dst: *Writer, src: *Reader, n: i64) anyerror!u64 {
     if (n <= 0) return 0;
-    const count = try src.stream(dst, .limited(@intCast(n)));
-    if (count < @as(usize, @intCast(n))) return Error.UnexpectedEndOfStream;
-    return @intCast(count);
+    var remaining: u64 = @intCast(n);
+    var total: u64 = 0;
+    while (remaining > 0) {
+        const step: usize = @intCast(@min(remaining, std.math.maxInt(usize)));
+        const count = src.stream(dst, .limited(step)) catch |err| switch (err) {
+            error.EndOfStream => return Error.UnexpectedEndOfStream,
+            else => |e| return e,
+        };
+        if (count == 0) return Error.UnexpectedEndOfStream;
+        total += count;
+        remaining -= count;
+    }
+    return total;
 }
 
 /// LimitReader returns a Reader that reads from r but stops with EndOfStream after n bytes.
@@ -211,4 +221,23 @@ test "io.copy and readFull via native std.Io" {
     const copied = try copy(&dst_alloc.writer, &src);
     try testing.expectEqual(@as(u64, data.len), copied);
     try testing.expectEqualStrings(data, dst_alloc.writer.buffer[0..dst_alloc.writer.end]);
+}
+
+test "io.copyN loops across short streaming chunks" {
+    const testing = std.testing;
+    const iotest = @import("../testing/iotest.zig");
+
+    const data = "0123456789abcdef";
+    var src = std.Io.Reader.fixed(data);
+    var one_byte = iotest.OneByteReader.init(&src);
+
+    var out_buf: [32]u8 = undefined;
+    var dst = std.Io.Writer.fixed(&out_buf);
+
+    const n = try copyN(&dst, one_byte.reader(), 10);
+    try testing.expectEqual(@as(u64, 10), n);
+    try testing.expectEqualStrings("0123456789", dst.buffered());
+
+    // Requesting more than remaining returns UnexpectedEndOfStream.
+    try testing.expectError(Error.UnexpectedEndOfStream, copyN(&dst, one_byte.reader(), 20));
 }

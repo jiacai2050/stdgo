@@ -198,19 +198,34 @@ pub const Values = struct {
         return null;
     }
 
+    /// Adds a key-value pair to the URL values, appending to any existing values for `key`.
     pub fn add(self: *Values, key: []const u8, value: []const u8) Allocator.Error!void {
         for (self.entries.items) |*entry| {
             if (std.mem.eql(u8, entry.key, key)) {
-                try entry.values.append(self.allocator, try self.allocator.dupe(u8, value));
+                const val_copy = try self.allocator.dupe(u8, value);
+                errdefer self.allocator.free(val_copy);
+                try entry.values.append(self.allocator, val_copy);
                 return;
             }
         }
-        var new_entry = Entry{
-            .key = try self.allocator.dupe(u8, key),
-            .values = std.ArrayList([]const u8).empty,
-        };
-        try new_entry.values.append(self.allocator, try self.allocator.dupe(u8, value));
-        try self.entries.append(self.allocator, new_entry);
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        var vals = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (vals.items) |v| self.allocator.free(v);
+            vals.deinit(self.allocator);
+        }
+        const val_copy = try self.allocator.dupe(u8, value);
+        {
+            var appended = false;
+            errdefer if (!appended) self.allocator.free(val_copy);
+            try vals.append(self.allocator, val_copy);
+            appended = true;
+        }
+        try self.entries.append(self.allocator, .{
+            .key = key_copy,
+            .values = vals,
+        });
     }
 
     /// Encode encodes the values into URL encoded form ("bar=baz&foo=quux").

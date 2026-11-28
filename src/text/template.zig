@@ -301,7 +301,7 @@ pub fn toValue(allocator: Allocator, data: anytype) Allocator.Error!Value {
         },
         .array => |arr_info| {
             if (arr_info.child == u8) {
-                return Value{ .string = data[0..] };
+                return Value{ .string = try allocator.dupe(u8, &data) };
             }
             var list = std.ArrayList(Value).empty;
             for (data) |item| {
@@ -473,11 +473,15 @@ pub const Template = struct {
         return null;
     }
 
-    /// Parse parses text as a template body.
+    /// Maximum nesting/recursion depth allowed during template execution.
+    pub const max_exec_depth: usize = 256;
+
+    /// Parse parses text as a template body, copying text into the template arena.
     pub fn parse(self: *Template, text: []const u8) !*Template {
+        const owned_text = try self.arena.allocator().dupe(u8, text);
         var parser = Parser{
             .allocator = self.arena.allocator(),
-            .input = text,
+            .input = owned_text,
             .pos = 0,
             .template = self,
         };
@@ -497,7 +501,7 @@ pub const Template = struct {
 
         const root_val = try toValue(eval_alloc, data);
         var root_scope = Scope.init(eval_alloc, null);
-        try self.executeNodes(eval_alloc, w, self.root_nodes, root_val, &root_scope);
+        try self.executeNodes(eval_alloc, w, self.root_nodes, root_val, &root_scope, 0);
     }
 
     /// ExecuteTemplate applies the template associated with t that has the given name
@@ -511,7 +515,7 @@ pub const Template = struct {
 
         const root_val = try toValue(eval_alloc, data);
         var root_scope = Scope.init(eval_alloc, null);
-        try self.executeNodes(eval_alloc, w, sub_nodes, root_val, &root_scope);
+        try self.executeNodes(eval_alloc, w, sub_nodes, root_val, &root_scope, 0);
     }
 
     fn executeNodes(
@@ -521,7 +525,9 @@ pub const Template = struct {
         nodes: []const Node,
         ctx: Value,
         scope: *Scope,
+        depth: usize,
     ) anyerror!void {
+        if (depth > max_exec_depth) return error.MaxExecDepthExceeded;
         for (nodes) |node| {
             switch (node) {
                 .text => |t| try w.writeAll(t),
@@ -553,10 +559,11 @@ pub const Template = struct {
                             if_node.then_branch,
                             ctx,
                             &child_scope,
+                            depth + 1,
                         );
                     } else if (if_node.else_branch) |else_branch| {
                         var child_scope = Scope.init(eval_alloc, scope);
-                        try self.executeNodes(eval_alloc, w, else_branch, ctx, &child_scope);
+                        try self.executeNodes(eval_alloc, w, else_branch, ctx, &child_scope, depth + 1);
                     }
                 },
                 .with => |with_node| {
@@ -575,10 +582,11 @@ pub const Template = struct {
                             with_node.body_branch,
                             val,
                             &child_scope,
+                            depth + 1,
                         );
                     } else if (with_node.else_branch) |eb| {
                         var child_scope = Scope.init(eval_alloc, scope);
-                        try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope);
+                        try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope, depth + 1);
                     }
                 },
                 .range => |range_node| {
@@ -594,7 +602,7 @@ pub const Template = struct {
                             if (items.len == 0) {
                                 if (range_node.else_branch) |eb| {
                                     var child_scope = Scope.init(eval_alloc, scope);
-                                    try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope);
+                                    try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope, depth + 1);
                                 }
                             } else {
                                 for (items, 0..) |item, idx| {
@@ -612,6 +620,7 @@ pub const Template = struct {
                                         range_node.body_branch,
                                         item,
                                         &loop_scope,
+                                        depth + 1,
                                     );
                                 }
                             }
@@ -619,7 +628,7 @@ pub const Template = struct {
                         else => {
                             if (range_node.else_branch) |eb| {
                                 var child_scope = Scope.init(eval_alloc, scope);
-                                try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope);
+                                try self.executeNodes(eval_alloc, w, eb, ctx, &child_scope, depth + 1);
                             }
                         },
                     }
@@ -632,7 +641,7 @@ pub const Template = struct {
 
                     const sub_nodes = self.lookup(call.name) orelse return error.TemplateNotFound;
                     var child_scope = Scope.init(eval_alloc, scope);
-                    try self.executeNodes(eval_alloc, w, sub_nodes, sub_ctx, &child_scope);
+                    try self.executeNodes(eval_alloc, w, sub_nodes, sub_ctx, &child_scope, depth + 1);
                 },
             }
         }
@@ -1051,7 +1060,16 @@ pub const Template = struct {
                                     var num_buf: [32]u8 = undefined;
                                     const val_i64: i64 = switch (arg) {
                                         .int => |v| v,
-                                        .float => |v| @intFromFloat(v),
+                                        .float => |v| blk: {
+                                            const min_f: f64 = @floatFromInt(std.math.minInt(i64));
+                                            if (!std.math.isFinite(v) or
+                                                v < min_f or
+                                                v >= 9223372036854775808.0)
+                                            {
+                                                break :blk 0;
+                                            }
+                                            break :blk @intFromFloat(v);
+                                        },
                                         else => 0,
                                     };
                                     const s = std.fmt.bufPrint(
@@ -1153,18 +1171,18 @@ pub const Template = struct {
                 return Value{ .list = sub_slice };
             }
 
+            fn toFloat(v: Value) f64 {
+                return switch (v) {
+                    .float => |f| f,
+                    .int => |i| @floatFromInt(i),
+                    else => 0.0,
+                };
+            }
+
             fn add(_: Allocator, args: []const Value) anyerror!Value {
                 if (args.len < 2) return Value{ .int = 0 };
                 if (args[0] == .float or args[1] == .float) {
-                    const a: f64 = if (args[0] == .float)
-                        args[0].float
-                    else
-                        @floatFromInt(args[0].int);
-                    const b: f64 = if (args[1] == .float)
-                        args[1].float
-                    else
-                        @floatFromInt(args[1].int);
-                    return Value{ .float = a + b };
+                    return Value{ .float = toFloat(args[0]) + toFloat(args[1]) };
                 }
                 const a: i64 = if (args[0] == .int) args[0].int else 0;
                 const b: i64 = if (args[1] == .int) args[1].int else 0;
@@ -1174,15 +1192,7 @@ pub const Template = struct {
             fn sub(_: Allocator, args: []const Value) anyerror!Value {
                 if (args.len < 2) return Value{ .int = 0 };
                 if (args[0] == .float or args[1] == .float) {
-                    const a: f64 = if (args[0] == .float)
-                        args[0].float
-                    else
-                        @floatFromInt(args[0].int);
-                    const b: f64 = if (args[1] == .float)
-                        args[1].float
-                    else
-                        @floatFromInt(args[1].int);
-                    return Value{ .float = a - b };
+                    return Value{ .float = toFloat(args[0]) - toFloat(args[1]) };
                 }
                 const a: i64 = if (args[0] == .int) args[0].int else 0;
                 const b: i64 = if (args[1] == .int) args[1].int else 0;
@@ -1192,15 +1202,7 @@ pub const Template = struct {
             fn mul(_: Allocator, args: []const Value) anyerror!Value {
                 if (args.len < 2) return Value{ .int = 0 };
                 if (args[0] == .float or args[1] == .float) {
-                    const a: f64 = if (args[0] == .float)
-                        args[0].float
-                    else
-                        @floatFromInt(args[0].int);
-                    const b: f64 = if (args[1] == .float)
-                        args[1].float
-                    else
-                        @floatFromInt(args[1].int);
-                    return Value{ .float = a * b };
+                    return Value{ .float = toFloat(args[0]) * toFloat(args[1]) };
                 }
                 const a: i64 = if (args[0] == .int) args[0].int else 0;
                 const b: i64 = if (args[1] == .int) args[1].int else 0;
@@ -1357,11 +1359,13 @@ const Parser = struct {
                 return error.UnclosedTemplateTag;
             };
 
-            const has_right_trim = (close_tag > ot + 2 and self.input[close_tag - 1] == '-');
-
             const tag_start = if (has_left_trim) ot + 3 else ot + 2;
+            const has_right_trim = (close_tag > tag_start and self.input[close_tag - 1] == '-');
             const tag_end = if (has_right_trim) close_tag - 1 else close_tag;
-            const inner = std.mem.trim(u8, self.input[tag_start..tag_end], " \t\r\n");
+            const inner = if (tag_start <= tag_end)
+                std.mem.trim(u8, self.input[tag_start..tag_end], " \t\r\n")
+            else
+                "";
             self.pos = close_tag + 2;
             if (has_right_trim) {
                 while (self.pos < self.input.len and
@@ -1605,12 +1609,37 @@ const Parser = struct {
 
     fn splitPipeline(self: *Parser, expr: []const u8) ![]const []const u8 {
         var list = std.ArrayList([]const u8).empty;
-        var it = std.mem.splitScalar(u8, expr, '|');
-        while (it.next()) |part| {
-            const trimmed = std.mem.trim(u8, part, " \t\r\n");
-            if (trimmed.len > 0) {
-                try list.append(self.allocator, trimmed);
+        var in_quote = false;
+        var paren_depth: usize = 0;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < expr.len) : (i += 1) {
+            const c = expr[i];
+            if (in_quote) {
+                if (c == '\\' and i + 1 < expr.len) {
+                    i += 1;
+                } else if (c == '"') {
+                    in_quote = false;
+                }
+            } else {
+                if (c == '"') {
+                    in_quote = true;
+                } else if (c == '(') {
+                    paren_depth += 1;
+                } else if (c == ')') {
+                    if (paren_depth > 0) paren_depth -= 1;
+                } else if (c == '|' and paren_depth == 0) {
+                    const trimmed = std.mem.trim(u8, expr[start..i], " \t\r\n");
+                    if (trimmed.len > 0) {
+                        try list.append(self.allocator, trimmed);
+                    }
+                    start = i + 1;
+                }
             }
+        }
+        const tail = std.mem.trim(u8, expr[start..], " \t\r\n");
+        if (tail.len > 0) {
+            try list.append(self.allocator, tail);
         }
         return list.toOwnedSlice(self.allocator);
     }
@@ -2231,4 +2260,83 @@ test "text.template: recursive template calls for tree structures" {
 
     try tmpl.execute(buf.writer(), data);
     try testing.expectEqualStrings("Tree: (root: [(child_a: [(leaf_1)])(child_b)])", buf.string());
+}
+
+test "text.template: edge cases (by-value array, {{-}}, non-numeric arithmetic, NaN %d, recursion limit, owned source, quoted pipe)" {
+    const testing = std.testing;
+    const bytes = @import("../bytes.zig");
+
+    // 1. By-value [N]u8 array in toValue
+    {
+        var tmpl = try Template.new(testing.allocator, "arr");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("{{ .Tag }}");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        const tag: [4]u8 = .{ 'z', 'i', 'g', '!' };
+        try tmpl.execute(buf.writer(), .{ .Tag = tag });
+        try testing.expectEqualStrings("zig!", buf.string());
+    }
+
+    // 2. {{-}} does not panic
+    {
+        var tmpl = try Template.new(testing.allocator, "trim_empty");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("a {{-}} b");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{});
+        try testing.expectEqualStrings("a b", buf.string());
+    }
+
+    // 3. add/sub/mul with float + non-numeric arg and printf %d with NaN/Inf
+    {
+        var tmpl = try Template.new(testing.allocator, "arith_nan");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("{{ add .F .S }}|{{ sub .F .S }}|{{ mul .F .S }}|{{ printf \"%d,%d\" .Nan .Inf }}");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{
+            .F = @as(f64, 2.5),
+            .S = "not_a_num",
+            .Nan = std.math.nan(f64),
+            .Inf = std.math.inf(f64),
+        });
+        try testing.expectEqualStrings("2.5|2.5|0|0,0", buf.string());
+    }
+
+    // 4. Infinite recursion hits MaxExecDepthExceeded
+    {
+        var tmpl = try Template.new(testing.allocator, "inf_rec");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("{{- define \"loop\" -}}{{ template \"loop\" . }}{{- end -}}{{ template \"loop\" . }}");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try testing.expectError(error.MaxExecDepthExceeded, tmpl.execute(buf.writer(), .{}));
+    }
+
+    // 5. Template.parse dupes input source so caller can free it
+    {
+        var tmpl = try Template.new(testing.allocator, "owned_src");
+        defer tmpl.deinit();
+        const dyn_src = try testing.allocator.dupe(u8, "Hi {{ .Name }}");
+        _ = try tmpl.parse(dyn_src);
+        testing.allocator.free(dyn_src);
+
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{ .Name = "Zig" });
+        try testing.expectEqualStrings("Hi Zig", buf.string());
+    }
+
+    // 6. splitPipeline ignores '|' inside quoted strings
+    {
+        var tmpl = try Template.new(testing.allocator, "quoted_pipe");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("{{ printf \"a|b:%s\" .X | upper }}");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{ .X = "ok" });
+        try testing.expectEqualStrings("A|B:OK", buf.string());
+    }
 }

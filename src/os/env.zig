@@ -32,11 +32,11 @@ pub fn environ(allocator: Allocator, env: *const EnvironMap) Allocator.Error![]c
 
     var it = env.iterator();
     while (it.next()) |entry| {
-        const line = try std.fmt.allocPrint(
-            allocator,
+        const line = try allocator.print(
             "{s}={s}",
             .{ entry.key_ptr.*, entry.value_ptr.* },
         );
+        errdefer allocator.free(line);
         try list.append(allocator, line);
     }
 

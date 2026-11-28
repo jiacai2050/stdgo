@@ -104,10 +104,7 @@ pub fn tempDir(env: ?*const EnvironMap) []const u8 {
 test "os.proc: getpid, getppid, hostname, tempDir, getwd" {
     const testing = std.testing;
     const allocator = testing.allocator;
-
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = testing.io;
 
     // 1. PID and PPID
     const pid = getpid();

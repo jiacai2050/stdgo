@@ -56,6 +56,7 @@ pub const UDPConn = struct {
     local_addr_buf: [64]u8 = undefined,
     local_addr_len: usize = 0,
 
+    /// Initializes a `UDPConn` wrapping `socket` and formats its bound local address.
     pub fn init(
         allocator: Allocator,
         io: std.Io,
@@ -70,14 +71,7 @@ pub const UDPConn = struct {
             .connected_dest = connected_dest,
         };
 
-        const p = switch (socket.address) {
-            .ip4 => |v4| v4.port,
-            .ip6 => |v6| v6.port,
-        };
-        const formatted = switch (socket.address) {
-            .ip4 => std.fmt.bufPrint(&uc.local_addr_buf, "127.0.0.1:{d}", .{p}) catch "",
-            .ip6 => std.fmt.bufPrint(&uc.local_addr_buf, "[::1]:{d}", .{p}) catch "",
-        };
+        const formatted = std.fmt.bufPrint(&uc.local_addr_buf, "{f}", .{socket.address}) catch "";
         uc.local_addr_len = formatted.len;
 
         return uc;
@@ -97,8 +91,12 @@ pub const UDPConn = struct {
         };
     }
 
+    /// Returns the local UDP port bound by this socket (IPv4 or IPv6).
     pub fn port(self: *const UDPConn) u16 {
-        return self.socket.address.ip4.port;
+        return switch (self.socket.address) {
+            .ip4 => |v4| v4.port,
+            .ip6 => |v6| v6.port,
+        };
     }
 
     pub fn readFrom(self: *UDPConn, buf: []u8) anyerror!PacketConn.ReadFromResult {
@@ -278,9 +276,21 @@ pub const UDPConn = struct {
         return self.write(bytes);
     }
 
+    fn cReadDeadline(ctx: *anyopaque, buf: []u8, deadline: Deadline) anyerror!usize {
+        const self: *UDPConn = @ptrCast(@alignCast(ctx));
+        return self.readDeadline(buf, deadline);
+    }
+
+    fn cWriteDeadline(ctx: *anyopaque, bytes: []const u8, deadline: Deadline) anyerror!usize {
+        const self: *UDPConn = @ptrCast(@alignCast(ctx));
+        return self.writeDeadline(bytes, deadline);
+    }
+
     const udp_conn_vtable: Conn.VTable = .{
         .read = cRead,
         .write = cWrite,
+        .readDeadline = cReadDeadline,
+        .writeDeadline = cWriteDeadline,
         .close = pcClose,
         .localAddr = pcLocalAddr,
     };
@@ -299,11 +309,14 @@ pub fn listenUDP(
 
     const hp = try hostport.splitHostPort(laddr);
     const port = std.fmt.parseInt(u16, hp.port, 10) catch return error.InvalidPort;
-    const is_wildcard = hp.host.len == 0 or std.mem.eql(u8, hp.host, "0.0.0.0");
-    const bind_host = if (is_wildcard) "0.0.0.0" else hp.host;
+    const bind_host = if (hp.host.len == 0)
+        (if (std.mem.eql(u8, network, "udp6")) "::" else "0.0.0.0")
+    else
+        hp.host;
 
     const bind_ip = try std.Io.net.IpAddress.parse(bind_host, port);
     const sock = try bind_ip.bind(io, .{ .mode = .dgram });
+    errdefer sock.close(io);
 
     return UDPConn.init(allocator, io, sock, null);
 }
@@ -320,13 +333,17 @@ pub fn dialUDP(
         return error.UnknownNetwork;
     }
 
-    const bind_addr_str = laddr orelse "0.0.0.0:0";
-    const local_uc = try listenUDP(allocator, io, network, bind_addr_str);
-    errdefer local_uc.close();
-
     const rhp = try hostport.splitHostPort(raddr);
     const rport = std.fmt.parseInt(u16, rhp.port, 10) catch return error.InvalidPort;
     const dest_ip = try std.Io.net.IpAddress.parse(rhp.host, rport);
+
+    const default_laddr = switch (dest_ip) {
+        .ip4 => "0.0.0.0:0",
+        .ip6 => "[::]:0",
+    };
+    const bind_addr_str = laddr orelse default_laddr;
+    const local_uc = try listenUDP(allocator, io, network, bind_addr_str);
+    errdefer local_uc.close();
 
     local_uc.connected_dest = dest_ip;
     return local_uc;

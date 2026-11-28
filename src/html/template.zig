@@ -82,6 +82,7 @@ pub const ContextState = enum {
     url_attr_unquoted,
     url_attr_single_quoted,
     url_attr_double_quoted,
+    js_attr_unquoted,
     js_attr_single_quoted,
     js_attr_double_quoted,
     script_data,
@@ -194,6 +195,8 @@ pub const Escaper = struct {
                             } else {
                                 self.state = if (self.is_url_attr)
                                     .url_attr_unquoted
+                                else if (self.is_js_attr)
+                                    .js_attr_unquoted
                                 else
                                     .attr_value_unquoted;
                                 i = j - 1;
@@ -201,6 +204,8 @@ pub const Escaper = struct {
                         } else {
                             self.state = if (self.is_url_attr)
                                 .url_attr_unquoted
+                            else if (self.is_js_attr)
+                                .js_attr_unquoted
                             else
                                 .attr_value_unquoted;
                         }
@@ -244,7 +249,7 @@ pub const Escaper = struct {
                         self.resetAttr();
                     }
                 },
-                .attr_value_unquoted, .url_attr_unquoted => {
+                .attr_value_unquoted, .url_attr_unquoted, .js_attr_unquoted => {
                     if (std.ascii.isWhitespace(c) or c == '>') {
                         self.state = if (c == '>') .text else .tag;
                         self.resetAttr();
@@ -377,6 +382,8 @@ pub const Filters = struct {
         return Value{ .string = try out.toOwnedSlice(allocator) };
     }
 
+    /// Escapes a URL value for HTML attributes, enforcing a safe protocol allowlist
+    /// (`http:`, `https:`, `mailto:`, or relative paths without `:`) and HTML-escaping `&`.
     pub fn urlEscaper(allocator: Allocator, args: []const Value) anyerror!Value {
         if (args.len == 0) return Value{ .string = "" };
         const arg = args[0];
@@ -386,21 +393,29 @@ pub const Filters = struct {
         const s = try valueToString(allocator, arg);
         const trimmed = std.mem.trim(u8, s, " \t\r\n");
 
-        // Inspect protocol scheme: intercept dangerous javascript/vbscript/data injection
-        if (std.ascii.startsWithIgnoreCase(trimmed, "javascript:") or
-            std.ascii.startsWithIgnoreCase(trimmed, "vbscript:") or
-            std.ascii.startsWithIgnoreCase(trimmed, "data:"))
-        {
-            // Go standard library replaces unsafe schemes with "#ZgotmplZ"
-            return Value{ .string = "#ZgotmplZ" };
+        // Enforce safe protocol allowlist: if a ':' appears before any '/', '?', or '#',
+        // the scheme must be explicitly http, https, or mailto.
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon_idx| {
+            const before_colon = trimmed[0..colon_idx];
+            const has_path_delim = std.mem.indexOfAny(u8, before_colon, "/?#") != null;
+            if (!has_path_delim) {
+                const is_safe_scheme = std.ascii.eqlIgnoreCase(before_colon, "http") or
+                    std.ascii.eqlIgnoreCase(before_colon, "https") or
+                    std.ascii.eqlIgnoreCase(before_colon, "mailto");
+                if (!is_safe_scheme) {
+                    return Value{ .string = "#ZgotmplZ" };
+                }
+            }
         }
 
-        // Percent-encode any dangerous characters
+        // Percent-encode dangerous characters and HTML-escape '&' to block entity-encoded schemes
         var out = std.ArrayList(u8).empty;
         for (s) |c| {
-            if (std.ascii.isAlphanumeric(c) or
+            if (c == '&') {
+                try out.appendSlice(allocator, "&amp;");
+            } else if (std.ascii.isAlphanumeric(c) or
                 c == '-' or c == '_' or c == '.' or c == '~' or
-                c == '/' or c == '?' or c == '#' or c == '&' or
+                c == '/' or c == '?' or c == '#' or
                 c == '=' or c == ':' or c == '+' or c == '@')
             {
                 try out.append(allocator, c);
@@ -455,6 +470,46 @@ pub const Filters = struct {
         return Value{ .string = try out.toOwnedSlice(allocator) };
     }
 
+    /// Escapes a value for JavaScript inside HTML event handler attributes (`on*`),
+    /// using HTML-safe quote delimiters (`&#34;`) and hex-escaping quotes, whitespace,
+    /// and HTML-significant characters.
+    pub fn jsAttrEscaper(allocator: Allocator, args: []const Value) anyerror!Value {
+        if (args.len == 0) return Value{ .string = "&#34;&#34;" };
+        const arg = args[0];
+        if (arg == .safe_string and arg.safe_string.kind == .js) {
+            return Value{ .string = arg.safe_string.data };
+        }
+        switch (arg) {
+            .int, .float, .bool => return arg,
+            .null => return Value{ .string = "null" },
+            else => {},
+        }
+        const s = try valueToString(allocator, arg);
+        var out = std.ArrayList(u8).empty;
+        try out.appendSlice(allocator, "&#34;");
+        for (s) |c| {
+            switch (c) {
+                '\\' => try out.appendSlice(allocator, "\\\\"),
+                '"' => try out.appendSlice(allocator, "\\x22"),
+                '\'' => try out.appendSlice(allocator, "\\x27"),
+                '`' => try out.appendSlice(allocator, "\\x60"),
+                ' ' => try out.appendSlice(allocator, "\\x20"),
+                '=' => try out.appendSlice(allocator, "\\x3d"),
+                '\n' => try out.appendSlice(allocator, "\\n"),
+                '\r' => try out.appendSlice(allocator, "\\r"),
+                '\t' => try out.appendSlice(allocator, "\\t"),
+                '<' => try out.appendSlice(allocator, "\\x3c"),
+                '>' => try out.appendSlice(allocator, "\\x3e"),
+                '&' => try out.appendSlice(allocator, "\\x26"),
+                else => try out.append(allocator, c),
+            }
+        }
+        try out.appendSlice(allocator, "&#34;");
+        return Value{ .string = try out.toOwnedSlice(allocator) };
+    }
+
+    /// Escapes CSS content and blocks dangerous constructs (`url(`, `@import`, `expression(`,
+    /// `javascript:`) as well as characters that could break out of `<style>` contexts.
     pub fn cssEscaper(allocator: Allocator, args: []const Value) anyerror!Value {
         if (args.len == 0) return Value{ .string = "" };
         const arg = args[0];
@@ -462,28 +517,68 @@ pub const Filters = struct {
             return Value{ .string = arg.safe_string.data };
         }
         const s = try valueToString(allocator, arg);
-        // Intercept javascript url or expression calls
         if (indexOfIgnoreCase(s, "javascript:") != null or
-            indexOfIgnoreCase(s, "expression(") != null)
+            indexOfIgnoreCase(s, "expression(") != null or
+            indexOfIgnoreCase(s, "url(") != null or
+            indexOfIgnoreCase(s, "@import") != null)
         {
             return Value{ .string = "/*ZgotmplZ*/" };
         }
-        return Value{ .string = s };
+        var needed = false;
+        for (s) |c| {
+            if (c == '<' or c == '>' or c == '/' or c == '\\' or c == '"' or c == '\'') {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) return Value{ .string = s };
+
+        var out = std.ArrayList(u8).empty;
+        for (s) |c| {
+            switch (c) {
+                '<' => try out.appendSlice(allocator, "\\3c "),
+                '>' => try out.appendSlice(allocator, "\\3e "),
+                '/' => try out.appendSlice(allocator, "\\2f "),
+                '\\' => try out.appendSlice(allocator, "\\5c "),
+                '"' => try out.appendSlice(allocator, "\\22 "),
+                '\'' => try out.appendSlice(allocator, "\\27 "),
+                else => try out.append(allocator, c),
+            }
+        }
+        return Value{ .string = try out.toOwnedSlice(allocator) };
     }
 
+    /// Neutralizes `--`, trailing `-`, `>`, and `!` inside HTML comments so comment
+    /// delimiters (`-->`, `--->`, `--!>`) cannot be injected.
     pub fn commentEscaper(allocator: Allocator, args: []const Value) anyerror!Value {
         if (args.len == 0) return Value{ .string = "" };
         const arg = args[0];
         const s = try valueToString(allocator, arg);
-        if (std.mem.indexOf(u8, s, "--") == null) return Value{ .string = s };
+        var needed = false;
+        for (s, 0..) |c, i| {
+            if (c == '>' or c == '!' or
+                (c == '-' and (i + 1 == s.len or s[i + 1] == '-')))
+            {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) return Value{ .string = s };
+
         var out = std.ArrayList(u8).empty;
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) {
-            if (i + 1 < s.len and s[i] == '-' and s[i + 1] == '-') {
-                try out.appendSlice(allocator, "- -");
-                i += 1;
+        for (s, 0..) |c, i| {
+            if (c == '>') {
+                try out.appendSlice(allocator, "&gt;");
+            } else if (c == '!') {
+                try out.appendSlice(allocator, "&#33;");
+            } else if (c == '-' and
+                ((i + 1 < s.len and s[i + 1] == '-') or
+                    (i > 0 and s[i - 1] == '-') or
+                    i + 1 == s.len))
+            {
+                try out.appendSlice(allocator, "&#45;");
             } else {
-                try out.append(allocator, s[i]);
+                try out.append(allocator, c);
             }
         }
         return Value{ .string = try out.toOwnedSlice(allocator) };
@@ -506,8 +601,9 @@ fn valueToString(allocator: Allocator, val: Value) anyerror![]const u8 {
         else => {
             const bytes = @import("../bytes.zig");
             var buf = bytes.Buffer.init(allocator);
+            defer buf.deinit();
             try val.format(buf.writer());
-            return buf.string();
+            return try buf.toOwnedSlice();
         },
     };
 }
@@ -542,10 +638,11 @@ pub fn escapeNodes(
                     .url_attr_single_quoted,
                     .url_attr_double_quoted,
                     => "_url_esc",
-                    .script_data,
+                    .script_data => "_js_esc",
+                    .js_attr_unquoted,
                     .js_attr_single_quoted,
                     .js_attr_double_quoted,
-                    => "_js_esc",
+                    => "_js_attr_esc",
                     .style_data => "_css_esc",
                     .comment => "_comment_esc",
                 };
@@ -558,10 +655,12 @@ pub fn escapeNodes(
                 try out.append(allocator, .{ .action = new_pipe });
             },
             .@"if" => |if_node| {
+                const saved = escaper.*;
                 const escaped_then = try escapeNodes(allocator, if_node.then_branch, escaper);
                 var escaped_else: ?[]const Node = null;
                 if (if_node.else_branch) |eb| {
-                    escaped_else = try escapeNodes(allocator, eb, escaper);
+                    var else_escaper = saved;
+                    escaped_else = try escapeNodes(allocator, eb, &else_escaper);
                 }
                 try out.append(allocator, .{
                     .@"if" = .{
@@ -572,10 +671,12 @@ pub fn escapeNodes(
                 });
             },
             .with => |with_node| {
+                const saved = escaper.*;
                 const escaped_body = try escapeNodes(allocator, with_node.body_branch, escaper);
                 var escaped_else: ?[]const Node = null;
                 if (with_node.else_branch) |eb| {
-                    escaped_else = try escapeNodes(allocator, eb, escaper);
+                    var else_escaper = saved;
+                    escaped_else = try escapeNodes(allocator, eb, &else_escaper);
                 }
                 try out.append(allocator, .{
                     .with = .{
@@ -586,10 +687,12 @@ pub fn escapeNodes(
                 });
             },
             .range => |range_node| {
+                const saved = escaper.*;
                 const escaped_body = try escapeNodes(allocator, range_node.body_branch, escaper);
                 var escaped_else: ?[]const Node = null;
                 if (range_node.else_branch) |eb| {
-                    escaped_else = try escapeNodes(allocator, eb, escaper);
+                    var else_escaper = saved;
+                    escaped_else = try escapeNodes(allocator, eb, &else_escaper);
                 }
                 try out.append(allocator, .{
                     .range = .{
@@ -617,6 +720,7 @@ pub fn escapeNodes(
 pub const Template = struct {
     allocator: Allocator,
     inner: *text_pkg.Template,
+    escaped_templates: std.StringHashMap([*]const Node),
 
     pub fn new(allocator: Allocator, name: []const u8) !*Template {
         const tmpl = try allocator.create(Template);
@@ -630,17 +734,20 @@ pub const Template = struct {
         try inner.funcs.put("_unquoted_attr_esc", Filters.unquotedAttrEscaper);
         try inner.funcs.put("_url_esc", Filters.urlEscaper);
         try inner.funcs.put("_js_esc", Filters.jsEscaper);
+        try inner.funcs.put("_js_attr_esc", Filters.jsAttrEscaper);
         try inner.funcs.put("_css_esc", Filters.cssEscaper);
         try inner.funcs.put("_comment_esc", Filters.commentEscaper);
 
         tmpl.* = .{
             .allocator = allocator,
             .inner = inner,
+            .escaped_templates = std.StringHashMap([*]const Node).init(allocator),
         };
         return tmpl;
     }
 
     pub fn deinit(self: *Template) void {
+        self.escaped_templates.deinit();
         self.inner.deinit();
         self.allocator.destroy(self);
     }
@@ -670,10 +777,17 @@ pub const Template = struct {
             &escaper,
         );
         self.inner.root_nodes = escaped_roots;
+        if (self.inner.name.len > 0) {
+            try self.inner.templates.put(self.inner.name, escaped_roots);
+            try self.escaped_templates.put(self.inner.name, escaped_roots.ptr);
+        }
 
-        // Also escape all registered sub-templates (defined via {{ define "..." }})
+        // Escape newly parsed or redefined sub-templates without double-escaping existing ones
         var it = self.inner.templates.iterator();
         while (it.next()) |entry| {
+            if (self.escaped_templates.get(entry.key_ptr.*)) |prev_ptr| {
+                if (prev_ptr == entry.value_ptr.*.ptr) continue;
+            }
             var sub_escaper = Escaper{};
             const escaped_sub = try escapeNodes(
                 self.inner.arena.allocator(),
@@ -681,6 +795,7 @@ pub const Template = struct {
                 &sub_escaper,
             );
             entry.value_ptr.* = escaped_sub;
+            try self.escaped_templates.put(entry.key_ptr.*, escaped_sub.ptr);
         }
 
         return self;
@@ -875,4 +990,97 @@ test "html.template: unquoted attribute escaping and multi-attribute parsing" {
 
     const expected = "<div id=a&#32;b&#61;c disabled class=\"container\"></div>";
     try testing.expectEqualStrings(expected, buf.string());
+}
+
+test "html.template: XSS hardening for URL, JS event attrs, CSS, comments, branches, repeated parse" {
+    const testing = std.testing;
+    const bytes = @import("../bytes.zig");
+
+    // 1. URL allowlist and '&' HTML-escaping (blocks custom schemes and &#106avascript:)
+    {
+        var tmpl = try Template.new(testing.allocator, "url_xss");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("<a href=\"{{ .U1 }}\">1</a><a href=\"{{ .U2 }}\">2</a><a href=\"{{ .U3 }}\">3</a>");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{
+            .U1 = "ftp://evil.example/x",
+            .U2 = "&#106avascript:alert(1)",
+            .U3 = "/path?a=1&b=2",
+        });
+        try testing.expectEqualStrings(
+            "<a href=\"#ZgotmplZ\">1</a>" ++
+                "<a href=\"&amp;#106avascript:alert%281%29\">2</a>" ++
+                "<a href=\"/path?a=1&amp;b=2\">3</a>",
+            buf.string(),
+        );
+    }
+
+    // 2. Event handler attributes (quoted and unquoted)
+    {
+        var tmpl = try Template.new(testing.allocator, "js_attr_xss");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("<button onclick=\"fn({{ .A }})\" onmouseover={{ .B }}></button>");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{
+            .A = "x\" onclick=\"alert(1)",
+            .B = "y z",
+        });
+        try testing.expectEqualStrings(
+            "<button onclick=\"fn(&#34;x\\x22\\x20onclick\\x3d\\x22alert(1)&#34;)\" " ++
+                "onmouseover=&#34;y\\x20z&#34;></button>",
+            buf.string(),
+        );
+    }
+
+    // 3. CSS escaping blocks </style><script> and url( / @import
+    {
+        var tmpl = try Template.new(testing.allocator, "css_xss");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("<style>body { color: {{ .C1 }}; bg: {{ .C2 }}; }</style>");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{
+            .C1 = "</style><script>alert(1)</script>",
+            .C2 = "url(http://evil)",
+        });
+        try testing.expect(std.mem.indexOf(u8, buf.string(), "</style><script>") == null);
+        try testing.expect(std.mem.indexOf(u8, buf.string(), "/*ZgotmplZ*/") != null);
+    }
+
+    // 4. Comment escaping neutralizes ---> and --!>
+    {
+        var tmpl = try Template.new(testing.allocator, "comment_xss");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("<!-- {{ .C }} -->");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{ .C = "---> --!>" });
+        try testing.expect(std.mem.indexOf(u8, buf.string(), "-->") == buf.string().len - 3);
+        try testing.expect(std.mem.indexOf(u8, buf.string(), "--!>") == null);
+    }
+
+    // 5. Branch state isolation and no double-escaping on repeated parse()
+    {
+        var tmpl = try Template.new(testing.allocator, "branch_and_repeat");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("{{- define \"sub\" -}}<span>{{ .V }}</span>{{- end -}}");
+        _ = try tmpl.parse("{{ if .Cond }}<a href=\"{{ .U }}\">{{ else }}<div>{{ .V }}{{ end }}{{ template \"sub\" . }}");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{ .Cond = false, .U = "https://x", .V = "<b>" });
+        try testing.expectEqualStrings("<div>&lt;b&gt;<span>&lt;b&gt;</span>", buf.string());
+    }
+
+    // 6. Non-string value formatting in valueToString (no stack UAF)
+    {
+        var tmpl = try Template.new(testing.allocator, "int_val");
+        defer tmpl.deinit();
+        _ = try tmpl.parse("<div>{{ .N }}</div>");
+        var buf = bytes.Buffer.init(testing.allocator);
+        defer buf.deinit();
+        try tmpl.execute(buf.writer(), .{ .N = 12345 });
+        try testing.expectEqualStrings("<div>12345</div>", buf.string());
+    }
 }

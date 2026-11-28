@@ -115,6 +115,7 @@ pub const Writer = struct {
 
 pub const Reader = struct {
     allocator: Allocator,
+    window_buf: []u8,
     decompress: flate_impl.Decompress,
 
     pub fn reader(self: *Reader) *io.Reader {
@@ -126,6 +127,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        self.allocator.free(self.window_buf);
         const alloc = self.allocator;
         alloc.destroy(self);
     }
@@ -186,9 +188,13 @@ pub fn newReader(allocator: Allocator, r: *io.Reader) Error!*Reader {
     const self = try allocator.create(Reader);
     errdefer allocator.destroy(self);
 
+    const window_buf = try allocator.alloc(u8, flate_impl.max_window_len);
+    errdefer allocator.free(window_buf);
+
     self.* = .{
         .allocator = allocator,
-        .decompress = flate_impl.Decompress.init(r, .raw, &.{}),
+        .window_buf = window_buf,
+        .decompress = flate_impl.Decompress.init(r, .raw, window_buf),
     };
     return self;
 }
@@ -228,4 +234,35 @@ test "compress.flate: raw deflate round-trip" {
     _ = try io.copy(decomp_buf.writer(), fr.reader());
 
     try testing.expectEqualStrings(original_text, decomp_buf.string());
+}
+
+test "compress.flate: reader readSliceShort and takeByte" {
+    const testing = std.testing;
+    const bytes = @import("../bytes.zig");
+
+    const original = "Hello flate window buffer test! Repeating: abcdefghij abcdefghij";
+    var comp_buf = bytes.Buffer.init(testing.allocator);
+    defer comp_buf.deinit();
+
+    var fw = try newWriter(testing.allocator, comp_buf.writer(), DefaultCompression);
+    defer fw.deinit();
+    try fw.writer().writeAll(original);
+    try fw.close();
+
+    var r = bytes.Reader.init(comp_buf.bytes());
+    var fr = try newReader(testing.allocator, r.reader());
+    defer fr.deinit();
+
+    const first = try fr.reader().takeByte();
+    try testing.expectEqual(@as(u8, 'H'), first);
+
+    var out: [128]u8 = undefined;
+    out[0] = first;
+    var total: usize = 1;
+    while (total < out.len) {
+        const n = try fr.reader().readSliceShort(out[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    try testing.expectEqualStrings(original, out[0..total]);
 }

@@ -348,16 +348,14 @@ pub const Int = struct {
         return self.managed.format(w);
     }
 
+    /// Returns the i64 representation of self, or null if it does not fit in an i64.
     pub fn int64(self: *const Int) ?i64 {
-        if (self.bitLen() > 63) return null;
-        const val: i64 = @intCast(self.managed.limbs[0]);
-        return if (self.managed.isPositive()) val else -val;
+        return self.managed.toConst().toInt(i64) catch null;
     }
 
+    /// Returns the u64 representation of self, or null if it does not fit in a u64.
     pub fn uint64(self: *const Int) ?u64 {
-        if (!self.managed.isPositive()) return null;
-        if (self.bitLen() > 64) return null;
-        return self.managed.limbs[0];
+        return self.managed.toConst().toInt(u64) catch null;
     }
 };
 
@@ -414,6 +412,15 @@ test "Int string parsing and formatting" {
     _ = try x.setString("-999", 10);
     try testing.expectEqual(@as(i64, -999), x.int64().?);
     try testing.expectEqual(@as(i8, -1), x.sign());
+
+    // minInt(i64) and maxInt(u64)
+    _ = try x.setInt64(std.math.minInt(i64));
+    try testing.expectEqual(std.math.minInt(i64), x.int64().?);
+    try testing.expectEqual(@as(?u64, null), x.uint64());
+
+    _ = try x.setUint64(std.math.maxInt(u64));
+    try testing.expectEqual(std.math.maxInt(u64), x.uint64().?);
+    try testing.expectEqual(@as(?i64, null), x.int64());
 }
 
 test "Int modular exponentiation and bit ops" {

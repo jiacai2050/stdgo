@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
     var body_buf = bytes.Buffer.init(gpa);
     defer body_buf.deinit();
 
-    var writer = multipart.Writer.init(gpa, body_buf.writer());
+    var writer = multipart.Writer.init(gpa, init.io, body_buf.writer());
 
     // Add standard text field
     try writer.writeField("username", "gopher2026");

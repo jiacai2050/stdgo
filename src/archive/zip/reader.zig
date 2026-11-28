@@ -18,19 +18,24 @@ pub const File = struct {
     /// Open decompresses the file and returns its content.
     /// Caller owns returned memory.
     pub fn open(self: *const File, allocator: Allocator) anyerror![]u8 {
-        const off = self.header.offset;
-        if (off + 30 > self.zip_data.len) return Error.FormatError;
+        const off: u64 = self.header.offset;
+        const hdr_end = std.math.add(u64, off, 30) catch return Error.FormatError;
+        if (hdr_end > self.zip_data.len) return Error.FormatError;
+        const off_usize: usize = @intCast(off);
 
-        const sig = try binary.LittleEndian.readU32(self.zip_data[off .. off + 4]);
+        const sig = try binary.LittleEndian.readU32(self.zip_data[off_usize .. off_usize + 4]);
         if (sig != zip_struct.file_header_signature) return Error.FormatError;
 
-        const name_len = try binary.LittleEndian.readU16(self.zip_data[off + 26 .. off + 28]);
-        const extra_len = try binary.LittleEndian.readU16(self.zip_data[off + 28 .. off + 30]);
+        const name_len: u64 = try binary.LittleEndian.readU16(self.zip_data[off_usize + 26 .. off_usize + 28]);
+        const extra_len: u64 = try binary.LittleEndian.readU16(self.zip_data[off_usize + 28 .. off_usize + 30]);
 
-        const data_start = off + 30 + name_len + extra_len;
-        const data_end = data_start + self.header.compressed_size;
-        if (data_end > self.zip_data.len) return Error.FormatError;
+        const after_name = std.math.add(u64, hdr_end, name_len) catch return Error.FormatError;
+        const data_start_u64 = std.math.add(u64, after_name, extra_len) catch return Error.FormatError;
+        const data_end_u64 = std.math.add(u64, data_start_u64, self.header.compressed_size) catch return Error.FormatError;
+        if (data_end_u64 > self.zip_data.len) return Error.FormatError;
 
+        const data_start: usize = @intCast(data_start_u64);
+        const data_end: usize = @intCast(data_end_u64);
         const comp_bytes = self.zip_data[data_start..data_end];
 
         if (self.header.method != .store) {
@@ -74,10 +79,11 @@ pub const Reader = struct {
 
         const eocd = eocd_pos orelse return Error.FormatError;
         const total_entries = try binary.LittleEndian.readU16(zip_bytes[eocd + 10 .. eocd + 12]);
-        const cd_size = try binary.LittleEndian.readU32(zip_bytes[eocd + 12 .. eocd + 16]);
-        const cd_offset = try binary.LittleEndian.readU32(zip_bytes[eocd + 16 .. eocd + 20]);
+        const cd_size: u64 = try binary.LittleEndian.readU32(zip_bytes[eocd + 12 .. eocd + 16]);
+        const cd_offset: u64 = try binary.LittleEndian.readU32(zip_bytes[eocd + 16 .. eocd + 20]);
 
-        if (cd_offset + cd_size > zip_bytes.len) {
+        const cd_end = std.math.add(u64, cd_offset, cd_size) catch return Error.FormatError;
+        if (cd_end > zip_bytes.len) {
             return Error.FormatError;
         }
 
@@ -89,32 +95,39 @@ pub const Reader = struct {
             entries.deinit(allocator);
         }
 
-        var cur = cd_offset;
+        var cur: u64 = cd_offset;
         var entry: usize = 0;
         while (entry < total_entries) : (entry += 1) {
-            if (cur + 46 > zip_bytes.len) return Error.FormatError;
-            const sig = try binary.LittleEndian.readU32(zip_bytes[cur .. cur + 4]);
+            const entry_hdr_end = std.math.add(u64, cur, 46) catch return Error.FormatError;
+            if (entry_hdr_end > zip_bytes.len) return Error.FormatError;
+            const cur_usize: usize = @intCast(cur);
+
+            const sig = try binary.LittleEndian.readU32(zip_bytes[cur_usize .. cur_usize + 4]);
             if (sig != zip_struct.directory_header_signature) return Error.FormatError;
 
-            const method_raw = try binary.LittleEndian.readU16(zip_bytes[cur + 10 .. cur + 12]);
-            const crc32 = try binary.LittleEndian.readU32(zip_bytes[cur + 16 .. cur + 20]);
-            const comp_sz = try binary.LittleEndian.readU32(zip_bytes[cur + 20 .. cur + 24]);
-            const uncomp_sz = try binary.LittleEndian.readU32(zip_bytes[cur + 24 .. cur + 28]);
-            const name_len = try binary.LittleEndian.readU16(zip_bytes[cur + 28 .. cur + 30]);
-            const extra_len = try binary.LittleEndian.readU16(zip_bytes[cur + 30 .. cur + 32]);
-            const comment_len = try binary.LittleEndian.readU16(zip_bytes[cur + 32 .. cur + 34]);
-            const local_hdr_off = try binary.LittleEndian.readU32(zip_bytes[cur + 42 .. cur + 46]);
+            const method_raw = try binary.LittleEndian.readU16(zip_bytes[cur_usize + 10 .. cur_usize + 12]);
+            const crc32 = try binary.LittleEndian.readU32(zip_bytes[cur_usize + 16 .. cur_usize + 20]);
+            const comp_sz = try binary.LittleEndian.readU32(zip_bytes[cur_usize + 20 .. cur_usize + 24]);
+            const uncomp_sz = try binary.LittleEndian.readU32(zip_bytes[cur_usize + 24 .. cur_usize + 28]);
+            const name_len: u64 = try binary.LittleEndian.readU16(zip_bytes[cur_usize + 28 .. cur_usize + 30]);
+            const extra_len: u64 = try binary.LittleEndian.readU16(zip_bytes[cur_usize + 30 .. cur_usize + 32]);
+            const comment_len: u64 = try binary.LittleEndian.readU16(zip_bytes[cur_usize + 32 .. cur_usize + 34]);
+            const local_hdr_off = try binary.LittleEndian.readU32(zip_bytes[cur_usize + 42 .. cur_usize + 46]);
 
-            cur += 46;
-            if (cur + name_len > zip_bytes.len) return Error.FormatError;
-            const file_name = try allocator.dupe(u8, zip_bytes[cur .. cur + name_len]);
-            cur += name_len + extra_len + comment_len;
+            const name_end = std.math.add(u64, entry_hdr_end, name_len) catch return Error.FormatError;
+            const after_extra = std.math.add(u64, name_end, extra_len) catch return Error.FormatError;
+            const next_cur = std.math.add(u64, after_extra, comment_len) catch return Error.FormatError;
+            if (next_cur > zip_bytes.len) return Error.FormatError;
 
             const method: zip_struct.Method = switch (method_raw) {
                 0 => .store,
                 8 => .deflate,
-                else => .store,
+                else => return Error.UnsupportedMethod,
             };
+
+            const file_name = try allocator.dupe(u8, zip_bytes[@intCast(entry_hdr_end)..@intCast(name_end)]);
+            errdefer allocator.free(file_name);
+            cur = next_cur;
 
             const header = zip_struct.FileHeader{
                 .name = file_name,
@@ -179,4 +192,37 @@ test "archive.zip roundtrip store and extract" {
     const content2 = try all_files[1].open(testing.allocator);
     defer testing.allocator.free(content2);
     try testing.expectEqualStrings("{\"key\": 123}", content2);
+}
+
+test "archive.zip rejects unknown compression method and overflowed EOCD" {
+    const testing = std.testing;
+    const bytes = @import("../../bytes.zig");
+    const zip_writer = @import("writer.zig");
+
+    var zip_buf = bytes.Buffer.init(testing.allocator);
+    defer zip_buf.deinit();
+
+    var zw = zip_writer.Writer.init(testing.allocator, zip_buf.writer());
+    defer zw.deinit();
+    try zw.writeFile("a.txt", "hello", .store);
+    try zw.close();
+
+    // Mutate central directory compression method to 99 (unknown)
+    const mutated = try testing.allocator.dupe(u8, zip_buf.bytes());
+    defer testing.allocator.free(mutated);
+
+    // Find CD header signature 0x02014b50 and patch method at +10
+    const cd_sig = [_]u8{ 0x50, 0x4b, 0x01, 0x02 };
+    const cd_pos = std.mem.indexOf(u8, mutated, &cd_sig).?;
+    mutated[cd_pos + 10] = 99;
+    mutated[cd_pos + 11] = 0;
+    try testing.expectError(Error.UnsupportedMethod, Reader.init(testing.allocator, mutated));
+
+    // Craft EOCD with overflowing cd_offset + cd_size (0xFFFFFFFF + 0xFFFFFFFF)
+    var bad_eocd: [22]u8 = @splat(0);
+    try binary.LittleEndian.writeU32(bad_eocd[0..4], zip_struct.directory_end_signature);
+    try binary.LittleEndian.writeU16(bad_eocd[10..12], 1);
+    try binary.LittleEndian.writeU32(bad_eocd[12..16], 0xFFFF_FFFF);
+    try binary.LittleEndian.writeU32(bad_eocd[16..20], 0xFFFF_FFFF);
+    try testing.expectError(Error.FormatError, Reader.init(testing.allocator, &bad_eocd));
 }

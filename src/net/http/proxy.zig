@@ -23,13 +23,15 @@ pub fn isNoProxy(no_proxy: []const u8, host_with_port: []const u8) bool {
     if (trimmed_rule.len == 0) return false;
     if (std.mem.eql(u8, trimmed_rule, "*")) return true;
 
-    // Separate host and port
+    // Separate host and port (handling bracketed IPv6 literals with or without port)
     var req_host = host_with_port;
-    if (std.mem.lastIndexOfScalar(u8, host_with_port, ':')) |colon| {
-        if (!std.mem.startsWith(u8, host_with_port, "[") or
-            std.mem.indexOfScalar(u8, host_with_port, ']') != null)
-        {
-            req_host = host_with_port[0..colon];
+    if (std.mem.startsWith(u8, host_with_port, "[")) {
+        if (std.mem.indexOfScalar(u8, host_with_port, ']')) |rb| {
+            req_host = host_with_port[1..rb];
+        }
+    } else if (std.mem.indexOfScalar(u8, host_with_port, ':')) |first_colon| {
+        if (std.mem.lastIndexOfScalar(u8, host_with_port, ':').? == first_colon) {
+            req_host = host_with_port[0..first_colon];
         }
     }
 
@@ -42,11 +44,16 @@ pub fn isNoProxy(no_proxy: []const u8, host_with_port: []const u8) bool {
         // Exact match with full host:port
         if (std.ascii.eqlIgnoreCase(entry, host_with_port)) return true;
 
+        const entry_host = if (entry.len >= 2 and entry[0] == '[' and entry[entry.len - 1] == ']')
+            entry[1 .. entry.len - 1]
+        else
+            entry;
+
         // Exact match with host only
-        if (std.ascii.eqlIgnoreCase(entry, req_host)) return true;
+        if (std.ascii.eqlIgnoreCase(entry_host, req_host)) return true;
 
         // Domain suffix match (e.g. .example.com or example.com matching sub.example.com)
-        const domain = if (std.mem.startsWith(u8, entry, ".")) entry[1..] else entry;
+        const domain = if (std.mem.startsWith(u8, entry_host, ".")) entry_host[1..] else entry_host;
         if (std.ascii.endsWithIgnoreCase(req_host, domain)) {
             if (req_host.len == domain.len) return true;
             if (req_host.len > domain.len and req_host[req_host.len - domain.len - 1] == '.') {
@@ -182,6 +189,7 @@ pub fn parseProxyDetails(allocator: Allocator, raw_proxy_url: []const u8) !Proxy
         errdefer allocator.free(clean_url);
 
         var socks_user: ?[]const u8 = null;
+        errdefer if (socks_user) |u| allocator.free(u);
         var socks_pass: ?[]const u8 = null;
 
         if (is_socks) {
@@ -227,6 +235,10 @@ test "proxy isNoProxy wildcard and suffix" {
     try std.testing.expect(isNoProxy(no_proxy_rule, "internal.net"));
     try std.testing.expect(!isNoProxy(no_proxy_rule, "external.com"));
     try std.testing.expect(!isNoProxy(no_proxy_rule, "fakeinternal.net"));
+    try std.testing.expect(isNoProxy("::1", "[::1]"));
+    try std.testing.expect(isNoProxy("[::1]", "[::1]:8080"));
+    try std.testing.expect(isNoProxy("::1", "[::1]:8080"));
+    try std.testing.expect(!isNoProxy("::1", "[::2]"));
 }
 
 test "proxy parseProxyDetails basic auth" {

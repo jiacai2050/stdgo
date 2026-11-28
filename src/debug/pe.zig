@@ -130,14 +130,14 @@ pub const File = struct {
 
         // e_lfanew is at 0x3c (60)
         const pe_offset = mem.readInt(u32, data[0x3c..0x40], .little);
-        if (pe_offset + 24 > data.len) return FormatError.UnexpectedEOF;
+        if (pe_offset > data.len or data.len - pe_offset < 24) return FormatError.UnexpectedEOF;
 
         // Check PE signature ("PE\0\0")
         const pe_sig = mem.readInt(u32, data[pe_offset..][0..4], .little);
         if (pe_sig != IMAGE_NT_SIGNATURE) return FormatError.BadPeSignature;
 
         // COFF File Header (20 bytes starting at pe_offset + 4)
-        const coff_raw = data[pe_offset + 4 .. pe_offset + 24];
+        const coff_raw = data[@as(usize, pe_offset) + 4 .. @as(usize, pe_offset) + 24];
         const machine_raw = mem.readInt(u16, coff_raw[0..2], .little);
         const num_sections = mem.readInt(u16, coff_raw[2..4], .little);
         const time_date = mem.readInt(u32, coff_raw[4..8], .little);
@@ -157,9 +157,9 @@ pub const File = struct {
         };
 
         var opt_header: ?OptionalHeader = null;
-        const opt_offset = pe_offset + 24;
+        const opt_offset: usize = @as(usize, pe_offset) + 24;
 
-        if (opt_size >= 28 and opt_offset + opt_size <= data.len) {
+        if (opt_size >= 28 and opt_offset <= data.len and opt_size <= data.len - opt_offset) {
             const opt_data = data[opt_offset .. opt_offset + opt_size];
             const magic_raw = mem.readInt(u16, opt_data[0..2], .little);
             const opt_magic: OptionalHeaderMagic = @fromBackingInt(@intCast(magic_raw));
@@ -181,7 +181,7 @@ pub const File = struct {
 
             if (opt_magic == .pe32) {
                 // PE32 (32-bit)
-                if (opt_data.len >= 68) {
+                if (opt_data.len >= 72) {
                     image_base = mem.readInt(u32, opt_data[28..32], .little);
                     sec_align = mem.readInt(u32, opt_data[32..36], .little);
                     file_align = mem.readInt(u32, opt_data[36..40], .little);
@@ -191,14 +191,11 @@ pub const File = struct {
 
                     // Data directories at offset 96 (each 8 bytes)
                     if (opt_data.len >= 96) {
-                        const num_rva = if (opt_data.len >= 96)
-                            mem.readInt(u32, opt_data[92..96], .little)
-                        else
-                            0;
+                        const num_rva = mem.readInt(u32, opt_data[92..96], .little);
                         const count = @min(16, num_rva);
                         for (0..count) |i| {
                             const d_off = 96 + i * 8;
-                            if (d_off + 8 <= opt_data.len) {
+                            if (d_off <= opt_data.len and opt_data.len - d_off >= 8) {
                                 ddir[i] = .{
                                     .virtual_address = mem.readInt(
                                         u32,
@@ -227,7 +224,7 @@ pub const File = struct {
                         const count = @min(16, num_rva);
                         for (0..count) |i| {
                             const d_off = 112 + i * 8;
-                            if (d_off + 8 <= opt_data.len) {
+                            if (d_off <= opt_data.len and opt_data.len - d_off >= 8) {
                                 ddir[i] = .{
                                     .virtual_address = mem.readInt(
                                         u32,
@@ -261,13 +258,19 @@ pub const File = struct {
         }
 
         // Section Headers (40 bytes each) right after Optional Header
-        const sec_headers_off = opt_offset + opt_size;
+        const sec_headers_off = std.math.add(usize, opt_offset, opt_size) catch {
+            return FormatError.InvalidSectionHeader;
+        };
         var sections = try allocator.alloc(Section, num_sections);
         errdefer allocator.free(sections);
 
         for (0..num_sections) |i| {
-            const sh_off = sec_headers_off + i * 40;
-            if (sh_off + 40 > data.len) return FormatError.InvalidSectionHeader;
+            const sh_off = std.math.add(usize, sec_headers_off, i * 40) catch {
+                return FormatError.InvalidSectionHeader;
+            };
+            if (sh_off > data.len or data.len - sh_off < 40) {
+                return FormatError.InvalidSectionHeader;
+            }
             const sh_data = data[sh_off .. sh_off + 40];
 
             const sec_name = cleanString(sh_data[0..8]);
@@ -281,8 +284,8 @@ pub const File = struct {
             const num_linenums = mem.readInt(u16, sh_data[34..36], .little);
             const sec_chars = mem.readInt(u32, sh_data[36..40], .little);
 
-            const sec_payload = if (raw_off + raw_size <= data.len)
-                data[raw_off .. raw_off + raw_size]
+            const sec_payload = if (raw_off <= data.len and raw_size <= data.len - raw_off)
+                data[raw_off .. @as(usize, raw_off) + @as(usize, raw_size)]
             else
                 &.{};
 
@@ -334,18 +337,20 @@ pub const File = struct {
             return alloc.alloc(COFFSymbol, 0);
         }
 
-        const sym_off = self.file_header.pointer_to_symbol_table;
-        const sym_cnt = self.file_header.number_of_symbols;
-        const total_size = sym_cnt * 18;
+        const sym_off: usize = self.file_header.pointer_to_symbol_table;
+        const sym_cnt: usize = self.file_header.number_of_symbols;
+        const total_size = std.math.mul(usize, sym_cnt, 18) catch return FormatError.UnexpectedEOF;
 
-        if (sym_off + total_size > self.raw_data.len) return FormatError.UnexpectedEOF;
+        if (sym_off > self.raw_data.len or total_size > self.raw_data.len - sym_off) {
+            return FormatError.UnexpectedEOF;
+        }
 
         // String table is immediately after the COFF symbols
         const strtab_off = sym_off + total_size;
         var strtab: []const u8 = &.{};
-        if (strtab_off + 4 <= self.raw_data.len) {
+        if (strtab_off <= self.raw_data.len and self.raw_data.len - strtab_off >= 4) {
             const strtab_size = mem.readInt(u32, self.raw_data[strtab_off..][0..4], .little);
-            if (strtab_size >= 4 and strtab_off + strtab_size <= self.raw_data.len) {
+            if (strtab_size >= 4 and strtab_size <= self.raw_data.len - strtab_off) {
                 strtab = self.raw_data[strtab_off .. strtab_off + strtab_size];
             }
         }

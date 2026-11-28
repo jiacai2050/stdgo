@@ -157,7 +157,7 @@ pub fn parseDuration(s_in: []const u8) Error!Duration {
     while (s.len > 0) {
         var v: u64 = 0;
         var f: u64 = 0;
-        var scale: f64 = 1.0;
+        var scale: u64 = 1;
 
         if (!(s[0] == '.' or (s[0] >= '0' and s[0] <= '9'))) {
             return Error.InvalidDuration;
@@ -166,7 +166,11 @@ pub fn parseDuration(s_in: []const u8) Error!Duration {
         // Consume leading integer digits
         const pl = s.len;
         while (s.len > 0 and s[0] >= '0' and s[0] <= '9') {
-            v = v * 10 + (s[0] - '0');
+            const mul_res = @mulWithOverflow(v, 10);
+            if (mul_res[1] != 0) return Error.InvalidDuration;
+            const add_res = @addWithOverflow(mul_res[0], @as(u64, s[0] - '0'));
+            if (add_res[1] != 0) return Error.InvalidDuration;
+            v = add_res[0];
             s = s[1..];
         }
         const pre = (pl != s.len);
@@ -176,7 +180,7 @@ pub fn parseDuration(s_in: []const u8) Error!Duration {
         if (s.len > 0 and s[0] == '.') {
             s = s[1..];
             while (s.len > 0 and s[0] >= '0' and s[0] <= '9') {
-                if (scale < 1e9) {
+                if (scale < 1_000_000_000) {
                     f = f * 10 + (s[0] - '0');
                     scale *= 10;
                 }
@@ -210,19 +214,31 @@ pub fn parseDuration(s_in: []const u8) Error!Duration {
         else
             return Error.InvalidDuration;
 
-        total_ns += v * unit_ns;
+        const prod = @mulWithOverflow(v, unit_ns);
+        if (prod[1] != 0) return Error.InvalidDuration;
+        const sum1 = @addWithOverflow(total_ns, prod[0]);
+        if (sum1[1] != 0) return Error.InvalidDuration;
+        total_ns = sum1[0];
+
         if (post) {
-            const frac_f: f64 = @as(f64, @floatFromInt(f)) / scale;
-            const frac_ns: u64 = @intFromFloat(frac_f * @as(f64, @floatFromInt(unit_ns)));
-            total_ns += frac_ns;
+            const frac_ns: u64 = @intCast((@as(u128, f) * unit_ns) / scale);
+            const sum2 = @addWithOverflow(total_ns, frac_ns);
+            if (sum2[1] != 0) return Error.InvalidDuration;
+            total_ns = sum2[0];
         }
     }
 
-    var signed_ns: i64 = @intCast(total_ns);
-    if (neg) {
-        signed_ns = -signed_ns;
-    }
-    return @fromBackingInt(@intCast(signed_ns));
+    const max_pos: u64 = @intCast(std.math.maxInt(i64));
+    const max_neg: u64 = max_pos + 1;
+    const signed_ns: i64 = if (neg) blk: {
+        if (total_ns > max_neg) return Error.InvalidDuration;
+        if (total_ns == max_neg) break :blk std.math.minInt(i64);
+        break :blk -@as(i64, @intCast(total_ns));
+    } else blk: {
+        if (total_ns > max_pos) return Error.InvalidDuration;
+        break :blk @intCast(total_ns);
+    };
+    return @fromBackingInt(signed_ns);
 }
 
 test "time.parseDuration Go test cases" {
@@ -250,6 +266,16 @@ test "time.parseDuration Go test cases" {
     try testing.expectError(Error.InvalidDuration, parseDuration(""));
     try testing.expectError(Error.InvalidDuration, parseDuration("xyz"));
     try testing.expectError(Error.InvalidDuration, parseDuration("10")); // missing unit
+
+    // Boundary & overflow cases
+    const d_max = try parseDuration("2562047h47m16.854775807s");
+    try testing.expectEqual(std.math.maxInt(i64), d_max.nanoseconds());
+    const d_min = try parseDuration("-2562047h47m16.854775808s");
+    try testing.expectEqual(std.math.minInt(i64), d_min.nanoseconds());
+
+    try testing.expectError(Error.InvalidDuration, parseDuration("2562047h47m16.854775808s"));
+    try testing.expectError(Error.InvalidDuration, parseDuration("-2562047h47m16.854775809s"));
+    try testing.expectError(Error.InvalidDuration, parseDuration("9999999999999999999999h"));
 }
 
 test "time.Duration.string Go test cases" {

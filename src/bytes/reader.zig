@@ -48,20 +48,16 @@ pub const Reader = struct {
         self.r.seek -= 1;
     }
 
+    /// Seek sets the offset for the next read using overflow-safe arithmetic.
     pub fn seek(self: *Reader, offset: i64, whence: io.SeekWhence) io.Error!u64 {
-        var abs_offset: i64 = 0;
-        switch (whence) {
-            .start => {
-                abs_offset = offset;
-            },
-            .current => {
-                abs_offset = @as(i64, @intCast(self.r.seek)) + offset;
-            },
-            .end => {
-                abs_offset = @as(i64, @intCast(self.r.end)) + offset;
-            },
-        }
-        if (abs_offset < 0 or abs_offset > @as(i64, @intCast(self.r.end))) {
+        const base: i64 = switch (whence) {
+            .start => 0,
+            .current => std.math.cast(i64, self.r.seek) orelse return io.Error.SeekBeforeStart,
+            .end => std.math.cast(i64, self.r.end) orelse return io.Error.SeekBeforeStart,
+        };
+        const abs_offset = std.math.add(i64, base, offset) catch return io.Error.SeekBeforeStart;
+        const end_i64 = std.math.cast(i64, self.r.end) orelse return io.Error.SeekBeforeStart;
+        if (abs_offset < 0 or abs_offset > end_i64) {
             return io.Error.SeekBeforeStart;
         }
         self.r.seek = @intCast(abs_offset);
@@ -111,4 +107,9 @@ test "bytes.Reader basic reading and seeking" {
     try std.testing.expectEqual(@as(u64, 11), written);
     const out_slice = out_alloc.writer.buffer[0..out_alloc.writer.end];
     try std.testing.expectEqualStrings("hello world", out_slice);
+
+    // Overflow-safe seek checks
+    try std.testing.expectError(io.Error.SeekBeforeStart, r.seek(std.math.maxInt(i64), .current));
+    try std.testing.expectError(io.Error.SeekBeforeStart, r.seek(std.math.minInt(i64), .current));
+    try std.testing.expectError(io.Error.SeekBeforeStart, r.seek(std.math.maxInt(i64), .end));
 }

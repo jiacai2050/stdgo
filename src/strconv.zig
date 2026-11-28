@@ -87,7 +87,9 @@ pub fn parseInt(s: []const u8, base: u8, bit_size: u8) error{ SyntaxError, Range
     if (actual_bits > 64) return error.RangeError;
 
     var val: u64 = 0;
-    const cutoff: u64 = 0x7fffffffffffffff / @as(u64, actual_base);
+    const limit: u64 = if (neg) 0x8000000000000000 else 0x7fffffffffffffff;
+    const cutoff: u64 = limit / @as(u64, actual_base);
+    var saw_digit = false;
 
     for (p) |c| {
         const d: u8 = switch (c) {
@@ -98,14 +100,15 @@ pub fn parseInt(s: []const u8, base: u8, bit_size: u8) error{ SyntaxError, Range
             else => return error.SyntaxError,
         };
         if (d >= actual_base) return error.SyntaxError;
+        saw_digit = true;
 
         if (val > cutoff) return error.RangeError;
         val *= actual_base;
 
-        const limit: u64 = if (neg) 0x8000000000000000 else 0x7fffffffffffffff;
         if (val > limit - d) return error.RangeError;
         val += d;
     }
+    if (!saw_digit) return error.SyntaxError;
 
     // Range check for smaller bit sizes
     if (actual_bits < 64) {
@@ -164,6 +167,7 @@ pub fn parseUint(s: []const u8, base: u8, bit_size: u8) error{ SyntaxError, Rang
 
     var val: u64 = 0;
     const cutoff: u64 = 0xffffffffffffffff / @as(u64, actual_base);
+    var saw_digit = false;
 
     for (p) |c| {
         const d: u8 = switch (c) {
@@ -174,6 +178,7 @@ pub fn parseUint(s: []const u8, base: u8, bit_size: u8) error{ SyntaxError, Rang
             else => return error.SyntaxError,
         };
         if (d >= actual_base) return error.SyntaxError;
+        saw_digit = true;
 
         if (val > cutoff) return error.RangeError;
         val *= actual_base;
@@ -181,6 +186,7 @@ pub fn parseUint(s: []const u8, base: u8, bit_size: u8) error{ SyntaxError, Rang
         if (val > 0xffffffffffffffff - @as(u64, d)) return error.RangeError;
         val += d;
     }
+    if (!saw_digit) return error.SyntaxError;
 
     if (actual_bits < 64) {
         const max_val: u64 = (@as(u64, 1) << @intCast(actual_bits)) - 1;
@@ -469,6 +475,16 @@ test "strconv parseInt and formatInt" {
     // Range error
     try testing.expectError(error.RangeError, parseInt("128", 10, 8)); // i8 max is 127
     try testing.expectEqual(@as(i64, 127), try parseInt("127", 10, 8));
+
+    // minInt(i64) in power-of-two bases and underscore-only rejection
+    try testing.expectEqual(std.math.minInt(i64), try parseInt("-8000000000000000", 16, 64));
+    try testing.expectEqual(
+        std.math.minInt(i64),
+        try parseInt("-1000000000000000000000", 8, 64),
+    );
+    try testing.expectError(error.SyntaxError, parseInt("_", 10, 64));
+    try testing.expectError(error.SyntaxError, parseInt("-_", 10, 64));
+    try testing.expectError(error.SyntaxError, parseUint("_", 10, 64));
 
     // FormatInt
     const f1 = try formatInt(allocator, 255, 16);

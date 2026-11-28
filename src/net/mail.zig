@@ -116,17 +116,23 @@ pub fn parseAddress(allocator: Allocator, s_in: []const u8) ParseError!Address {
 
         const raw_name = std.mem.trim(u8, s[start_idx + 1 .. end_idx], " \t\r\n");
 
+        const name_copy = try allocator.dupe(u8, raw_name);
+        errdefer allocator.free(name_copy);
+        const addr_copy = try allocator.dupe(u8, raw_addr);
         return .{
-            .name = try allocator.dupe(u8, raw_name),
-            .address = try allocator.dupe(u8, raw_addr),
+            .name = name_copy,
+            .address = addr_copy,
         };
     }
 
     // Bare address: addr
     if (!isValidEmail(s)) return ParseError.InvalidAddress;
+    const name_copy = try allocator.dupe(u8, "");
+    errdefer allocator.free(name_copy);
+    const addr_copy = try allocator.dupe(u8, s);
     return .{
-        .name = try allocator.dupe(u8, ""),
-        .address = try allocator.dupe(u8, s),
+        .name = name_copy,
+        .address = addr_copy,
     };
 }
 
@@ -164,7 +170,8 @@ pub fn parseAddressList(allocator: Allocator, list_in: []const u8) ParseError![]
         } else if (c == ',' and !in_quotes and !in_angles) {
             const piece = std.mem.trim(u8, list_in[start..i], " \t\r\n");
             if (piece.len > 0) {
-                const addr = try parseAddress(allocator, piece);
+                var addr = try parseAddress(allocator, piece);
+                errdefer addr.deinit(allocator);
                 try list.append(allocator, addr);
             }
             start = i + 1;
@@ -173,7 +180,8 @@ pub fn parseAddressList(allocator: Allocator, list_in: []const u8) ParseError![]
 
     const last = std.mem.trim(u8, list_in[start..], " \t\r\n");
     if (last.len > 0) {
-        const addr = try parseAddress(allocator, last);
+        var addr = try parseAddress(allocator, last);
+        errdefer addr.deinit(allocator);
         try list.append(allocator, addr);
     }
 

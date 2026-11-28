@@ -66,8 +66,9 @@ pub const OneByteReader = struct {
     fn streamImpl(
         r: *std.Io.Reader,
         w: *std.Io.Writer,
-        _: std.Io.Limit,
+        limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
+        if (@backingInt(limit) == 0) return 0;
         const self: *OneByteReader = @alignCast(@fieldParentPtr("reader_inst", r));
         return try self.r.stream(w, .limited(1));
     }
@@ -101,8 +102,9 @@ pub const HalfReader = struct {
         w: *std.Io.Writer,
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
-        const self: *HalfReader = @alignCast(@fieldParentPtr("reader_inst", r));
         const max_bytes = @backingInt(limit);
+        if (max_bytes == 0) return 0;
+        const self: *HalfReader = @alignCast(@fieldParentPtr("reader_inst", r));
         const half = if (max_bytes <= 1) 1 else max_bytes / 2;
         return try self.r.stream(w, .limited(half));
     }
@@ -178,18 +180,29 @@ pub const TruncateWriter = struct {
         data: []const []const u8,
         splat: usize,
     ) std.Io.Writer.Error!usize {
-        _ = splat;
         const self: *TruncateWriter = @alignCast(@fieldParentPtr("writer_inst", w));
         var written: usize = 0;
-        for (data) |chunk| {
-            if (self.remaining == 0) {
-                written += chunk.len; // Silently drop remainder
-                continue;
+        if (data.len > 1) {
+            for (data[0 .. data.len - 1]) |chunk| {
+                if (self.remaining > 0) {
+                    const to_write = @min(self.remaining, chunk.len);
+                    try self.w.writeAll(chunk[0..to_write]);
+                    self.remaining -= to_write;
+                }
+                written += chunk.len;
             }
-            const to_write = @min(self.remaining, chunk.len);
-            try self.w.writeAll(chunk[0..to_write]);
-            self.remaining -= to_write;
-            written += chunk.len;
+        }
+        if (data.len > 0 and splat > 0) {
+            const last = data[data.len - 1];
+            if (last.len > 0) {
+                var reps_left = splat;
+                while (reps_left > 0 and self.remaining > 0) : (reps_left -= 1) {
+                    const to_write = @min(self.remaining, last.len);
+                    try self.w.writeAll(last[0..to_write]);
+                    self.remaining -= to_write;
+                }
+                written += last.len * splat;
+            }
         }
         return written;
     }
@@ -257,4 +270,20 @@ test "iotest TimeoutReader and TruncateWriter" {
 
     try w.writeAll("hello world");
     try testing.expectEqualStrings("hello", dst.buffered());
+
+    // Verify splat handling and zero-limit reader behavior.
+    var splat_buf: [16]u8 = undefined;
+    var splat_dst = std.Io.Writer.fixed(&splat_buf);
+    var tw2 = TruncateWriter.init(&splat_dst, 5);
+    var w2 = tw2.writer();
+    try w2.splatByteAll('x', 8);
+    try testing.expectEqualStrings("xxxxx", splat_dst.buffered());
+
+    var src_zero = std.Io.Reader.fixed("abc");
+    var obr_zero = OneByteReader.init(&src_zero);
+    var hr_zero = HalfReader.init(&src_zero);
+    var zbuf: [4]u8 = undefined;
+    var zdst = std.Io.Writer.fixed(&zbuf);
+    try testing.expectEqual(@as(usize, 0), try obr_zero.reader().stream(&zdst, .limited(0)));
+    try testing.expectEqual(@as(usize, 0), try hr_zero.reader().stream(&zdst, .limited(0)));
 }

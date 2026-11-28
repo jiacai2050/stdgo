@@ -82,8 +82,7 @@ pub fn parseMediaType(allocator: Allocator, v_in: []const u8) ParseError!MediaTy
         rest = std.mem.trimStart(u8, rest[eq_idx + 1 ..], " \t\r\n");
 
         // Parse value (quoted or unquoted token)
-        var val: []u8 = undefined;
-        if (rest.len > 0 and rest[0] == '"') {
+        const val: []u8 = if (rest.len > 0 and rest[0] == '"') blk: {
             // Quoted string
             var list: std.ArrayList(u8) = .empty;
             defer list.deinit(allocator);
@@ -105,9 +104,10 @@ pub fn parseMediaType(allocator: Allocator, v_in: []const u8) ParseError!MediaTy
                 }
             }
             if (!closed) return ParseError.InvalidMediaType;
-            val = try list.toOwnedSlice(allocator);
+            const owned = try list.toOwnedSlice(allocator);
             rest = rest[i..];
-        } else {
+            break :blk owned;
+        } else blk: {
             // Unquoted token
             var end_idx = rest.len;
             for (rest, 0..) |c, idx| {
@@ -117,8 +117,14 @@ pub fn parseMediaType(allocator: Allocator, v_in: []const u8) ParseError!MediaTy
                 }
             }
             const token = rest[0..end_idx];
-            val = try allocator.dupe(u8, token);
+            const owned = try allocator.dupe(u8, token);
             rest = rest[end_idx..];
+            break :blk owned;
+        };
+        errdefer allocator.free(val);
+
+        if (params.contains(lower_key)) {
+            return ParseError.InvalidMediaType;
         }
 
         try params.put(lower_key, val);
@@ -313,4 +319,12 @@ test "formatMediaType" {
     defer testing.allocator.free(formatted);
 
     try testing.expectEqualStrings("text/html; charset=utf-8", formatted);
+}
+
+test "parseMediaType rejects duplicate parameter keys without leaking" {
+    const testing = std.testing;
+    try testing.expectError(
+        ParseError.InvalidMediaType,
+        parseMediaType(testing.allocator, "text/plain; charset=utf-8; CHARSET=latin1"),
+    );
 }

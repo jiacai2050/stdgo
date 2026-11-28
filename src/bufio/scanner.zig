@@ -152,11 +152,11 @@ pub const Scanner = struct {
                 }
 
                 if (self.done) {
-                    if (self.start < self.end) {
-                        // EOF reached, but split function consumed bytes without token
+                    if (res.advance > 0 and self.start < self.end) {
+                        // EOF reached, split function made progress without emitting a token
                         continue;
                     }
-                    // EOF and no more tokens
+                    // EOF and no more tokens (or no progress made)
                     return false;
                 }
             }
@@ -170,7 +170,7 @@ pub const Scanner = struct {
             if (self.start > 0) {
                 const remaining = self.end - self.start;
                 if (remaining > 0) {
-                    @memcpy(self.buf[0..remaining], self.buf[self.start..self.end]);
+                    std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[self.start..self.end]);
                 }
                 self.end = remaining;
                 self.start = 0;
@@ -299,7 +299,7 @@ pub fn scanWords(data: []const u8, at_eof: bool) anyerror!SplitResult {
         i += 1;
     }
 
-    if (i > start) {
+    if (i > start and (i < data.len or at_eof)) {
         return .{
             .advance = i,
             .token = data[start..i],
@@ -471,6 +471,43 @@ test "Scanner: initWithBuffer zero allocation" {
         count += 1;
     }
     try testing.expectEqual(expected.len, count);
+    try testing.expect(scanner.err() == null);
+}
+
+test "Scanner: scanWords does not split across small buffer boundaries" {
+    const testing = std.testing;
+    const input = "abcdefgh ijklmnop qrstuvwx";
+    var r = stdgo_bytes_reader(input);
+
+    var buf: [10]u8 = undefined;
+    var scanner = Scanner.initWithBuffer(r.reader(), &buf, buf.len);
+    defer scanner.deinit();
+    scanner.split(scanWords);
+
+    const expected = [_][]const u8{ "abcdefgh", "ijklmnop", "qrstuvwx" };
+    var count: usize = 0;
+    while (scanner.scan()) {
+        try testing.expectEqualStrings(expected[count], scanner.text());
+        count += 1;
+    }
+    try testing.expectEqual(expected.len, count);
+    try testing.expect(scanner.err() == null);
+}
+
+test "Scanner: custom split returning zero advance at EOF terminates" {
+    const testing = std.testing;
+    const NoProgressSplit = struct {
+        fn split(_: []const u8, _: bool) anyerror!SplitResult {
+            return .{ .advance = 0, .token = null };
+        }
+    };
+
+    var r = stdgo_bytes_reader("leftover");
+    var scanner = try Scanner.init(testing.allocator, r.reader());
+    defer scanner.deinit();
+    scanner.split(NoProgressSplit.split);
+
+    try testing.expect(!scanner.scan());
     try testing.expect(scanner.err() == null);
 }
 

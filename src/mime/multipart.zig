@@ -38,7 +38,14 @@ pub const Header = struct {
         return null;
     }
 
+    /// Sets the header entry associated with `name` to the single element `value`,
+    /// replacing any existing values (case-insensitive).
     pub fn set(self: *Header, name: []const u8, value: []const u8) !void {
+        const new_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(new_name);
+        const new_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(new_value);
+
         var i: usize = 0;
         var replaced = false;
         while (i < self.entries.items.len) {
@@ -47,8 +54,8 @@ pub const Header = struct {
                     self.allocator.free(self.entries.items[i].name);
                     self.allocator.free(self.entries.items[i].value);
                     self.entries.items[i] = .{
-                        .name = try self.allocator.dupe(u8, name),
-                        .value = try self.allocator.dupe(u8, value),
+                        .name = new_name,
+                        .value = new_value,
                     };
                     replaced = true;
                     i += 1;
@@ -63,16 +70,21 @@ pub const Header = struct {
         }
         if (!replaced) {
             try self.entries.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, name),
-                .value = try self.allocator.dupe(u8, value),
+                .name = new_name,
+                .value = new_value,
             });
         }
     }
 
+    /// Adds the key, value pair to the header.
     pub fn add(self: *Header, name: []const u8, value: []const u8) !void {
+        const dup_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(dup_name);
+        const dup_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(dup_value);
         try self.entries.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, name),
-            .value = try self.allocator.dupe(u8, value),
+            .name = dup_name,
+            .value = dup_value,
         });
     }
 };
@@ -104,24 +116,34 @@ pub const Writer = struct {
     last_part_open: bool = false,
     closed: bool = false,
 
-    pub fn init(allocator: Allocator, w: *io.Writer) Writer {
+    /// Initializes a multipart Writer writing to `w` with a random boundary generated via `io_inst`.
+    pub fn init(allocator: Allocator, io_inst: std.Io, w: *io.Writer) Writer {
         var self = Writer{
             .allocator = allocator,
             .w = w,
         };
-        self.randomBoundary();
+        self.randomBoundary(io_inst);
         return self;
     }
 
-    var boundary_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0x123456789abcdef0);
+    /// Initializes a multipart Writer writing to `w` using an explicit custom boundary.
+    pub fn initWithBoundary(allocator: Allocator, w: *io.Writer, b: []const u8) !Writer {
+        var self = Writer{
+            .allocator = allocator,
+            .w = w,
+        };
+        try self.setBoundary(b);
+        return self;
+    }
 
-    fn randomBoundary(self: *Writer) void {
-        const id = boundary_counter.fetchAdd(0x9e3779b97f4a7c15, .monotonic);
-        const hex = std.fmt.bytesToHex(std.mem.asBytes(&id), .lower);
+    fn randomBoundary(self: *Writer, io_inst: std.Io) void {
+        var rand_bytes: [16]u8 = undefined;
+        io_inst.random(&rand_bytes);
+        const hex = std.fmt.bytesToHex(rand_bytes, .lower);
         const prefix = "stdgo_boundary_";
         @memcpy(self.boundary_buf[0..prefix.len], prefix);
-        @memcpy(self.boundary_buf[prefix.len .. prefix.len + 16], &hex);
-        self.boundary_len = prefix.len + 16;
+        @memcpy(self.boundary_buf[prefix.len .. prefix.len + hex.len], &hex);
+        self.boundary_len = prefix.len + hex.len;
     }
 
     pub fn boundary(self: *const Writer) []const u8 {
@@ -287,8 +309,14 @@ pub const Reader = struct {
         }
 
         const b_idx = std.mem.indexOf(u8, self.buf.items, dash_boundary).?;
-        // Check if closing boundary: "--boundary--"
+        // Check if closing boundary: "--boundary--" or followed by "\r\n"
         const after_b = b_idx + dash_boundary.len;
+        while (self.buf.items.len < after_b + 2) {
+            var temp: [1024]u8 = undefined;
+            const n = try self.r.readSliceShort(&temp);
+            if (n == 0) break;
+            try self.buf.appendSlice(self.allocator, temp[0..n]);
+        }
         if (after_b + 2 <= self.buf.items.len and
             std.mem.eql(u8, self.buf.items[after_b .. after_b + 2], "--"))
         {
@@ -363,7 +391,7 @@ test "mime.multipart Writer and Reader roundtrip" {
     var out_buf = bytes_mod.Buffer.init(testing.allocator);
     defer out_buf.deinit();
 
-    var w = Writer.init(testing.allocator, out_buf.writer());
+    var w = Writer.init(testing.allocator, testing.io, out_buf.writer());
     try w.setBoundary("my-custom-boundary-12345");
 
     var ct_buf: [128]u8 = undefined;
@@ -407,4 +435,55 @@ test "mime.multipart Writer and Reader roundtrip" {
     // Part 3: EOF
     const part3 = try r.nextPart();
     try testing.expect(part3 == null);
+}
+
+test "mime.multipart initWithBoundary and split boundary reads" {
+    const testing = std.testing;
+
+    var out_buf = bytes_mod.Buffer.init(testing.allocator);
+    defer out_buf.deinit();
+
+    var w = try Writer.initWithBoundary(testing.allocator, out_buf.writer(), "B123");
+    try w.writeField("k", "v");
+    try w.close();
+
+    // Custom 1-byte-at-a-time reader to split right before "\r\n" and "--" after "--B123"
+    const OneByteReader = struct {
+        data: []const u8,
+        pos: usize = 0,
+        r: std.Io.Reader = undefined,
+
+        fn stream(
+            rd: *std.Io.Reader,
+            dst: *std.Io.Writer,
+            limit: std.Io.Limit,
+        ) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("r", rd));
+            if (self.pos >= self.data.len) return error.EndOfStream;
+            if (@backingInt(limit) == 0) return 0;
+            dst.writeByte(self.data[self.pos]) catch return error.WriteFailed;
+            self.pos += 1;
+            return 1;
+        }
+    };
+
+    var one = OneByteReader{ .data = out_buf.bytes() };
+    one.r = .{
+        .buffer = &.{},
+        .seek = 0,
+        .end = 0,
+        .vtable = &.{ .stream = OneByteReader.stream },
+    };
+
+    var r = Reader.init(testing.allocator, &one.r, "B123");
+    defer r.deinit();
+
+    var p1 = (try r.nextPart()).?;
+    defer p1.deinit();
+    try testing.expectEqualStrings("k", p1.formName().?);
+    var vbuf: [16]u8 = undefined;
+    const vn = try p1.read(&vbuf);
+    try testing.expectEqualStrings("v", vbuf[0..vn]);
+
+    try testing.expect((try r.nextPart()) == null);
 }

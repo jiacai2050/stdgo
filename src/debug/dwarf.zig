@@ -190,23 +190,27 @@ pub fn readUleb128(data: []const u8, pos: *usize) error{ UnexpectedEof, Overflow
 
 /// ReadSleb128 decodes a signed LEB128 integer from data at pos.
 pub fn readSleb128(data: []const u8, pos: *usize) error{ UnexpectedEof, Overflow }!i64 {
-    var result: i64 = 0;
+    var result: u64 = 0;
     var shift: usize = 0;
     var b: u8 = 0;
     while (true) {
         if (pos.* >= data.len) return error.UnexpectedEof;
         b = data[pos.*];
         pos.* += 1;
-        const slice: i64 = @intCast(b & 0x7f);
-        if (shift >= 64 or (shift == 63 and slice > 1)) return error.Overflow;
+        if (shift == 63) {
+            if (b != 0x00 and b != 0x7f) return error.Overflow;
+        } else if (shift >= 64) {
+            return error.Overflow;
+        }
+        const slice: u64 = b & 0x7f;
         result |= slice << @as(u6, @intCast(shift));
         shift += 7;
         if ((b & 0x80) == 0) break;
     }
     if (shift < 64 and (b & 0x40) != 0) {
-        result |= -(@as(i64, 1) << @as(u6, @intCast(shift)));
+        result |= (~@as(u64, 0)) << @as(u6, @intCast(shift));
     }
-    return result;
+    return @bitCast(result);
 }
 
 pub const Value = union(enum) {
@@ -366,7 +370,7 @@ pub const Data = struct {
         var cur_pos: usize = 0;
         while (cur_pos < sec.info.len) {
             const start_cu = cur_pos;
-            if (cur_pos + 4 > sec.info.len) break;
+            if (sec.info.len - cur_pos < 4) break;
 
             const len32 = mem.readInt(u32, sec.info[cur_pos..][0..4], endian);
             cur_pos += 4;
@@ -374,16 +378,16 @@ pub const Data = struct {
             var cu_len: u64 = len32;
             var cu_is_64 = false;
             if (len32 == 0xffffffff) {
-                if (cur_pos + 8 > sec.info.len) return error.UnexpectedEof;
+                if (sec.info.len - cur_pos < 8) return error.UnexpectedEof;
                 cu_len = mem.readInt(u64, sec.info[cur_pos..][0..8], endian);
                 cur_pos += 8;
                 cu_is_64 = true;
             }
 
-            if (cur_pos + cu_len > sec.info.len) return error.UnexpectedEof;
-            const cu_end = cur_pos + cu_len;
+            if (cu_len > sec.info.len - cur_pos) return error.UnexpectedEof;
+            const cu_end = cur_pos + @as(usize, @intCast(cu_len));
 
-            if (cur_pos + 2 > cu_end) return error.UnexpectedEof;
+            if (cu_end - cur_pos < 2) return error.UnexpectedEof;
             const vers = mem.readInt(u16, sec.info[cur_pos..][0..2], endian);
             cur_pos += 2;
 
@@ -391,27 +395,27 @@ pub const Data = struct {
             var addr_sz: u8 = 4;
 
             if (vers >= 5) {
-                if (cur_pos + 2 > cu_end) return error.UnexpectedEof;
+                if (cu_end - cur_pos < 2) return error.UnexpectedEof;
                 _ = sec.info[cur_pos]; // unit_type
                 addr_sz = sec.info[cur_pos + 1];
                 cur_pos += 2;
 
                 if (cu_is_64) {
-                    if (cur_pos + 8 > cu_end) return error.UnexpectedEof;
+                    if (cu_end - cur_pos < 8) return error.UnexpectedEof;
                     abbrev_off = mem.readInt(u64, sec.info[cur_pos..][0..8], endian);
                     cur_pos += 8;
                 } else {
-                    if (cur_pos + 4 > cu_end) return error.UnexpectedEof;
+                    if (cu_end - cur_pos < 4) return error.UnexpectedEof;
                     abbrev_off = mem.readInt(u32, sec.info[cur_pos..][0..4], endian);
                     cur_pos += 4;
                 }
             } else {
                 if (cu_is_64) {
-                    if (cur_pos + 8 > cu_end) return error.UnexpectedEof;
+                    if (cu_end - cur_pos < 8) return error.UnexpectedEof;
                     abbrev_off = mem.readInt(u64, sec.info[cur_pos..][0..8], endian);
                     cur_pos += 8;
                 } else {
-                    if (cur_pos + 4 > cu_end) return error.UnexpectedEof;
+                    if (cu_end - cur_pos < 4) return error.UnexpectedEof;
                     abbrev_off = mem.readInt(u32, sec.info[cur_pos..][0..4], endian);
                     cur_pos += 4;
                 }
@@ -462,8 +466,10 @@ pub const Data = struct {
         while (pos < data.len) {
             const code_u64 = try readUleb128(data, &pos);
             if (code_u64 == 0) break; // Table end
+            const code = std.math.cast(u32, code_u64) orelse return error.Overflow;
 
             const tag_u64 = try readUleb128(data, &pos);
+            const tag = std.math.cast(u32, tag_u64) orelse return error.Overflow;
             if (pos >= data.len) return error.UnexpectedEof;
             const children = (data[pos] != 0);
             pos += 1;
@@ -476,24 +482,34 @@ pub const Data = struct {
                 const form_id = try readUleb128(data, &pos);
                 if (attr_id == 0 and form_id == 0) break;
 
+                const attr_u32 = std.math.cast(u32, attr_id) orelse return error.Overflow;
+                const form_u32 = std.math.cast(u32, form_id) orelse return error.Overflow;
+
                 var implicit_val: i64 = 0;
-                if (form_id == FormImplicitConst) {
+                if (form_u32 == FormImplicitConst) {
                     implicit_val = try readSleb128(data, &pos);
                 }
 
                 try attr_list.append(self.allocator, AttrSpec{
-                    .attr = @intCast(attr_id),
-                    .form = @intCast(form_id),
+                    .attr = attr_u32,
+                    .form = form_u32,
                     .val = implicit_val,
                 });
             }
 
-            try table.abbrevs.put(@intCast(code_u64), Abbrev{
-                .code = @intCast(code_u64),
-                .tag = @intCast(tag_u64),
+            const attrs = try attr_list.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(attrs);
+
+            const gop = try table.abbrevs.getOrPut(code);
+            if (gop.found_existing) {
+                self.allocator.free(gop.value_ptr.attrs);
+            }
+            gop.value_ptr.* = Abbrev{
+                .code = code,
+                .tag = tag,
                 .children = children,
-                .attrs = try attr_list.toOwnedSlice(self.allocator),
-            });
+                .attrs = attrs,
+            };
         }
 
         return table;
@@ -581,7 +597,10 @@ pub const Reader = struct {
             }
 
             const abbrev_tab = try self.ensureUnitAbbrevs();
-            const abbrev = abbrev_tab.abbrevs.get(@intCast(code_u64)) orelse {
+            const code_u32 = std.math.cast(u32, code_u64) orelse {
+                return error.UnknownAbbreviationCode;
+            };
+            const abbrev = abbrev_tab.abbrevs.get(code_u32) orelse {
                 return error.UnknownAbbreviationCode;
             };
 
@@ -629,18 +648,20 @@ pub const Reader = struct {
         var form = spec.form;
 
         while (form == FormIndirect) {
-            form = @intCast(try readUleb128(u.data, &self.unit_pos));
+            form = std.math.cast(u32, try readUleb128(u.data, &self.unit_pos)) orelse {
+                return error.UnsupportedDwarfForm;
+            };
         }
 
         switch (form) {
             FormAddr => {
                 if (u.address_size == 8) {
-                    if (self.unit_pos + 8 > u.data.len) return error.UnexpectedEof;
+                    if (u.data.len - self.unit_pos < 8) return error.UnexpectedEof;
                     const v = mem.readInt(u64, u.data[self.unit_pos..][0..8], endian);
                     self.unit_pos += 8;
                     return Value{ .addr = v };
                 } else {
-                    if (self.unit_pos + 4 > u.data.len) return error.UnexpectedEof;
+                    if (u.data.len - self.unit_pos < 4) return error.UnexpectedEof;
                     const v = mem.readInt(u32, u.data[self.unit_pos..][0..4], endian);
                     self.unit_pos += 4;
                     return Value{ .addr = v };
@@ -650,33 +671,33 @@ pub const Reader = struct {
                 if (self.unit_pos >= u.data.len) return error.UnexpectedEof;
                 const len = u.data[self.unit_pos];
                 self.unit_pos += 1;
-                if (self.unit_pos + len > u.data.len) return error.UnexpectedEof;
+                if (len > u.data.len - self.unit_pos) return error.UnexpectedEof;
                 const slice = u.data[self.unit_pos .. self.unit_pos + len];
                 self.unit_pos += len;
                 return Value{ .bytes = slice };
             },
             FormBlock2 => {
-                if (self.unit_pos + 2 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 2) return error.UnexpectedEof;
                 const len = mem.readInt(u16, u.data[self.unit_pos..][0..2], endian);
                 self.unit_pos += 2;
-                if (self.unit_pos + len > u.data.len) return error.UnexpectedEof;
+                if (len > u.data.len - self.unit_pos) return error.UnexpectedEof;
                 const slice = u.data[self.unit_pos .. self.unit_pos + len];
                 self.unit_pos += len;
                 return Value{ .bytes = slice };
             },
             FormBlock4 => {
-                if (self.unit_pos + 4 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 4) return error.UnexpectedEof;
                 const len = mem.readInt(u32, u.data[self.unit_pos..][0..4], endian);
                 self.unit_pos += 4;
-                if (self.unit_pos + len > u.data.len) return error.UnexpectedEof;
+                if (len > u.data.len - self.unit_pos) return error.UnexpectedEof;
                 const slice = u.data[self.unit_pos .. self.unit_pos + len];
                 self.unit_pos += len;
                 return Value{ .bytes = slice };
             },
             FormBlock, FormExprloc => {
                 const len = try readUleb128(u.data, &self.unit_pos);
-                const usize_len: usize = @intCast(len);
-                if (self.unit_pos + usize_len > u.data.len) return error.UnexpectedEof;
+                const usize_len = std.math.cast(usize, len) orelse return error.UnexpectedEof;
+                if (usize_len > u.data.len - self.unit_pos) return error.UnexpectedEof;
                 const slice = u.data[self.unit_pos .. self.unit_pos + usize_len];
                 self.unit_pos += usize_len;
                 return Value{ .bytes = slice };
@@ -688,19 +709,19 @@ pub const Reader = struct {
                 return Value{ .uint = v };
             },
             FormData2 => {
-                if (self.unit_pos + 2 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 2) return error.UnexpectedEof;
                 const v = mem.readInt(u16, u.data[self.unit_pos..][0..2], endian);
                 self.unit_pos += 2;
                 return Value{ .uint = v };
             },
             FormData4 => {
-                if (self.unit_pos + 4 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 4) return error.UnexpectedEof;
                 const v = mem.readInt(u32, u.data[self.unit_pos..][0..4], endian);
                 self.unit_pos += 4;
                 return Value{ .uint = v };
             },
             FormData8 => {
-                if (self.unit_pos + 8 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 8) return error.UnexpectedEof;
                 const v = mem.readInt(u64, u.data[self.unit_pos..][0..8], endian);
                 self.unit_pos += 8;
                 return Value{ .uint = v };
@@ -735,11 +756,11 @@ pub const Reader = struct {
             FormStrp => {
                 var str_offset: u64 = 0;
                 if (u.is_64) {
-                    if (self.unit_pos + 8 > u.data.len) return error.UnexpectedEof;
+                    if (u.data.len - self.unit_pos < 8) return error.UnexpectedEof;
                     str_offset = mem.readInt(u64, u.data[self.unit_pos..][0..8], endian);
                     self.unit_pos += 8;
                 } else {
-                    if (self.unit_pos + 4 > u.data.len) return error.UnexpectedEof;
+                    if (u.data.len - self.unit_pos < 4) return error.UnexpectedEof;
                     str_offset = mem.readInt(u32, u.data[self.unit_pos..][0..4], endian);
                     self.unit_pos += 4;
                 }
@@ -754,38 +775,38 @@ pub const Reader = struct {
                 if (self.unit_pos >= u.data.len) return error.UnexpectedEof;
                 const v = u.data[self.unit_pos];
                 self.unit_pos += 1;
-                return Value{ .reference = u.offset + v };
+                return Value{ .reference = std.math.add(u64, u.offset, v) catch return error.Overflow };
             },
             FormRef2 => {
-                if (self.unit_pos + 2 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 2) return error.UnexpectedEof;
                 const v = mem.readInt(u16, u.data[self.unit_pos..][0..2], endian);
                 self.unit_pos += 2;
-                return Value{ .reference = u.offset + v };
+                return Value{ .reference = std.math.add(u64, u.offset, v) catch return error.Overflow };
             },
             FormRef4 => {
-                if (self.unit_pos + 4 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 4) return error.UnexpectedEof;
                 const v = mem.readInt(u32, u.data[self.unit_pos..][0..4], endian);
                 self.unit_pos += 4;
-                return Value{ .reference = u.offset + v };
+                return Value{ .reference = std.math.add(u64, u.offset, v) catch return error.Overflow };
             },
             FormRef8 => {
-                if (self.unit_pos + 8 > u.data.len) return error.UnexpectedEof;
+                if (u.data.len - self.unit_pos < 8) return error.UnexpectedEof;
                 const v = mem.readInt(u64, u.data[self.unit_pos..][0..8], endian);
                 self.unit_pos += 8;
-                return Value{ .reference = u.offset + v };
+                return Value{ .reference = std.math.add(u64, u.offset, v) catch return error.Overflow };
             },
             FormRefUdata => {
                 const v = try readUleb128(u.data, &self.unit_pos);
-                return Value{ .reference = u.offset + v };
+                return Value{ .reference = std.math.add(u64, u.offset, v) catch return error.Overflow };
             },
             FormRefAddr, FormSecOffset => {
                 if (u.is_64) {
-                    if (self.unit_pos + 8 > u.data.len) return error.UnexpectedEof;
+                    if (u.data.len - self.unit_pos < 8) return error.UnexpectedEof;
                     const v = mem.readInt(u64, u.data[self.unit_pos..][0..8], endian);
                     self.unit_pos += 8;
                     return Value{ .reference = v };
                 } else {
-                    if (self.unit_pos + 4 > u.data.len) return error.UnexpectedEof;
+                    if (u.data.len - self.unit_pos < 4) return error.UnexpectedEof;
                     const v = mem.readInt(u32, u.data[self.unit_pos..][0..4], endian);
                     self.unit_pos += 4;
                     return Value{ .reference = v };
@@ -827,6 +848,12 @@ test "dwarf leb128 encoding and decoding" {
         .{ .val = 63, .bytes = &[_]u8{0x3f} },
         .{ .val = -64, .bytes = &[_]u8{0x40} },
         .{ .val = -624485, .bytes = &[_]u8{ 0x9b, 0xf1, 0x59 } },
+        .{ .val = std.math.minInt(i64), .bytes = &[_]u8{
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f,
+        } },
+        .{ .val = std.math.maxInt(i64), .bytes = &[_]u8{
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+        } },
     };
 
     for (sleb_cases) |tc| {

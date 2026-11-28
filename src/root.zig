@@ -378,6 +378,7 @@ test {
     _ = log;
     _ = os;
     _ = html;
+    _ = strconv;
     _ = database;
     _ = bufio;
     _ = unicode;

@@ -1,11 +1,80 @@
 const std = @import("std");
 const io_mod = @import("../io.zig");
 const bytes_mod = @import("../bytes.zig");
+const Mutex = @import("../sync/mutex.zig").Mutex;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Child = std.process.Child;
 
 pub const Error = anyerror;
+
+fn pumpStdin(task_io: Io, in_file: std.Io.File, r_in: *io_mod.Reader) anyerror!void {
+    defer in_file.close(task_io);
+    var w_scratch: [2048]u8 = undefined;
+    var file_w = in_file.writerStreaming(task_io, &w_scratch);
+    _ = try io_mod.copy(&file_w.interface, r_in);
+    try file_w.interface.flush();
+}
+
+fn pumpOutput(task_io: Io, out_file: std.Io.File, w_out: *io_mod.Writer) anyerror!void {
+    defer out_file.close(task_io);
+    var r_scratch: [2048]u8 = undefined;
+    var file_r = out_file.readerStreaming(task_io, &r_scratch);
+    var chunk: [2048]u8 = undefined;
+    while (true) {
+        const n = try file_r.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        try w_out.writeAll(chunk[0..n]);
+    }
+    try w_out.flush();
+}
+
+const LockedWriter = struct {
+    mu: *Mutex,
+    inner: *io_mod.Writer,
+    buf: [2048]u8 = undefined,
+    writer_inst: std.Io.Writer = undefined,
+
+    fn writer(self: *LockedWriter) *io_mod.Writer {
+        self.writer_inst = .{
+            .buffer = &self.buf,
+            .end = 0,
+            .vtable = &.{
+                .drain = drainImpl,
+            },
+        };
+        return &self.writer_inst;
+    }
+
+    fn drainImpl(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *LockedWriter = @alignCast(@fieldParentPtr("writer_inst", w));
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (w.end > 0) {
+            try self.inner.writeAll(w.buffer[0..w.end]);
+            w.end = 0;
+        }
+        var total: usize = 0;
+        if (data.len > 1) {
+            for (data[0 .. data.len - 1]) |chunk| {
+                try self.inner.writeAll(chunk);
+                total += chunk.len;
+            }
+        }
+        if (data.len > 0) {
+            const last = data[data.len - 1];
+            for (0..splat) |_| {
+                try self.inner.writeAll(last);
+                total += last.len;
+            }
+        }
+        return total;
+    }
+};
 
 /// Cmd represents an external command being prepared or run.
 pub const Cmd = struct {
@@ -51,41 +120,67 @@ pub const Cmd = struct {
         });
         errdefer child.kill(io);
 
-        // Pipe stdin if provided
+        // Pump stdin, stdout, and stderr concurrently to avoid pipe buffer deadlocks.
+        var stdin_fut: ?Io.Future(anyerror!void) = null;
+        var stdout_fut: ?Io.Future(anyerror!void) = null;
+        var stderr_fut: ?Io.Future(anyerror!void) = null;
+
+        defer {
+            if (stdin_fut) |*f| _ = f.cancel(io) catch {};
+            if (stdout_fut) |*f| _ = f.cancel(io) catch {};
+            if (stderr_fut) |*f| _ = f.cancel(io) catch {};
+        }
+
         if (self.stdin) |r_in| {
-            if (child.stdin) |*in_file| {
-                var w_scratch: [2048]u8 = undefined;
-                var file_w = in_file.writerStreaming(io, &w_scratch);
-                _ = try io_mod.copy(&file_w.interface, r_in);
-                try file_w.interface.flush();
-                in_file.close(io);
+            if (child.stdin) |in_file| {
                 child.stdin = null;
+                stdin_fut = io.concurrent(pumpStdin, .{ io, in_file, r_in }) catch |err| {
+                    in_file.close(io);
+                    return err;
+                };
             }
         }
 
-        // Pipe stdout if provided
         if (self.stdout) |w_out| {
-            if (child.stdout) |*out_file| {
-                var r_scratch: [2048]u8 = undefined;
-                var file_r = out_file.readerStreaming(io, &r_scratch);
-                _ = try io_mod.copy(w_out, &file_r.interface);
-                try w_out.flush();
-                out_file.close(io);
+            if (child.stdout) |out_file| {
                 child.stdout = null;
+                stdout_fut = io.concurrent(pumpOutput, .{ io, out_file, w_out }) catch |err| {
+                    out_file.close(io);
+                    return err;
+                };
             }
         }
 
-        // Pipe stderr if provided
         if (self.stderr) |w_err| {
-            if (child.stderr) |*err_file| {
-                var r_scratch: [2048]u8 = undefined;
-                var file_r = err_file.readerStreaming(io, &r_scratch);
-                _ = try io_mod.copy(w_err, &file_r.interface);
-                try w_err.flush();
-                err_file.close(io);
+            if (child.stderr) |err_file| {
                 child.stderr = null;
+                stderr_fut = io.concurrent(pumpOutput, .{ io, err_file, w_err }) catch |err| {
+                    err_file.close(io);
+                    return err;
+                };
             }
         }
+
+        var pump_err: ?anyerror = null;
+        if (stdin_fut) |*f| {
+            if (f.await(io)) |_| {} else |err| {
+                if (pump_err == null) pump_err = err;
+            }
+            stdin_fut = null;
+        }
+        if (stdout_fut) |*f| {
+            if (f.await(io)) |_| {} else |err| {
+                if (pump_err == null) pump_err = err;
+            }
+            stdout_fut = null;
+        }
+        if (stderr_fut) |*f| {
+            if (f.await(io)) |_| {} else |err| {
+                if (pump_err == null) pump_err = err;
+            }
+            stderr_fut = null;
+        }
+        if (pump_err) |err| return err;
 
         const term = blk: {
             const previous = io.swapCancelProtection(.blocked);
@@ -107,6 +202,7 @@ pub const Cmd = struct {
         errdefer out_buf.deinit();
 
         self.stdout = out_buf.writer();
+        defer self.stdout = null;
         _ = try self.run(io);
 
         return try out_buf.toOwnedSlice();
@@ -117,8 +213,17 @@ pub const Cmd = struct {
         var combined_buf = bytes_mod.Buffer.init(self.allocator);
         errdefer combined_buf.deinit();
 
-        self.stdout = combined_buf.writer();
-        self.stderr = combined_buf.writer();
+        var mu: Mutex = .{};
+        const inner_w = combined_buf.writer();
+        var out_locked = LockedWriter{ .mu = &mu, .inner = inner_w };
+        var err_locked = LockedWriter{ .mu = &mu, .inner = inner_w };
+
+        self.stdout = out_locked.writer();
+        self.stderr = err_locked.writer();
+        defer {
+            self.stdout = null;
+            self.stderr = null;
+        }
         _ = try self.run(io);
 
         return try combined_buf.toOwnedSlice();
@@ -180,4 +285,34 @@ test "os.exec: task cancellation" {
     var future = try io.concurrent(Worker.run, .{ &cmd, io, &started });
     try started.wait(io);
     try testing.expectError(error.Canceled, future.cancel(io));
+}
+
+test "os.exec: concurrent large stdin/stdout and combinedOutput clears pointers" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    // 128 KiB exceeds typical OS pipe buffer (64 KiB), verifying concurrent pumping avoids deadlock.
+    const payload = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'Z');
+
+    var r = bytes_mod.Reader.init(payload);
+    const argv = [_][]const u8{"cat"};
+    var cmd = command(testing.allocator, &argv);
+    cmd.stdin = r.reader();
+
+    const out = try cmd.output(io);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(payload.len, out.len);
+    try testing.expect(cmd.stdout == null);
+
+    // Verify combinedOutput captures both stdout and stderr and clears pointers.
+    const sh_argv = [_][]const u8{ "sh", "-c", "echo out_msg; echo err_msg >&2" };
+    var sh_cmd = command(testing.allocator, &sh_argv);
+    const combined = try sh_cmd.combinedOutput(io);
+    defer testing.allocator.free(combined);
+    try testing.expect(std.mem.indexOf(u8, combined, "out_msg") != null);
+    try testing.expect(std.mem.indexOf(u8, combined, "err_msg") != null);
+    try testing.expect(sh_cmd.stdout == null);
+    try testing.expect(sh_cmd.stderr == null);
 }

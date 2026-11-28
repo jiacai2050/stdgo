@@ -29,9 +29,13 @@ pub const DirEntry = struct {
 
 /// File represents an open file descriptor.
 pub const File = struct {
+    const ActiveMode = enum { none, read, write };
+
     handle: StdFile,
     io: Io,
     name: []const u8,
+    pos: u64 = 0,
+    active_mode: ActiveMode = .none,
     r_buffer: [4096]u8 = undefined,
     w_buffer: [4096]u8 = undefined,
     reader_inst: StdFile.Reader = undefined,
@@ -40,11 +44,14 @@ pub const File = struct {
     writer_init: bool = false,
     closed: bool = false,
 
+    /// Initializes a File wrapper around an open std.Io.File handle.
     pub fn init(handle: StdFile, io: Io, name: []const u8) File {
         return .{
             .handle = handle,
             .io = io,
             .name = name,
+            .pos = 0,
+            .active_mode = .none,
             .reader_init = false,
             .writer_init = false,
             .closed = false,
@@ -55,8 +62,10 @@ pub const File = struct {
     pub fn reader(self: *File) *io_mod.Reader {
         if (!self.reader_init) {
             self.reader_inst = self.handle.reader(self.io, &self.r_buffer);
+            self.reader_inst.pos = self.pos;
             self.reader_init = true;
         }
+        self.active_mode = .read;
         return &self.reader_inst.interface;
     }
 
@@ -64,19 +73,47 @@ pub const File = struct {
     pub fn writer(self: *File) *io_mod.Writer {
         if (!self.writer_init) {
             self.writer_inst = self.handle.writer(self.io, &self.w_buffer);
+            self.writer_inst.pos = self.pos;
             self.writer_init = true;
         }
+        self.active_mode = .write;
         return &self.writer_inst.interface;
     }
 
     /// Read reads up to buf.len bytes into buf.
     pub fn read(self: *File, buf: []u8) !usize {
-        return self.reader().readSliceShort(buf);
+        if (self.writer_init) {
+            try self.writer_inst.interface.flush();
+            if (self.active_mode == .write) {
+                self.pos = self.writer_inst.logicalPos();
+            }
+            if (self.reader_init and self.reader_inst.logicalPos() != self.pos) {
+                self.reader_inst.size = null;
+                try self.reader_inst.seekTo(self.pos);
+            }
+        }
+        const n = try self.reader().readSliceShort(buf);
+        self.pos = self.reader_inst.logicalPos();
+        if (self.writer_init) {
+            try self.writer_inst.seekTo(self.pos);
+        }
+        return n;
     }
 
     /// Write writes len(b) bytes to the File.
     pub fn write(self: *File, b: []const u8) !usize {
+        if (self.reader_init and self.active_mode == .read) {
+            self.pos = self.reader_inst.logicalPos();
+            if (self.writer_init and self.writer_inst.logicalPos() != self.pos) {
+                try self.writer_inst.seekTo(self.pos);
+            }
+        }
         try self.writer().writeAll(b);
+        self.pos = self.writer_inst.logicalPos();
+        if (self.reader_init) {
+            self.reader_inst.size = null;
+            try self.reader_inst.seekTo(self.pos);
+        }
         return b.len;
     }
 
@@ -89,32 +126,48 @@ pub const File = struct {
     pub fn seek(self: *File, offset: i64, whence: io_mod.SeekWhence) !u64 {
         if (self.writer_init) {
             try self.writer_inst.interface.flush();
-            self.writer_init = false;
+            if (self.active_mode == .write) {
+                self.pos = self.writer_inst.logicalPos();
+            }
         }
-        const r_stream = self.reader();
-        _ = r_stream;
-        switch (whence) {
-            .start => {
+        if (self.reader_init and self.active_mode == .read) {
+            self.pos = self.reader_inst.logicalPos();
+        }
+
+        const new_pos: u64 = switch (whence) {
+            .start => blk: {
                 if (offset < 0) return error.InvalidArgument;
-                try self.reader_inst.seekTo(@intCast(offset));
-                return @intCast(offset);
+                break :blk @intCast(offset);
             },
-            .current => {
-                try self.reader_inst.seekBy(offset);
-                return self.reader_inst.logicalPos();
+            .current => blk: {
+                const target = @as(i64, @intCast(self.pos)) + offset;
+                if (target < 0) return error.InvalidArgument;
+                break :blk @intCast(target);
             },
-            .end => {
+            .end => blk: {
                 const st = try self.handle.stat(self.io);
                 const target = @as(i64, @intCast(st.size)) + offset;
                 if (target < 0) return error.InvalidArgument;
-                try self.reader_inst.seekTo(@intCast(target));
-                return @intCast(target);
+                break :blk @intCast(target);
             },
+        };
+
+        self.pos = new_pos;
+        if (self.reader_init) {
+            self.reader_inst.size = null;
+            try self.reader_inst.seekTo(new_pos);
         }
+        if (self.writer_init) {
+            try self.writer_inst.seekTo(new_pos);
+        }
+        return new_pos;
     }
 
     /// Stat returns the FileInfo structure describing file.
     pub fn stat(self: *File) !FileInfo {
+        if (self.writer_init) {
+            try self.writer_inst.interface.flush();
+        }
         const st = try self.handle.stat(self.io);
         return FileInfo{
             .name = self.name,
@@ -129,7 +182,13 @@ pub const File = struct {
     pub fn sync(self: *File) !void {
         if (self.writer_init) {
             try self.writer_inst.interface.flush();
-            self.writer_init = false;
+            if (self.active_mode == .write) {
+                self.pos = self.writer_inst.logicalPos();
+            }
+            if (self.reader_init) {
+                self.reader_inst.size = null;
+                try self.reader_inst.seekTo(self.pos);
+            }
         }
         try self.handle.sync(self.io);
     }
@@ -249,6 +308,7 @@ pub fn readDir(allocator: Allocator, io: Io, path: []const u8) ![]DirEntry {
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         const owned_name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(owned_name);
         try list.append(allocator, .{
             .name = owned_name,
             .is_dir = entry.kind == .directory,
@@ -256,7 +316,13 @@ pub fn readDir(allocator: Allocator, io: Io, path: []const u8) ![]DirEntry {
         });
     }
 
-    return try list.toOwnedSlice(allocator);
+    const slice = try list.toOwnedSlice(allocator);
+    std.mem.sort(DirEntry, slice, {}, struct {
+        fn lessThan(_: void, a: DirEntry, b: DirEntry) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+    return slice;
 }
 
 /// Stdin returns a File connected to standard input.
@@ -402,4 +468,49 @@ test "os.file: create, write, seek, read, remove" {
     try testing.expect(!isNotExist(error.AccessDenied));
     try testing.expect(isPermission(error.AccessDenied));
     try testing.expect(isExist(error.PathAlreadyExists));
+}
+
+test "os.file: sync preserves write offset and readDir sorts entries" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    const test_dir = "test_os_sync_sort_dir";
+    mkdirAll(io, test_dir, 0o755) catch {};
+    defer removeAll(io, test_dir) catch {};
+
+    const p = test_dir ++ "/b_file.txt";
+    var f = try create(io, p);
+    defer _ = f.close() catch {};
+
+    _ = try f.write("hello ");
+    try f.sync();
+    _ = try f.write("world");
+    try f.sync();
+
+    _ = try f.seek(0, .start);
+    var buf: [32]u8 = undefined;
+    const n = try f.read(&buf);
+    try testing.expectEqualStrings("hello world", buf[0..n]);
+
+    // Seek back and overwrite part of file
+    _ = try f.seek(6, .start);
+    _ = try f.write("zig!!");
+    try f.sync();
+    _ = try f.seek(0, .start);
+    const n2 = try f.read(&buf);
+    try testing.expectEqualStrings("hello zig!!", buf[0..n2]);
+
+    // Create additional files to verify readDir lexicographical sorting
+    try writeFile(io, test_dir ++ "/c_file.txt", "c", 0o644);
+    try writeFile(io, test_dir ++ "/a_file.txt", "a", 0o644);
+
+    const entries = try readDir(testing.allocator, io, test_dir);
+    defer {
+        for (entries) |e| testing.allocator.free(e.name);
+        testing.allocator.free(entries);
+    }
+    try testing.expectEqual(@as(usize, 3), entries.len);
+    try testing.expectEqualStrings("a_file.txt", entries[0].name);
+    try testing.expectEqualStrings("b_file.txt", entries[1].name);
+    try testing.expectEqualStrings("c_file.txt", entries[2].name);
 }

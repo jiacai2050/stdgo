@@ -66,18 +66,24 @@ pub const MIMEHeader = struct {
     /// associated with key.
     pub fn add(self: *MIMEHeader, key: []const u8, value: []const u8) !void {
         const c_key = try canonicalMIMEHeaderKey(self.allocator, key);
-        errdefer self.allocator.free(c_key);
+        var owns_key = true;
+        errdefer if (owns_key) self.allocator.free(c_key);
 
         const val_copy = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(val_copy);
 
         const gop = try self.entries.getOrPut(c_key);
         if (gop.found_existing) {
-            self.allocator.free(c_key); // Key already exists
+            self.allocator.free(c_key);
+            owns_key = false;
             try gop.value_ptr.append(self.allocator, val_copy);
         } else {
             gop.value_ptr.* = std.ArrayList([]const u8).empty;
-            try gop.value_ptr.append(self.allocator, val_copy);
+            gop.value_ptr.append(self.allocator, val_copy) catch |err| {
+                _ = self.entries.remove(c_key);
+                return err;
+            };
+            owns_key = false;
         }
     }
 
@@ -185,6 +191,7 @@ pub const Reader = struct {
     /// Peeks at the byte after each line, so r must have a buffer of at least one byte.
     pub fn readContinuedLine(self: *Reader) anyerror!?[]u8 {
         const first = try self.readLine() orelse return null;
+        if (first.len == 0) return first;
         var full = bytes.Buffer.init(self.allocator);
         errdefer full.deinit();
         _ = try full.write(first);
@@ -231,7 +238,7 @@ pub const Reader = struct {
 
         var header_count: usize = 0;
         while (header_count < headers_count_max) : (header_count += 1) {
-            const line = try self.readLine() orelse break;
+            const line = try self.readContinuedLine() orelse break;
             defer self.allocator.free(line);
 
             if (line.len == 0) {
@@ -467,4 +474,29 @@ test "Writer: writeLine and dotWriter" {
         "250 OK\r\n";
 
     try testing.expectEqualStrings(expected, buf.string());
+}
+
+test "Reader: readMIMEHeader handles RFC 5322 folded headers" {
+    const testing = std.testing;
+    const raw =
+        "Subject: hello\r\n" ++
+        " folded\r\n" ++
+        "\tvalue\r\n" ++
+        "From: alice@example.com\r\n" ++
+        "\r\n" ++
+        " body starting with space";
+
+    var r = @import("../bytes/reader.zig").Reader.init(raw);
+    var tp_reader = Reader.init(testing.allocator, r.reader());
+
+    var hdr = try tp_reader.readMIMEHeader();
+    defer hdr.deinit();
+
+    try testing.expectEqualStrings("hello folded value", hdr.get("Subject").?);
+    try testing.expectEqualStrings("alice@example.com", hdr.get("From").?);
+
+    // Body line starting with space must remain unread after blank line.
+    const body = (try tp_reader.readLine()).?;
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings(" body starting with space", body);
 }

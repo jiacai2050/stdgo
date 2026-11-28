@@ -17,6 +17,7 @@ pub fn Ring(comptime T: type) type {
             r.next_ptr = r;
             r.prev_ptr = r;
             r.value = undefined;
+            errdefer r.deinit(allocator);
 
             var p = r;
             var i: usize = 1;
@@ -51,16 +52,18 @@ pub fn Ring(comptime T: type) type {
             return self.prev_ptr;
         }
 
+        /// Move moves n % r.len() elements backward (n < 0) or forward (n >= 0) in the ring.
         pub fn move(self: *Self, n: i64) *Self {
             var r = self;
+            const steps: u64 = @abs(n) % self.len();
             if (n > 0) {
-                var i: i64 = 0;
-                while (i < n) : (i += 1) {
+                var i: u64 = 0;
+                while (i < steps) : (i += 1) {
                     r = r.next_ptr;
                 }
             } else if (n < 0) {
-                var i: i64 = 0;
-                while (i < -n) : (i += 1) {
+                var i: u64 = 0;
+                while (i < steps) : (i += 1) {
                     r = r.prev_ptr;
                 }
             }
@@ -80,9 +83,17 @@ pub fn Ring(comptime T: type) type {
         }
 
         /// Unlink removes n % r.len() elements from the ring r, starting at r.next().
+        /// If n % r.len() == 0, r remains unchanged and self is returned.
         pub fn unlink(self: *Self, n: usize) *Self {
-            if (n == 0) return self;
-            return self.link(self.move(@as(i64, @intCast(n)) + 1));
+            const l = self.len();
+            const k = n % l;
+            if (k == 0) return self;
+            var target = self;
+            var i: usize = 0;
+            while (i <= k) : (i += 1) {
+                target = target.next_ptr;
+            }
+            return self.link(target);
         }
 
         /// Len computes the number of elements in ring r.
@@ -115,4 +126,11 @@ test "container.Ring basic cycle and link" {
     try testing.expectEqual(@as(i32, 1), r.value);
     try testing.expectEqual(@as(i32, 2), r.next().value);
     try testing.expectEqual(@as(i32, 3), r.prev().value);
+
+    // minInt(i64) move must not overflow
+    try testing.expectEqual(@as(i32, 2), r.move(std.math.minInt(i64)).value);
+
+    // unlink with n % len == 0 leaves ring unchanged
+    try testing.expectEqual(r, r.unlink(3));
+    try testing.expectEqual(@as(usize, 3), r.len());
 }

@@ -106,11 +106,18 @@ pub const Encoding = struct {
         return buf;
     }
 
+    /// Decodes `src` into `dst`, returning the number of bytes written.
+    /// In padded mode, `src.len` must be a multiple of 4 and trailing padding must be valid.
     pub fn decode(self: Encoding, dst: []u8, src: []const u8) Error!usize {
+        if (src.len == 0) return 0;
+
         var clean_src_len = src.len;
         if (self.pad_char) |pad| {
-            while (clean_src_len > 0 and src[clean_src_len - 1] == pad) {
+            if (src.len % 4 != 0) return Error.CorruptInput;
+            var pad_count: usize = 0;
+            while (pad_count < 2 and clean_src_len > 0 and src[clean_src_len - 1] == pad) {
                 clean_src_len -= 1;
+                pad_count += 1;
             }
         }
 
@@ -220,4 +227,17 @@ test "base64 raw url encoding" {
     const dec = try raw_url_encoding.decodeString(testing.allocator, enc);
     defer testing.allocator.free(dec);
     try testing.expectEqualStrings(input, dec);
+}
+
+test "base64 strict padding validation" {
+    const testing = std.testing;
+
+    // Unpadded input in padded mode must return CorruptInput (not ShortBuffer)
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "Zg"));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "Zm8"));
+    // Excess or stray padding
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "Zg==="));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "===="));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "Zg=a"));
+    try testing.expectError(Error.CorruptInput, std_encoding.decodeString(testing.allocator, "Zm9v===="));
 }

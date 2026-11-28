@@ -65,7 +65,9 @@ pub const Client = struct {
         if (options.proxy_url) |p| {
             trans_opts.proxy_url = p;
         }
-        trans_opts.proxy_from_env = options.proxy_from_env;
+        if (!options.proxy_from_env) {
+            trans_opts.proxy_from_env = false;
+        }
         if (trans_opts.environ_map == null and options.environ_map != null) {
             trans_opts.environ_map = options.environ_map;
         }
@@ -99,6 +101,51 @@ pub const Client = struct {
         }
     }
 
+    fn resolveRedirectUrl(
+        allocator: std.mem.Allocator,
+        current_url: []const u8,
+        target_scheme: []const u8,
+        location: []const u8,
+    ) ![]u8 {
+        if (std.mem.startsWith(u8, location, "http://") or
+            std.mem.startsWith(u8, location, "https://"))
+        {
+            return allocator.dupe(u8, location);
+        }
+        if (std.mem.startsWith(u8, location, "//")) {
+            return allocator.print("{s}:{s}", .{ target_scheme, location });
+        }
+
+        const scheme_end = std.mem.indexOf(u8, current_url, "://");
+        const host_start = if (scheme_end) |pos| pos + 3 else 0;
+        const auth_end_rel = std.mem.indexOfAny(u8, current_url[host_start..], "/?#");
+        const host_root = if (auth_end_rel) |idx|
+            current_url[0 .. host_start + idx]
+        else
+            current_url;
+
+        if (std.mem.startsWith(u8, location, "/")) {
+            return allocator.print("{s}{s}", .{ host_root, location });
+        }
+
+        const qf_idx = std.mem.indexOfAny(u8, current_url, "?#");
+        const base_no_query = if (qf_idx) |idx| current_url[0..idx] else current_url;
+
+        if (std.mem.startsWith(u8, location, "?")) {
+            if (std.mem.indexOfScalar(u8, base_no_query[host_start..], '/') == null) {
+                return allocator.print("{s}/{s}", .{ base_no_query, location });
+            }
+            return allocator.print("{s}{s}", .{ base_no_query, location });
+        }
+
+        if (std.mem.lastIndexOfScalar(u8, base_no_query[host_start..], '/')) |rel_slash| {
+            const dir_base = base_no_query[0 .. host_start + rel_slash + 1];
+            return allocator.print("{s}{s}", .{ dir_base, location });
+        }
+        return allocator.print("{s}/{s}", .{ host_root, location });
+    }
+
+    /// Executes an HTTP request, following redirects and applying cookies and deadlines.
     pub fn do(self: *Client, req: *Request, deadline: deadline_mod.Deadline) !Response {
         try deadline.validate();
         try self.io.checkCancel();
@@ -111,7 +158,8 @@ pub const Client = struct {
 
         var current_method = req.method;
         var current_body = req.body;
-        var current_body_reader = req.body_reader;
+        var current_body_reader = if (req.body != null) null else req.body_reader;
+        var strip_sensitive_headers = false;
         var redirects_followed: u8 = 0;
 
         var via = std.ArrayListUnmanaged(*Request).empty;
@@ -130,14 +178,26 @@ pub const Client = struct {
             const target = try parseUrlTarget(current_url);
 
             const round_trip_req = try self.allocator.create(Request);
-            round_trip_req.* = Request.init(self.allocator, current_method, current_url);
+            round_trip_req.* = Request.init(self.allocator, current_method, "");
             var owned_by_via = false;
             errdefer if (!owned_by_via) {
                 round_trip_req.deinit();
                 self.allocator.destroy(round_trip_req);
             };
 
-            // Copy original headers (stripping body headers if converted to GET)
+            // Keep an owned copy of current_url inside round_trip_req so `via`
+            // entries remain valid across redirects.
+            const owned_url = try self.allocator.dupe(u8, current_url);
+            {
+                var url_appended = false;
+                errdefer if (!url_appended) self.allocator.free(owned_url);
+                try round_trip_req.extra_strings.append(self.allocator, owned_url);
+                url_appended = true;
+            }
+            round_trip_req.url = owned_url;
+
+            // Copy original headers (stripping body headers if converted to GET,
+            // and sensitive headers after cross-origin redirects without mutating req).
             for (req.header.entries.items) |entry| {
                 if (current_method == .GET and req.method != .GET) {
                     if (std.ascii.eqlIgnoreCase(entry.name, "Content-Length") or
@@ -147,16 +207,29 @@ pub const Client = struct {
                         continue;
                     }
                 }
+                if (strip_sensitive_headers) {
+                    if (std.ascii.eqlIgnoreCase(entry.name, "Authorization") or
+                        std.ascii.eqlIgnoreCase(entry.name, "Proxy-Authorization") or
+                        std.ascii.eqlIgnoreCase(entry.name, "Cookie"))
+                    {
+                        continue;
+                    }
+                }
                 try round_trip_req.header.add(entry.name, entry.value);
             }
 
-            var cookie_header_to_free: ?[]u8 = null;
-            defer if (cookie_header_to_free) |buf| self.allocator.free(buf);
-
-            // Inject cookies from jar
+            // Inject cookies from jar and keep the formatted header alive with round_trip_req.
             if (self.options.jar) |jar| {
-                if (try jar.formatCookieHeader(self.allocator, target.host)) |cookie_header| {
-                    cookie_header_to_free = cookie_header;
+                if (try jar.formatCookieHeaderForRequest(
+                    self.allocator,
+                    target.host,
+                    target.request_target,
+                    target.is_tls,
+                )) |cookie_header| {
+                    var cookie_appended = false;
+                    errdefer if (!cookie_appended) self.allocator.free(cookie_header);
+                    try round_trip_req.extra_strings.append(self.allocator, cookie_header);
+                    cookie_appended = true;
                     try round_trip_req.header.set("Cookie", cookie_header);
                 }
             }
@@ -170,10 +243,10 @@ pub const Client = struct {
                 try rt.roundTrip(round_trip_req, request_deadline)
             else
                 try self.transport.roundTripWithBudget(round_trip_req, request_deadline);
-            request_deadline.check(self.io) catch |err| {
-                resp.close();
-                return err;
-            };
+            var resp_handed_off = false;
+            errdefer if (!resp_handed_off) resp.close();
+
+            try request_deadline.check(self.io);
 
             // Collect Set-Cookie into jar
             if (self.options.jar) |jar| {
@@ -202,66 +275,35 @@ pub const Client = struct {
                     const const_via: []const *const Request = @ptrCast(via.items);
                     try check_fn(self.options.check_redirect_ctx, req, const_via);
                 } else if (redirects_followed >= self.options.max_redirects) {
-                    resp.close();
                     return error.TooManyRedirects;
                 }
 
                 const location = resp.header.get("Location") orelse {
-                    request_deadline.check(self.io) catch |err| {
-                        resp.close();
-                        return err;
-                    };
+                    try request_deadline.check(self.io);
+                    resp_handed_off = true;
                     return resp;
                 };
 
                 redirects_followed += 1;
 
-                var new_url: []u8 = undefined;
-                if (std.mem.startsWith(u8, location, "http://") or
-                    std.mem.startsWith(u8, location, "https://"))
-                {
-                    new_url = try self.allocator.dupe(u8, location);
-                } else {
-                    const scheme_end = std.mem.indexOf(u8, current_url, "://");
-                    const host_start = if (scheme_end) |pos| pos + 3 else 0;
-                    const slash_idx = std.mem.indexOfScalar(u8, current_url[host_start..], '/');
-                    const host_root = if (slash_idx) |idx|
-                        current_url[0 .. host_start + idx]
-                    else
-                        current_url;
-                    if (std.mem.startsWith(u8, location, "/")) {
-                        new_url = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{s}{s}",
-                            .{ host_root, location },
-                        );
-                    } else {
-                        const last_slash = std.mem.lastIndexOfScalar(u8, current_url, '/');
-                        const dir_base = if (last_slash) |ls|
-                            current_url[0 .. ls + 1]
-                        else
-                            host_root;
-                        new_url = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{s}{s}",
-                            .{ dir_base, location },
-                        );
-                    }
-                }
+                const new_url = try resolveRedirectUrl(
+                    self.allocator,
+                    current_url,
+                    target.scheme,
+                    location,
+                );
+                var new_url_transferred = false;
+                errdefer if (!new_url_transferred) self.allocator.free(new_url);
 
                 const new_target = try parseUrlTarget(new_url);
 
-                // Security: Strip sensitive headers on cross-origin redirects
+                // Security: Strip sensitive headers on cross-origin redirects (host, port, or scheme downgrade)
                 const is_cross_origin = !std.ascii.eqlIgnoreCase(target.host, new_target.host) or
+                    target.port != new_target.port or
                     (target.is_tls and !new_target.is_tls);
                 if (is_cross_origin) {
-                    req.header.del("Authorization");
-                    req.header.del("Proxy-Authorization");
-                    req.header.del("Cookie");
+                    strip_sensitive_headers = true;
                 }
-
-                self.allocator.free(current_url);
-                current_url = new_url;
 
                 switch (resp.status) {
                     .see_other => {
@@ -277,23 +319,28 @@ pub const Client = struct {
                         }
                     },
                     .temporary_redirect, .permanent_redirect => {
-                        if (req.get_body) |get_b| {
-                            current_body_reader = try get_b(req.get_body_ctx.?);
+                        if (current_body == null) {
+                            if (req.get_body) |get_b| {
+                                current_body_reader = try get_b(req.get_body_ctx.?);
+                            }
                         }
                     },
                     else => {},
                 }
 
+                self.allocator.free(current_url);
+                current_url = new_url;
+                new_url_transferred = true;
+
+                resp_handed_off = true;
                 resp.close();
                 continue;
             }
 
-            request_deadline.check(self.io) catch |err| {
-                resp.close();
-                return err;
-            };
+            try request_deadline.check(self.io);
             round_trip_req.deinit();
             self.allocator.destroy(round_trip_req);
+            resp_handed_off = true;
             return resp;
         }
     }
@@ -1606,4 +1653,41 @@ test "Client: cancellation interrupts a timed socket write" {
     var future = try io.concurrent(Worker.run, .{ &client, url, payload });
     try accepted.wait(io);
     try testing.expectError(error.Canceled, future.cancel(io));
+}
+
+test "Client: redirect URL resolution and transport proxy_from_env preservation" {
+    const testing = std.testing;
+
+    const r1 = try Client.resolveRedirectUrl(
+        testing.allocator,
+        "https://example.com/a/b?foo=bar",
+        "https",
+        "//cdn.example.net/x",
+    );
+    defer testing.allocator.free(r1);
+    try testing.expectEqualStrings("https://cdn.example.net/x", r1);
+
+    const r2 = try Client.resolveRedirectUrl(
+        testing.allocator,
+        "http://example.com?a=1",
+        "http",
+        "next",
+    );
+    defer testing.allocator.free(r2);
+    try testing.expectEqualStrings("http://example.com/next", r2);
+
+    const r3 = try Client.resolveRedirectUrl(
+        testing.allocator,
+        "http://example.com/dir/page?q=1#h",
+        "http",
+        "other",
+    );
+    defer testing.allocator.free(r3);
+    try testing.expectEqualStrings("http://example.com/dir/other", r3);
+
+    var c = Client.init(testing.allocator, testing.io, .{
+        .transport = .{ .proxy_from_env = false },
+    });
+    defer c.deinit();
+    try testing.expect(!c.transport.options.proxy_from_env);
 }

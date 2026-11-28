@@ -168,8 +168,6 @@ pub const File = struct {
         const flags = mem.readInt(u32, data[24..28], endian);
 
         var f = try allocator.create(File);
-        errdefer allocator.destroy(f);
-
         f.* = .{
             .allocator = allocator,
             .raw_data = data,
@@ -187,6 +185,7 @@ pub const File = struct {
             .sections = &.{},
             .dylibs = &.{},
         };
+        errdefer f.deinit();
 
         var segments_list = std.ArrayListUnmanaged(Segment).empty;
         errdefer segments_list.deinit(allocator);
@@ -199,10 +198,10 @@ pub const File = struct {
 
         var offset = min_header_size;
         for (0..ncmd) |_| {
-            if (offset + 8 > data.len) break;
+            if (offset > data.len or data.len - offset < 8) break;
             const cmd_raw = mem.readInt(u32, data[offset..][0..4], endian);
             const cmd_len = mem.readInt(u32, data[offset + 4 ..][0..4], endian);
-            if (cmd_len < 8 or offset + cmd_len > data.len) return FormatError.InvalidLoadCommand;
+            if (cmd_len < 8 or cmd_len > data.len - offset) return FormatError.InvalidLoadCommand;
 
             const cmd: LoadCmd = @fromBackingInt(@intCast(cmd_raw));
             const cmd_data = data[offset .. offset + cmd_len];
@@ -221,8 +220,8 @@ pub const File = struct {
                     const nsects = mem.readInt(u32, cmd_data[48..52], endian);
                     const segflags = mem.readInt(u32, cmd_data[52..56], endian);
 
-                    const seg_data = if (fileoff + filesize <= data.len)
-                        data[fileoff .. fileoff + filesize]
+                    const seg_data = if (fileoff <= data.len and filesize <= data.len - fileoff)
+                        data[fileoff .. @as(usize, fileoff) + @as(usize, filesize)]
                     else
                         &.{};
 
@@ -246,7 +245,7 @@ pub const File = struct {
                     // Parse embedded 32-bit sections (68 bytes each)
                     var sec_off: usize = 56;
                     for (0..nsects) |_| {
-                        if (sec_off + 68 > cmd_data.len) break;
+                        if (sec_off > cmd_data.len or cmd_data.len - sec_off < 68) break;
                         const sec_bytes = cmd_data[sec_off .. sec_off + 68];
                         const secname = cleanCString(sec_bytes[0..16]);
                         const s_segname = cleanCString(sec_bytes[16..32]);
@@ -258,8 +257,8 @@ pub const File = struct {
                         const nreloc = mem.readInt(u32, sec_bytes[52..56], endian);
                         const s_flags = mem.readInt(u32, sec_bytes[56..60], endian);
 
-                        const sec_data = if (s_off + size <= data.len)
-                            data[s_off .. s_off + size]
+                        const sec_data = if (s_off <= data.len and size <= data.len - s_off)
+                            data[s_off .. @as(usize, s_off) + @as(usize, size)]
                         else
                             &.{};
                         try sections_list.append(allocator, .{
@@ -292,10 +291,13 @@ pub const File = struct {
                     const nsects = mem.readInt(u32, cmd_data[64..68], endian);
                     const segflags = mem.readInt(u32, cmd_data[68..72], endian);
 
-                    const seg_data = if (fileoff + filesize <= data.len)
-                        data[fileoff .. fileoff + filesize]
-                    else
-                        &.{};
+                    const seg_data = if (fileoff <= data.len and
+                        filesize <= data.len - @as(usize, @intCast(fileoff)))
+                    blk: {
+                        const fo: usize = @intCast(fileoff);
+                        const fs: usize = @intCast(filesize);
+                        break :blk data[fo .. fo + fs];
+                    } else &.{};
 
                     try segments_list.append(allocator, .{
                         .header = .{
@@ -317,7 +319,7 @@ pub const File = struct {
                     // Parse embedded 64-bit sections (80 bytes each)
                     var sec_off: usize = 72;
                     for (0..nsects) |_| {
-                        if (sec_off + 80 > cmd_data.len) break;
+                        if (sec_off > cmd_data.len or cmd_data.len - sec_off < 80) break;
                         const sec_bytes = cmd_data[sec_off .. sec_off + 80];
                         const secname = cleanCString(sec_bytes[0..16]);
                         const s_segname = cleanCString(sec_bytes[16..32]);
@@ -329,10 +331,13 @@ pub const File = struct {
                         const nreloc = mem.readInt(u32, sec_bytes[60..64], endian);
                         const s_flags = mem.readInt(u32, sec_bytes[64..68], endian);
 
-                        const sec_data = if (s_off + size <= data.len)
-                            data[s_off .. s_off + size]
-                        else
-                            &.{};
+                        const sec_data = if (s_off <= data.len and
+                            size <= data.len - @as(usize, s_off))
+                        blk: {
+                            const so: usize = s_off;
+                            const sz: usize = @intCast(size);
+                            break :blk data[so .. so + sz];
+                        } else &.{};
                         try sections_list.append(allocator, .{
                             .header = .{
                                 .name = secname,
@@ -500,8 +505,12 @@ pub const FatFile = struct {
     pub fn openArch(self: *const FatFile, index: usize) !*File {
         if (index >= self.arches.len) return error.IndexOutOfBounds;
         const arch = self.arches[index];
-        if (arch.offset + arch.size > self.raw_data.len) return FormatError.UnexpectedEOF;
-        return File.parse(self.allocator, self.raw_data[arch.offset .. arch.offset + arch.size]);
+        if (arch.offset > self.raw_data.len or arch.size > self.raw_data.len - arch.offset) {
+            return FormatError.UnexpectedEOF;
+        }
+        const start: usize = arch.offset;
+        const end: usize = start + @as(usize, arch.size);
+        return File.parse(self.allocator, self.raw_data[start..end]);
     }
 };
 

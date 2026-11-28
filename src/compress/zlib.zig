@@ -115,6 +115,7 @@ pub const Writer = struct {
 
 pub const Reader = struct {
     allocator: Allocator,
+    window_buf: []u8,
     decompress: flate.Decompress,
 
     pub fn reader(self: *Reader) *io.Reader {
@@ -126,6 +127,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        self.allocator.free(self.window_buf);
         const alloc = self.allocator;
         alloc.destroy(self);
     }
@@ -191,9 +193,13 @@ pub fn newReader(allocator: Allocator, r: *io.Reader) Error!*Reader {
     const self = try allocator.create(Reader);
     errdefer allocator.destroy(self);
 
+    const window_buf = try allocator.alloc(u8, flate.max_window_len);
+    errdefer allocator.free(window_buf);
+
     self.* = .{
         .allocator = allocator,
-        .decompress = flate.Decompress.init(r, .zlib, &.{}),
+        .window_buf = window_buf,
+        .decompress = flate.Decompress.init(r, .zlib, window_buf),
     };
     return self;
 }
@@ -268,4 +274,35 @@ test "compress.zlib: multiple compression levels" {
         _ = try io.copy(out_buf.writer(), zr.reader());
         try testing.expectEqualStrings(original_text, out_buf.string());
     }
+}
+
+test "compress.zlib: reader readSliceShort and takeByte" {
+    const testing = std.testing;
+    const bytes = @import("../bytes.zig");
+
+    const original = "Hello zlib window buffer test! Repeating: 0123456789 0123456789";
+    var comp_buf = bytes.Buffer.init(testing.allocator);
+    defer comp_buf.deinit();
+
+    var zw = try newWriter(testing.allocator, comp_buf.writer());
+    defer zw.deinit();
+    try zw.writer().writeAll(original);
+    try zw.close();
+
+    var r = bytes.Reader.init(comp_buf.bytes());
+    var zr = try newReader(testing.allocator, r.reader());
+    defer zr.deinit();
+
+    const first = try zr.reader().takeByte();
+    try testing.expectEqual(@as(u8, 'H'), first);
+
+    var out: [128]u8 = undefined;
+    out[0] = first;
+    var total: usize = 1;
+    while (total < out.len) {
+        const n = try zr.reader().readSliceShort(out[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    try testing.expectEqualStrings(original, out[0..total]);
 }

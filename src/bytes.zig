@@ -50,6 +50,9 @@ pub fn count(s: []const u8, sep: []const u8) usize {
     if (sep.len == 0) {
         return s.len + 1;
     }
+    if (sep.len > s.len) {
+        return 0;
+    }
     var total: usize = 0;
     var cursor: usize = 0;
     while (cursor <= s.len - sep.len) {
@@ -68,7 +71,7 @@ pub fn repeat(allocator: std.mem.Allocator, b: []const u8, n: usize) std.mem.All
     if (n == 0 or b.len == 0) {
         return try allocator.alloc(u8, 0);
     }
-    const total_len = b.len * n;
+    const total_len = std.math.mul(usize, b.len, n) catch return error.OutOfMemory;
     const res = try allocator.alloc(u8, total_len);
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -103,8 +106,10 @@ test "bytes utility functions" {
 
     try testing.expectEqual(@as(usize, 3), count("banana", "a"));
     try testing.expectEqual(@as(usize, 2), count("aaaa", "aa"));
+    try testing.expectEqual(@as(usize, 0), count("ab", "abcd"));
 
     const rep = try repeat(testing.allocator, "go", 3);
     defer testing.allocator.free(rep);
     try testing.expectEqualStrings("gogogo", rep);
+    try testing.expectError(error.OutOfMemory, repeat(testing.allocator, "ab", std.math.maxInt(usize)));
 }

@@ -36,15 +36,23 @@ pub const HttpConn = struct {
         return conn;
     }
 
+    /// Initializes a TLS-wrapped HTTP connection over `stream`.
+    /// When `insecure_skip_verify` is false, both `ca_bundle` and `ca_lock`
+    /// must be provided; this function never silently disables verification.
     pub fn initTls(
         allocator: std.mem.Allocator,
         io: std.Io,
         stream: std.Io.net.Stream,
         host: []const u8,
         ca_bundle: ?*std.crypto.Certificate.Bundle,
+        ca_lock: ?*std.Io.RwLock,
         insecure_skip_verify: bool,
         deadline: Deadline,
     ) !*HttpConn {
+        if (!insecure_skip_verify and (ca_bundle == null or ca_lock == null)) {
+            return error.MissingCaBundle;
+        }
+
         const min_buf = std.crypto.tls.Client.min_buffer_len;
         const total_mem = min_buf * 4;
         const mem = try allocator.alloc(u8, total_mem);
@@ -72,22 +80,19 @@ pub const HttpConn = struct {
 
         const now = std.Io.Timestamp.now(io, .real);
 
-        var ca_lock: std.Io.RwLock = .init;
         const ca_opt: std.crypto.tls.Client.Options = .{
             .host = if (insecure_skip_verify) .no_verification else .{ .explicit = host },
             .ca = if (insecure_skip_verify)
                 .no_verification
-            else if (ca_bundle) |bundle|
+            else
                 .{
                     .bundle = .{
                         .gpa = allocator,
                         .io = io,
-                        .lock = &ca_lock,
-                        .bundle = bundle,
+                        .lock = ca_lock.?,
+                        .bundle = ca_bundle.?,
                     },
-                }
-            else
-                .no_verification,
+                },
             .write_buffer = tls_write_buf,
             .read_buffer = tls_read_buf,
             .entropy = &random_buf,

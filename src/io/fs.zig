@@ -60,16 +60,18 @@ pub const MapFS = struct {
         self.* = undefined;
     }
 
+    /// Adds a regular file at the normalized path in the MapFS.
     pub fn addFile(self: *MapFS, path: []const u8, data: []const u8) !void {
-        try self.files.put(path, .{
+        try self.files.put(cleanPath(path), .{
             .data = data,
             .is_dir = false,
             .mode = 0o644,
         });
     }
 
+    /// Adds an explicit directory at the normalized path in the MapFS.
     pub fn addDir(self: *MapFS, path: []const u8) !void {
-        try self.files.put(path, .{
+        try self.files.put(cleanPath(path), .{
             .data = "",
             .is_dir = true,
             .mode = ModeDir | 0o755,
@@ -119,6 +121,7 @@ pub const MapFS = struct {
         return mf.data;
     }
 
+    /// Reads the named directory, returning deduplicated directory entries.
     pub fn readDir(self: MapFS, allocator: Allocator, dir_path: []const u8) ![]DirEntry {
         const clean = cleanPath(dir_path);
         const prefix = if (clean.len == 0 or mem.eql(u8, clean, ".")) "" else clean;
@@ -126,54 +129,51 @@ pub const MapFS = struct {
         var entries = std.ArrayList(DirEntry).empty;
         defer entries.deinit(allocator);
 
-        var seen_dirs = std.StringHashMap(void).init(allocator);
+        var seen_dirs = std.StringHashMap(usize).init(allocator);
         defer seen_dirs.deinit();
 
         var it = self.files.iterator();
         while (it.next()) |entry| {
             const k = entry.key_ptr.*;
-            if (prefix.len == 0) {
-                // Root entries
-                if (mem.indexOfScalar(u8, k, '/')) |slash_idx| {
-                    const top_dir = k[0..slash_idx];
-                    if (!seen_dirs.contains(top_dir)) {
-                        try seen_dirs.put(top_dir, {});
-                        try entries.append(allocator, .{
-                            .name = top_dir,
-                            .is_dir = true,
-                            .size = 0,
-                        });
-                    }
-                } else {
+            const rel: []const u8 = if (prefix.len == 0)
+                k
+            else if (k.len > prefix.len and mem.startsWith(u8, k, prefix) and k[prefix.len] == '/')
+                k[prefix.len + 1 ..]
+            else
+                continue;
+
+            if (rel.len == 0) continue;
+
+            if (mem.indexOfScalar(u8, rel, '/')) |slash_idx| {
+                const sub_dir = rel[0..slash_idx];
+                if (!seen_dirs.contains(sub_dir)) {
+                    try seen_dirs.put(sub_dir, entries.items.len);
                     try entries.append(allocator, .{
-                        .name = k,
-                        .is_dir = entry.value_ptr.is_dir,
+                        .name = sub_dir,
+                        .is_dir = true,
+                        .size = 0,
+                        .mode = ModeDir | 0o755,
+                    });
+                }
+            } else if (entry.value_ptr.is_dir) {
+                if (seen_dirs.get(rel)) |idx| {
+                    entries.items[idx].mode = entry.value_ptr.mode;
+                } else {
+                    try seen_dirs.put(rel, entries.items.len);
+                    try entries.append(allocator, .{
+                        .name = rel,
+                        .is_dir = true,
                         .size = entry.value_ptr.data.len,
                         .mode = entry.value_ptr.mode,
                     });
                 }
             } else {
-                if (k.len > prefix.len and mem.startsWith(u8, k, prefix) and k[prefix.len] == '/') {
-                    const rest = k[prefix.len + 1 ..];
-                    if (mem.indexOfScalar(u8, rest, '/')) |slash_idx| {
-                        const sub_dir = rest[0..slash_idx];
-                        if (!seen_dirs.contains(sub_dir)) {
-                            try seen_dirs.put(sub_dir, {});
-                            try entries.append(allocator, .{
-                                .name = sub_dir,
-                                .is_dir = true,
-                                .size = 0,
-                            });
-                        }
-                    } else {
-                        try entries.append(allocator, .{
-                            .name = rest,
-                            .is_dir = entry.value_ptr.is_dir,
-                            .size = entry.value_ptr.data.len,
-                            .mode = entry.value_ptr.mode,
-                        });
-                    }
-                }
+                try entries.append(allocator, .{
+                    .name = rel,
+                    .is_dir = false,
+                    .size = entry.value_ptr.data.len,
+                    .mode = entry.value_ptr.mode,
+                });
             }
         }
 
@@ -297,4 +297,24 @@ test "io/fs MapFS read, stat, and walkDir" {
     try walkDir(mfs, allocator, ".", Walker.walk);
     // Root (.) + README.md + src + main.zig + util + helper.zig + assets + config.json = 8 items
     try testing.expectEqual(@as(usize, 8), Walker.count);
+}
+
+test "io/fs MapFS normalizes paths and deduplicates explicit/implicit dirs" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var mfs = MapFS.init(allocator);
+    defer mfs.deinit();
+
+    try mfs.addDir("./src/");
+    try mfs.addFile("/src/app.zig", "pub fn main() void {}");
+
+    const content = try mfs.readFile("src/app.zig");
+    try testing.expectEqualStrings("pub fn main() void {}", content);
+
+    const root_entries = try mfs.readDir(allocator, ".");
+    defer allocator.free(root_entries);
+    try testing.expectEqual(@as(usize, 1), root_entries.len);
+    try testing.expectEqualStrings("src", root_entries[0].name);
+    try testing.expect(root_entries[0].is_dir);
 }

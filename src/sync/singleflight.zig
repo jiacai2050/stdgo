@@ -83,7 +83,10 @@ pub fn Group(comptime T: type) type {
                 };
             }
 
-            const c = try self.allocator.create(Call);
+            const c = self.allocator.create(Call) catch |err| {
+                self.mu.unlock();
+                return err;
+            };
             c.* = .{};
             c.wg.add(1);
 
@@ -132,6 +135,7 @@ pub fn Group(comptime T: type) type {
 
             const res_val = c.val;
             const res_err = c.err;
+            const shared = c.dups > 0;
             c.release(self.allocator);
             self.mu.unlock();
 
@@ -140,7 +144,7 @@ pub fn Group(comptime T: type) type {
             }
             return Result{
                 .val = res_val,
-                .shared = false,
+                .shared = shared,
             };
         }
 
@@ -267,4 +271,20 @@ test "singleflight: forget cancels sharing for subsequent calls" {
 
     // Key was completed and auto-removed, so forget returns false
     try testing.expect(!g.forget("forget-key"));
+}
+
+test "singleflight: OOM during create does not deadlock" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var g = Group(i32).init(failing.allocator());
+    defer g.deinit();
+
+    const Work = struct {
+        fn run() i32 {
+            return 7;
+        }
+    };
+
+    try testing.expectError(error.OutOfMemory, g.do("oom-key", Work.run, .{}));
+    // Mutex must be unlocked so subsequent calls do not deadlock.
+    try testing.expect(!g.forget("oom-key"));
 }

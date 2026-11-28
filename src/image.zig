@@ -141,6 +141,7 @@ pub const RGBAImage = struct {
         const total_bytes = std.math.mul(usize, stride, h_u) catch return error.OutOfMemory;
 
         const pix = try alloc.alloc(u8, total_bytes);
+        errdefer alloc.free(pix);
         @memset(pix, 0);
 
         const img = try alloc.create(RGBAImage);
@@ -196,10 +197,21 @@ pub const RGBAImage = struct {
         self.set(x, y, c);
     }
 
+    /// Returns an image representing the portion of the image visible through `r`.
+    /// The returned value shares pixels with the original image.
     pub fn subImage(self: *RGBAImage, r: Rectangle) RGBAImage {
         const inter = self.rect.intersect(r);
+        if (inter.empty()) {
+            return RGBAImage{
+                .pix = &.{},
+                .stride = self.stride,
+                .rect = Rectangle{},
+                .allocator = null,
+            };
+        }
+        const offset = self.pixOffset(inter.min.x, inter.min.y);
         return RGBAImage{
-            .pix = self.pix,
+            .pix = self.pix[offset..],
             .stride = self.stride,
             .rect = inter,
             .allocator = null,
@@ -216,10 +228,12 @@ pub const GrayImage = struct {
     pub fn init(alloc: Allocator, r: Rectangle) !*GrayImage {
         const w = @max(0, r.dx());
         const h = @max(0, r.dy());
-        const stride: usize = @as(usize, @intCast(w));
-        const total_bytes = stride * @as(usize, @intCast(h));
+        const stride: usize = @intCast(w);
+        const h_u: usize = @intCast(h);
+        const total_bytes = std.math.mul(usize, stride, h_u) catch return error.OutOfMemory;
 
         const pix = try alloc.alloc(u8, total_bytes);
+        errdefer alloc.free(pix);
         @memset(pix, 0);
 
         const img = try alloc.create(GrayImage);
@@ -324,6 +338,16 @@ test "RGBAImage and subImage" {
     const blue = color.RGBA{ .r = 0, .g = 0, .b = 255, .a = 255 };
     sub.set(2, 3, blue);
     try testing.expectEqual(@as(u8, 255), img.at(2, 3).b);
+
+    // subImage with non-zero origin slices pix at the right offset
+    const green = color.RGBA{ .r = 0, .g = 255, .b = 0, .a = 255 };
+    img.set(4, 5, green);
+    var offset_sub = img.subImage(rect(3, 4, 8, 8));
+    try testing.expectEqual(@as(u8, 255), offset_sub.at(4, 5).g);
+    const yellow = color.RGBA{ .r = 255, .g = 255, .b = 0, .a = 255 };
+    offset_sub.set(4, 5, yellow);
+    try testing.expectEqual(@as(u8, 255), img.at(4, 5).r);
+    try testing.expectEqual(@as(u8, 255), img.at(4, 5).g);
 }
 
 test "GrayImage" {

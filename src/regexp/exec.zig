@@ -91,9 +91,16 @@ pub const VM = struct {
         return res != null;
     }
 
+    /// Find searches for the leftmost match of the compiled program in text.
     pub fn find(self: *const VM, text: []const u8) anyerror!?MatchResult {
+        return self.findAt(text, 0);
+    }
+
+    /// FindAt searches for the leftmost match of the compiled program in text
+    /// starting at byte index start_offset, preserving start-of-text (^) anchor semantics.
+    pub fn findAt(self: *const VM, text: []const u8, start_offset: usize) anyerror!?MatchResult {
         const num_insts = self.prog.insts.items.len;
-        if (num_insts == 0) return null;
+        if (num_insts == 0 or start_offset > text.len) return null;
 
         var visited_buf: [max_inline_insts]bool = undefined;
         const visited = if (num_insts <= max_inline_insts)
@@ -119,9 +126,10 @@ pub const VM = struct {
 
         var best_match: ?MatchResult = null;
 
-        // Try matching starting at each position in text
-        var start_pos: usize = 0;
+        // Try matching starting at each position in text from start_offset
+        var start_pos: usize = start_offset;
         while (start_pos <= text.len) : (start_pos += 1) {
+            cur_threads.clearRetainingCapacity();
             @memset(visited, false);
             try self.addThread(&cur_threads, self.prog.start, start_pos, text, visited, start_pos);
 

@@ -70,8 +70,11 @@ pub const Writer = struct {
 
         self.offset += @intCast(30 + name.len + final_data.len);
 
+        const file_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(file_name);
+
         const header = zip_struct.FileHeader{
-            .name = try self.allocator.dupe(u8, name),
+            .name = file_name,
             .method = comp_method,
             .crc32 = crc,
             .compressed_size = comp_size,

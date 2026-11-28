@@ -227,6 +227,7 @@ pub const TCPListener = struct {
     addr_buf: [64]u8 = undefined,
     addr_len: usize = 0,
 
+    /// Initializes a `TCPListener` wrapping `server` and formats its bound address.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.Server) !*TCPListener {
         const self = try allocator.create(TCPListener);
         self.* = .{
@@ -234,14 +235,17 @@ pub const TCPListener = struct {
             .io = io,
             .server = server,
         };
-        const p = self.port();
-        const formatted = std.fmt.bufPrint(&self.addr_buf, "127.0.0.1:{d}", .{p}) catch "";
+        const formatted = std.fmt.bufPrint(&self.addr_buf, "{f}", .{self.server.socket.address}) catch "";
         self.addr_len = formatted.len;
         return self;
     }
 
+    /// Returns the local TCP port bound by this listener (IPv4 or IPv6).
     pub fn port(self: *const TCPListener) u16 {
-        return self.server.socket.address.ip4.port;
+        return switch (self.server.socket.address) {
+            .ip4 => |v4| v4.port,
+            .ip6 => |v6| v6.port,
+        };
     }
 
     pub fn listener(self: *TCPListener) Listener {
@@ -298,11 +302,14 @@ pub fn listen(
 
     const hp = try hostport.splitHostPort(address);
     const port = std.fmt.parseInt(u16, hp.port, 10) catch return error.InvalidPort;
-    const is_wildcard = hp.host.len == 0 or std.mem.eql(u8, hp.host, "0.0.0.0");
-    const bind_host = if (is_wildcard) "0.0.0.0" else hp.host;
+    const bind_host = if (hp.host.len == 0)
+        (if (std.mem.eql(u8, network, "tcp6")) "::" else "0.0.0.0")
+    else
+        hp.host;
 
     const bind_ip = try std.Io.net.IpAddress.parse(bind_host, port);
-    const server = try bind_ip.listen(io, .{ .reuse_address = true });
+    var server = try bind_ip.listen(io, .{ .reuse_address = true });
+    errdefer server.deinit(io);
     const tl = try TCPListener.init(allocator, io, server);
     return tl.listener();
 }
@@ -420,7 +427,9 @@ const PipeQueue = struct {
     tail: usize = 0,
     count: usize = 0,
     closed: bool = false,
-    mutex: Mutex = .{},
+    mutex: std.Io.Mutex = .init,
+    not_empty: std.Io.Condition = .init,
+    not_full: std.Io.Condition = .init,
 
     fn write(
         self: *PipeQueue,
@@ -431,21 +440,18 @@ const PipeQueue = struct {
         try deadline.check(io);
         try io.checkCancel();
         var written: usize = 0;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
         while (written < data.len) {
             try deadline.check(io);
             try io.checkCancel();
-            self.mutex.lock();
-            deadline.check(io) catch |err| {
-                self.mutex.unlock();
-                return err;
-            };
-            if (self.closed) {
-                self.mutex.unlock();
-                return error.BrokenPipe;
-            }
+            if (self.closed) return error.BrokenPipe;
             if (self.count == self.buf.len) {
-                self.mutex.unlock();
-                std.Thread.yield() catch {};
+                if (deadline.isNone()) {
+                    try self.not_full.wait(io, &self.mutex);
+                } else {
+                    try self.not_full.waitTimeout(io, &self.mutex, deadline.timeout());
+                }
                 continue;
             }
             const avail = self.buf.len - self.count;
@@ -456,7 +462,7 @@ const PipeQueue = struct {
             }
             self.count += chunk;
             written += chunk;
-            self.mutex.unlock();
+            self.not_empty.signal(io);
         }
         return written;
     }
@@ -465,14 +471,11 @@ const PipeQueue = struct {
         try deadline.check(io);
         try io.checkCancel();
         if (out.len == 0) return 0;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
         while (true) {
             try deadline.check(io);
             try io.checkCancel();
-            self.mutex.lock();
-            deadline.check(io) catch |err| {
-                self.mutex.unlock();
-                return err;
-            };
             if (self.count > 0) {
                 const chunk = @min(out.len, self.count);
                 for (0..chunk) |i| {
@@ -480,22 +483,24 @@ const PipeQueue = struct {
                     self.head = (self.head + 1) % self.buf.len;
                 }
                 self.count -= chunk;
-                self.mutex.unlock();
+                self.not_full.signal(io);
                 return chunk;
             }
-            if (self.closed) {
-                self.mutex.unlock();
-                return 0; // EOF
+            if (self.closed) return 0; // EOF
+            if (deadline.isNone()) {
+                try self.not_empty.wait(io, &self.mutex);
+            } else {
+                try self.not_empty.waitTimeout(io, &self.mutex, deadline.timeout());
             }
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
         }
     }
 
-    fn close(self: *PipeQueue) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn close(self: *PipeQueue, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         self.closed = true;
+        self.not_empty.broadcast(io);
+        self.not_full.broadcast(io);
     }
 };
 
@@ -554,9 +559,9 @@ const PipeEndpoint = struct {
 
     fn closeImpl(ctx: *anyopaque) void {
         const self: *PipeEndpoint = @ptrCast(@alignCast(ctx));
-        self.out_q.close();
-        self.in_q.close();
         const st = self.state;
+        self.out_q.close(st.io);
+        self.in_q.close(st.io);
         const alloc = st.allocator;
         alloc.destroy(self);
         st.destroyIfDone();

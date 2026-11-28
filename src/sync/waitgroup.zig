@@ -11,7 +11,7 @@ pub const WaitGroup = struct {
     /// If the counter becomes zero, all threads blocked on Wait are released.
     /// If the counter goes negative, Add panics.
     pub fn add(self: *WaitGroup, delta: i32) void {
-        const prev = self.counter.fetchAdd(delta, .monotonic);
+        const prev = self.counter.fetchAdd(delta, .acq_rel);
         if (prev + delta < 0) {
             @panic("sync: negative WaitGroup counter");
         }

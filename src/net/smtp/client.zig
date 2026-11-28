@@ -15,7 +15,17 @@ pub const SmtpError = error{
     SmtpAuthFailed,
     SmtpBadResponse,
     SmtpNotConnected,
+    InvalidSmtpArgument,
 };
+
+fn containsCrLf(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "\r\n") != null;
+}
+
+fn freeResponseAlloc(allocator: Allocator, resp: Response) void {
+    for (resp.lines) |l| allocator.free(l);
+    allocator.free(resp.lines);
+}
 
 pub const Response = struct {
     code: u16,
@@ -32,8 +42,12 @@ pub const Client = struct {
     read_pos: usize = 0,
     read_len: usize = 0,
 
+    /// Initializes an SMTP client over an existing connection and reads the
+    /// server's initial `220` greeting. On error, `conn` is not closed by `init`;
+    /// the caller retains ownership of `conn`.
     pub fn init(allocator: Allocator, conn: Conn, host: []const u8) !*Client {
         const self = try allocator.create(Client);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .conn = conn,
@@ -42,9 +56,8 @@ pub const Client = struct {
 
         // Read the initial 220 greeting from server
         const resp = try self.readResponse();
-        defer self.freeResponse(resp);
+        defer freeResponseAlloc(allocator, resp);
         if (resp.code != 220) {
-            self.close();
             return error.SmtpCommandFailed;
         }
 
@@ -161,8 +174,9 @@ pub const Client = struct {
     }
 
     /// Sends EHLO and parses supported extensions.
+    /// Rejects empty names or values containing CR/LF to prevent SMTP command injection.
     pub fn ehlo(self: *Client, local_name: []const u8) !void {
-        std.debug.assert(local_name.len > 0);
+        if (local_name.len == 0 or containsCrLf(local_name)) return error.InvalidSmtpArgument;
         const resp = try self.cmd("EHLO {s}", .{local_name});
         defer self.freeResponse(resp);
 
@@ -176,18 +190,28 @@ pub const Client = struct {
             const ext_name = parts.next() orelse continue;
 
             const upper_ext = try self.allocator.alloc(u8, ext_name.len);
+            var owns_key = true;
+            errdefer if (owns_key) self.allocator.free(upper_ext);
             for (ext_name, 0..) |c, i| upper_ext[i] = std.ascii.toUpper(c);
 
             const rest = std.mem.trim(u8, line[ext_name.len..], " \t");
             const val_copy = try self.allocator.dupe(u8, rest);
+            var owns_val = true;
+            errdefer if (owns_val) self.allocator.free(val_copy);
 
-            try self.ext.put(self.allocator, upper_ext, val_copy);
+            if (try self.ext.fetchPut(self.allocator, upper_ext, val_copy)) |prev| {
+                self.allocator.free(prev.key);
+                self.allocator.free(prev.value);
+            }
+            owns_key = false;
+            owns_val = false;
 
-            if (std.mem.eql(u8, upper_ext, "AUTH")) {
+            if (std.ascii.eqlIgnoreCase(ext_name, "AUTH")) {
                 var auth_it = std.mem.splitScalar(u8, rest, ' ');
                 while (auth_it.next()) |mech| {
                     if (mech.len > 0) {
                         const m = try self.allocator.dupe(u8, mech);
+                        errdefer self.allocator.free(m);
                         try self.auth_mechanisms.append(self.allocator, m);
                     }
                 }
@@ -196,8 +220,9 @@ pub const Client = struct {
     }
 
     /// Sends HELO (basic SMTP).
+    /// Rejects empty names or values containing CR/LF to prevent SMTP command injection.
     pub fn hello(self: *Client, local_name: []const u8) !void {
-        std.debug.assert(local_name.len > 0);
+        if (local_name.len == 0 or containsCrLf(local_name)) return error.InvalidSmtpArgument;
         const resp = try self.cmd("HELO {s}", .{local_name});
         defer self.freeResponse(resp);
         if (resp.code != 250) return error.SmtpCommandFailed;
@@ -261,17 +286,19 @@ pub const Client = struct {
         }
     }
 
-    /// Sends MAIL FROM:<from>.
+    /// Sends `MAIL FROM:<from>`.
+    /// Rejects empty addresses or values containing CR/LF to prevent SMTP command injection.
     pub fn mail(self: *Client, from: []const u8) !void {
-        std.debug.assert(from.len > 0);
+        if (from.len == 0 or containsCrLf(from)) return error.InvalidSmtpArgument;
         const resp = try self.cmd("MAIL FROM:<{s}>", .{from});
         defer self.freeResponse(resp);
         if (resp.code != 250) return error.SmtpCommandFailed;
     }
 
-    /// Sends RCPT TO:<to>.
+    /// Sends `RCPT TO:<to>`.
+    /// Rejects empty addresses or values containing CR/LF to prevent SMTP command injection.
     pub fn rcpt(self: *Client, to: []const u8) !void {
-        std.debug.assert(to.len > 0);
+        if (to.len == 0 or containsCrLf(to)) return error.InvalidSmtpArgument;
         const resp = try self.cmd("RCPT TO:<{s}>", .{to});
         defer self.freeResponse(resp);
         if (resp.code != 250 and resp.code != 251) return error.SmtpCommandFailed;

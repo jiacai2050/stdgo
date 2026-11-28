@@ -84,9 +84,10 @@ pub const Reader = struct {
                 }
             }
 
-            // Skip empty lines
+            // Skip empty lines (including "\n", "\r", and "\r\n")
             const is_empty = raw_line.len == 0 or
-                (raw_line.len == 1 and (raw_line[0] == '\r' or raw_line[0] == '\n'));
+                (raw_line.len == 1 and (raw_line[0] == '\r' or raw_line[0] == '\n')) or
+                (raw_line.len == 2 and raw_line[0] == '\r' and raw_line[1] == '\n');
             if (is_empty) {
                 continue;
             }
@@ -115,6 +116,7 @@ pub const Reader = struct {
     fn readLine(self: *Reader, allocator: Allocator) anyerror!void {
         self.line_buffer.clearRetainingCapacity();
         var in_quotes = false;
+        var is_comment = false;
         while (true) {
             const ch = self.r.takeByte() catch |err| {
                 if (err == error.EndOfStream or err == io.Error.EndOfStream) {
@@ -129,7 +131,15 @@ pub const Reader = struct {
                 return err;
             };
 
-            if (ch == '"' and !self.lazy_quotes) {
+            if (self.line_buffer.items.len == 0) {
+                if (self.comment) |com| {
+                    if (ch == com) {
+                        is_comment = true;
+                    }
+                }
+            }
+
+            if (!is_comment and ch == '"' and !self.lazy_quotes) {
                 in_quotes = !in_quotes;
             }
 
@@ -224,6 +234,7 @@ pub const Reader = struct {
                 try self.record_fields.append(allocator, field_slice);
             } else {
                 const field_str = try allocator.dupe(u8, field_slice);
+                errdefer allocator.free(field_str);
                 try fields.append(allocator, field_str);
             }
         }
@@ -387,4 +398,28 @@ test "csv.Reader reuse_record eliminates per-field allocations" {
         @as(?[]const []const u8, null),
         try reader.read(testing.allocator),
     );
+}
+
+test "csv.Reader comment with unmatched quote and CRLF empty lines" {
+    const testing = std.testing;
+
+    const input = "# comment with \"unmatched quote\r\n\r\na,b\r\n\r\nc,d\r\n";
+    var br = bytes.Reader.init(input);
+    var reader = Reader.init(br.reader());
+    defer reader.deinit();
+    reader.comment = '#';
+
+    const r1 = (try reader.read(testing.allocator)).?;
+    defer freeRecord(testing.allocator, r1);
+    try testing.expectEqual(@as(usize, 2), r1.len);
+    try testing.expectEqualStrings("a", r1[0]);
+    try testing.expectEqualStrings("b", r1[1]);
+
+    const r2 = (try reader.read(testing.allocator)).?;
+    defer freeRecord(testing.allocator, r2);
+    try testing.expectEqual(@as(usize, 2), r2.len);
+    try testing.expectEqualStrings("c", r2[0]);
+    try testing.expectEqualStrings("d", r2[1]);
+
+    try testing.expectEqual(@as(?[]const []const u8, null), try reader.read(testing.allocator));
 }

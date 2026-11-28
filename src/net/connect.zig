@@ -62,10 +62,14 @@ fn connectTask(
 }
 
 fn connectInner(io: std.Io, host: []const u8, port: u16, ordered: bool) !std.Io.net.Stream {
-    if (std.Io.net.IpAddress.parse(host, port)) |ip| {
+    const bare_host = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        host[1 .. host.len - 1]
+    else
+        host;
+    if (std.Io.net.IpAddress.parse(bare_host, port)) |ip| {
         return ip.connect(io, .{ .mode = .stream, .timeout = .none });
     } else |_| {}
-    const host_name = try std.Io.net.HostName.init(host);
+    const host_name = try std.Io.net.HostName.init(bare_host);
     if (ordered) {
         var canonical_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         var lookup_buffer: [16]std.Io.net.HostName.LookupResult = undefined;

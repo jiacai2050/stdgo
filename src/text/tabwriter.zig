@@ -71,11 +71,15 @@ pub const Writer = struct {
         for (p) |b| {
             if (b == '\t') {
                 const cell_str = try self.allocator.dupe(u8, self.current_cell.bytes());
+                errdefer self.allocator.free(cell_str);
                 try self.current_line.append(self.allocator, cell_str);
                 self.current_cell.reset();
             } else if (b == '\n') {
-                const cell_str = try self.allocator.dupe(u8, self.current_cell.bytes());
-                try self.current_line.append(self.allocator, cell_str);
+                {
+                    const cell_str = try self.allocator.dupe(u8, self.current_cell.bytes());
+                    errdefer self.allocator.free(cell_str);
+                    try self.current_line.append(self.allocator, cell_str);
+                }
                 self.current_cell.reset();
 
                 try self.rows.append(self.allocator, self.current_line);
@@ -91,8 +95,11 @@ pub const Writer = struct {
     pub fn flush(self: *Writer) anyerror!void {
         // If there is an unfinished line or cell, commit it
         if (self.current_cell.len() > 0 or self.current_line.items.len > 0) {
-            const cell_str = try self.allocator.dupe(u8, self.current_cell.bytes());
-            try self.current_line.append(self.allocator, cell_str);
+            {
+                const cell_str = try self.allocator.dupe(u8, self.current_cell.bytes());
+                errdefer self.allocator.free(cell_str);
+                try self.current_line.append(self.allocator, cell_str);
+            }
             self.current_cell.reset();
 
             try self.rows.append(self.allocator, self.current_line);

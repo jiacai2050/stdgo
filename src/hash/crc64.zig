@@ -71,11 +71,14 @@ pub const Digest = struct {
         return self.crc;
     }
 
+    /// Copies the big-endian CRC-64 checksum into `b` (up to `@min(b.len, 8)` bytes)
+    /// and returns the written sub-slice.
     pub fn sum(self: Digest, b: []u8) []u8 {
         var s: [8]u8 = undefined;
         mem.writeInt(u64, &s, self.crc, .big);
-        @memcpy(b[0..8], &s);
-        return b[0..8];
+        const n = @min(b.len, 8);
+        @memcpy(b[0..n], s[0..n]);
+        return b[0..n];
     }
 
     pub fn write(self: *Digest, p: []const u8) !usize {
@@ -99,12 +102,16 @@ pub const Digest = struct {
         data: []const []const u8,
         splat: usize,
     ) std.Io.Writer.Error!usize {
-        _ = splat;
         const self: *Digest = @alignCast(@fieldParentPtr("writer_inst", w));
         var total: usize = 0;
-        for (data) |chunk| {
+        for (data[0 .. data.len - 1]) |chunk| {
             _ = self.write(chunk) catch return error.WriteFailed;
             total += chunk.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            _ = self.write(pattern) catch return error.WriteFailed;
+            total += pattern.len;
         }
         return total;
     }
@@ -135,4 +142,15 @@ test "hash/crc64 standard vectors" {
     try w.writeAll("abc");
     try w.writeAll("defghij");
     try testing.expectEqual(@as(u64, 0x7f5b6e21b002d367), d.sum64());
+
+    // Test Digest.sum bounds check with short slice
+    var short_buf: [4]u8 = undefined;
+    const short_sum = d.sum(&short_buf);
+    try testing.expectEqual(@as(usize, 4), short_sum.len);
+
+    // Test splat handling in drainImpl
+    var d2 = Digest.init(&iso_table);
+    var w2 = d2.writer();
+    try w2.splatByteAll('a', 5);
+    try testing.expectEqual(checksum("aaaaa", &iso_table), d2.sum64());
 }

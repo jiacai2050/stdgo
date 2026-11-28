@@ -31,6 +31,7 @@ pub const Hmac = struct {
         };
 
         var key_buf: [128]u8 = @splat(0);
+        defer std.crypto.secureZero(u8, &key_buf);
         if (key.len > b_size) {
             // Key is longer than block size: key = hash(key)
             inner_h.reset();
@@ -162,6 +163,17 @@ pub const Hmac = struct {
     }
 };
 
+/// Equal compares two MACs for equality without leaking timing information.
+/// Returns false if lengths differ, otherwise compares all bytes in constant time.
+pub fn equal(mac1: []const u8, mac2: []const u8) bool {
+    if (mac1.len != mac2.len) return false;
+    var diff: u8 = 0;
+    for (mac1, mac2) |a, b| {
+        diff |= a ^ b;
+    }
+    return diff == 0;
+}
+
 /// Convenience function to compute HMAC-SHA256 in a single call.
 pub fn sha256(key: []const u8, message: []const u8, out: *[32]u8) void {
     const sha256_mod = @import("sha256.zig");
@@ -214,4 +226,20 @@ test "hmac-md5 RFC 2202 test vector" {
     md5(key, data, &mac);
     const hex = std.fmt.bytesToHex(mac, .lower);
     try testing.expectEqualStrings(expected_hex, &hex);
+}
+
+test "hmac.equal constant-time comparison" {
+    const testing = std.testing;
+
+    var mac1: [32]u8 = undefined;
+    var mac2: [32]u8 = undefined;
+    var mac3: [32]u8 = undefined;
+    sha256("secret", "hello", &mac1);
+    sha256("secret", "hello", &mac2);
+    sha256("secret", "world", &mac3);
+
+    try testing.expect(equal(&mac1, &mac2));
+    try testing.expect(!equal(&mac1, &mac3));
+    try testing.expect(!equal(&mac1, mac2[0..16]));
+    try testing.expect(equal(&.{}, &.{}));
 }

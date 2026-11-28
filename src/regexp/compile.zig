@@ -53,9 +53,9 @@ pub const Compiler = struct {
     fn patch(self: *Compiler, outs: std.ArrayList(u32), target: u32) void {
         for (outs.items) |idx| {
             var inst = &self.prog.insts.items[idx];
-            if (inst.out == 0) {
+            if (inst.out == prog_mod.unpatched) {
                 inst.out = target;
-            } else if (inst.out1 == 0 and (inst.op == .split)) {
+            } else if (inst.out1 == prog_mod.unpatched and inst.op == .split) {
                 inst.out1 = target;
             }
         }
@@ -63,16 +63,19 @@ pub const Compiler = struct {
 
     fn makeFrag(self: *Compiler, start: u32) Allocator.Error!Frag {
         var out = std.ArrayList(u32).empty;
+        errdefer out.deinit(self.allocator);
         try out.append(self.allocator, start);
         return .{ .start = start, .out = out };
     }
 
     fn parseAlt(self: *Compiler) anyerror!Frag {
         var left = try self.parseConcat();
+        errdefer left.out.deinit(self.allocator);
 
         while (self.pos < self.pattern.len and self.pattern[self.pos] == '|') {
             self.pos += 1;
             var right = try self.parseConcat();
+            errdefer right.out.deinit(self.allocator);
             const split_idx = try self.emit(.{
                 .op = .split,
                 .out = left.start,
@@ -80,6 +83,7 @@ pub const Compiler = struct {
             });
 
             var merged_out = std.ArrayList(u32).empty;
+            errdefer merged_out.deinit(self.allocator);
             for (left.out.items) |o| try merged_out.append(self.allocator, o);
             for (right.out.items) |o| try merged_out.append(self.allocator, o);
             left.out.deinit(self.allocator);
@@ -93,6 +97,7 @@ pub const Compiler = struct {
 
     fn parseConcat(self: *Compiler) anyerror!Frag {
         var left: ?Frag = null;
+        errdefer if (left) |*l| l.out.deinit(self.allocator);
 
         while (self.pos < self.pattern.len) {
             const ch = self.pattern[self.pos];
@@ -114,12 +119,13 @@ pub const Compiler = struct {
         }
 
         // Empty string matches
-        const nop = try self.emit(.{ .op = .split, .out = 0, .out1 = 0 });
+        const nop = try self.emit(.{ .op = .jump, .out = prog_mod.unpatched });
         return self.makeFrag(nop);
     }
 
     fn parsePiece(self: *Compiler) anyerror!Frag {
         var atom = try self.parseAtom();
+        errdefer atom.out.deinit(self.allocator);
 
         if (self.pos < self.pattern.len) {
             const op_char = self.pattern[self.pos];
@@ -128,35 +134,38 @@ pub const Compiler = struct {
                 const split_idx = try self.emit(.{
                     .op = .split,
                     .out = atom.start,
-                    .out1 = 0,
+                    .out1 = prog_mod.unpatched,
                 });
+                var out = std.ArrayList(u32).empty;
+                errdefer out.deinit(self.allocator);
+                try out.append(self.allocator, split_idx);
                 self.patch(atom.out, split_idx);
                 atom.out.deinit(self.allocator);
 
-                var out = std.ArrayList(u32).empty;
-                try out.append(self.allocator, split_idx);
                 return .{ .start = split_idx, .out = out };
             } else if (op_char == '+') {
                 self.pos += 1;
                 const split_idx = try self.emit(.{
                     .op = .split,
                     .out = atom.start,
-                    .out1 = 0,
+                    .out1 = prog_mod.unpatched,
                 });
+                var out = std.ArrayList(u32).empty;
+                errdefer out.deinit(self.allocator);
+                try out.append(self.allocator, split_idx);
                 self.patch(atom.out, split_idx);
                 atom.out.deinit(self.allocator);
 
-                var out = std.ArrayList(u32).empty;
-                try out.append(self.allocator, split_idx);
                 return .{ .start = atom.start, .out = out };
             } else if (op_char == '?') {
                 self.pos += 1;
                 const split_idx = try self.emit(.{
                     .op = .split,
                     .out = atom.start,
-                    .out1 = 0,
+                    .out1 = prog_mod.unpatched,
                 });
                 var out = std.ArrayList(u32).empty;
+                errdefer out.deinit(self.allocator);
                 for (atom.out.items) |o| try out.append(self.allocator, o);
                 try out.append(self.allocator, split_idx);
                 atom.out.deinit(self.allocator);
@@ -174,7 +183,8 @@ pub const Compiler = struct {
 
         if (ch == '(') {
             self.pos += 1;
-            const frag = try self.parseAlt();
+            var frag = try self.parseAlt();
+            errdefer frag.out.deinit(self.allocator);
             if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
                 return Error.UnmatchedParen;
             }
@@ -274,12 +284,15 @@ pub const Compiler = struct {
         in_ranges: []const Range,
         negated: bool,
     ) Allocator.Error!Frag {
-        const ranges_copy = try self.allocator.dupe(Range, in_ranges);
-        const idx = try self.emit(.{
-            .op = .class,
-            .ranges = ranges_copy,
-            .negated = negated,
-        });
+        const idx = blk: {
+            const ranges_copy = try self.allocator.dupe(Range, in_ranges);
+            errdefer self.allocator.free(ranges_copy);
+            break :blk try self.emit(.{
+                .op = .class,
+                .ranges = ranges_copy,
+                .negated = negated,
+            });
+        };
         return self.makeFrag(idx);
     }
 };

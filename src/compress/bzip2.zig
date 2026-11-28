@@ -303,7 +303,10 @@ pub const Reader = struct {
 
         self.block_size = @as(usize, 100_000) * @as(usize, level - '0');
         if (self.block_size > self.tt.len) {
-            if (self.tt.len > 0) self.allocator.free(self.tt);
+            if (self.tt.len > 0) {
+                self.allocator.free(self.tt);
+                self.tt = &.{};
+            }
             self.tt = try self.allocator.alloc(u32, self.block_size);
         }
     }
@@ -329,6 +332,9 @@ pub const Reader = struct {
             if (self.byte_repeats == 3) {
                 self.repeats = b;
                 self.byte_repeats = 0;
+                if (self.repeats == 0) {
+                    self.last_byte = -1;
+                }
                 continue;
             }
 
@@ -411,6 +417,7 @@ pub const Reader = struct {
             }
         }
 
+        if (num_symbols == 0) return StructuralError.EmptyHuffmanTree;
         var mtf = MoveToFront.init(byte_map[0..num_symbols]);
         const alpha_size = num_symbols + 2;
 
@@ -445,8 +452,9 @@ pub const Reader = struct {
 
         // Read Huffman tree bit lengths
         var huffman_trees = try self.allocator.alloc(HuffmanTree, num_trees);
+        var built_trees: usize = 0;
         defer {
-            for (huffman_trees) |*t| t.deinit(self.allocator);
+            for (huffman_trees[0..built_trees]) |*t| t.deinit(self.allocator);
             self.allocator.free(huffman_trees);
         }
 
@@ -469,6 +477,7 @@ pub const Reader = struct {
                 lengths[j] = @intCast(length);
             }
             huffman_trees[t_idx] = try newHuffmanTree(self.allocator, lengths);
+            built_trees += 1;
         }
 
         // Decode block symbols
@@ -608,4 +617,20 @@ test "bzip2 repeated bytes RLE decoding" {
     defer alloc.free(decompressed);
 
     try testing.expectEqualStrings("AAAAABBBBBCCCCCDDDDDEEEEE", decompressed);
+}
+
+test "bzip2 rejects empty symbol table" {
+    const testing = std.testing;
+    // "BZh9" + block magic 0x314159265359 + crc(4) + rand(1b)+orig_ptr(24b)+in_use16(16b=0)
+    const empty_sym_bz2 = [_]u8{
+        'B',  'Z',  'h',  '9',
+        0x31, 0x41, 0x59, 0x26,
+        0x53, 0x59, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    try testing.expectError(
+        StructuralError.EmptyHuffmanTree,
+        decompressAlloc(testing.allocator, &empty_sym_bz2),
+    );
 }

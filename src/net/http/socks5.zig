@@ -118,7 +118,13 @@ pub fn establishWithReaderWriter(
     try w.writeByte(0x00);
 
     // ATYP and Address
-    if (std.Io.net.IpAddress.parse(target_host, target_port)) |ip| {
+    const bare_host = if (target_host.len >= 2 and
+        target_host[0] == '[' and
+        target_host[target_host.len - 1] == ']')
+        target_host[1 .. target_host.len - 1]
+    else
+        target_host;
+    if (std.Io.net.IpAddress.parse(bare_host, target_port)) |ip| {
         switch (ip) {
             .ip4 => |v4| {
                 try w.writeByte(0x01); // ATYP = IPv4
@@ -131,10 +137,10 @@ pub fn establishWithReaderWriter(
         }
     } else |_| {
         // ATYP = Domain Name (proxy resolves DNS remotely)
-        if (target_host.len > 255) return error.Socks5AddressTypeNotSupported;
+        if (bare_host.len > 255) return error.Socks5AddressTypeNotSupported;
         try w.writeByte(0x03);
-        try w.writeByte(@intCast(target_host.len));
-        try w.writeAll(target_host);
+        try w.writeByte(@intCast(bare_host.len));
+        try w.writeAll(bare_host);
     }
 
     // Port (2 bytes big-endian)

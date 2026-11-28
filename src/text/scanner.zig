@@ -85,7 +85,7 @@ pub const Scanner = struct {
             const c = self.src[self.pos_idx];
 
             // Comments: // or /*
-            if (c == '/' and self.pos_idx + 1 < self.src.len) {
+            if (c == '/' and (self.mode & ScanComments) != 0 and self.pos_idx + 1 < self.src.len) {
                 const next = self.src[self.pos_idx + 1];
                 if (next == '/') {
                     self.consumeSingleComment();
@@ -103,7 +103,9 @@ pub const Scanner = struct {
             }
 
             // Identifiers: [a-zA-Z_]
-            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_') {
+            if ((self.mode & ScanIdents) != 0 and
+                ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'))
+            {
                 self.consumeIdent();
                 self.tok_end = self.pos_idx;
                 self.cur_tok = .ident;
@@ -111,15 +113,15 @@ pub const Scanner = struct {
             }
 
             // Numbers: [0-9]
-            if (c >= '0' and c <= '9') {
-                const is_float = self.consumeNumber();
+            if ((self.mode & (ScanInts | ScanFloats)) != 0 and c >= '0' and c <= '9') {
+                const is_float = self.consumeNumber((self.mode & ScanFloats) != 0);
                 self.tok_end = self.pos_idx;
                 self.cur_tok = if (is_float) .float else .int;
                 return self.cur_tok;
             }
 
             // Strings: "..."
-            if (c == '"') {
+            if ((self.mode & ScanStrings) != 0 and c == '"') {
                 self.consumeString();
                 self.tok_end = self.pos_idx;
                 self.cur_tok = .string;
@@ -127,7 +129,7 @@ pub const Scanner = struct {
             }
 
             // Raw strings: `...`
-            if (c == '`') {
+            if ((self.mode & ScanRawStrings) != 0 and c == '`') {
                 self.consumeRawString();
                 self.tok_end = self.pos_idx;
                 self.cur_tok = .raw_string;
@@ -135,7 +137,7 @@ pub const Scanner = struct {
             }
 
             // Chars: '...'
-            if (c == '\'') {
+            if ((self.mode & ScanChars) != 0 and c == '\'') {
                 self.consumeChar();
                 self.tok_end = self.pos_idx;
                 self.cur_tok = .char;
@@ -189,7 +191,7 @@ pub const Scanner = struct {
         }
     }
 
-    fn consumeNumber(self: *Scanner) bool {
+    fn consumeNumber(self: *Scanner, allow_float: bool) bool {
         var is_float = false;
 
         // Base prefix: 0x, 0b, 0o
@@ -218,7 +220,7 @@ pub const Scanner = struct {
             const c = self.src[self.pos_idx];
             if (c >= '0' and c <= '9') {
                 self.advance();
-            } else if (c == '.') {
+            } else if (allow_float and c == '.') {
                 if (self.pos_idx + 1 < self.src.len and
                     self.src[self.pos_idx + 1] >= '0' and
                     self.src[self.pos_idx + 1] <= '9')
@@ -228,7 +230,7 @@ pub const Scanner = struct {
                 } else {
                     break;
                 }
-            } else if (c == 'e' or c == 'E') {
+            } else if (allow_float and (c == 'e' or c == 'E')) {
                 is_float = true;
                 self.advance();
                 if (self.pos_idx < self.src.len and
@@ -303,8 +305,11 @@ pub const Scanner = struct {
             if (self.src[self.pos_idx] == '*' and self.src[self.pos_idx + 1] == '/') {
                 self.advance();
                 self.advance();
-                break;
+                return;
             }
+            self.advance();
+        }
+        if (self.pos_idx < self.src.len) {
             self.advance();
         }
     }
@@ -428,4 +433,24 @@ test "text/scanner tokenizes Go source code" {
 
     // 31. EOF
     try testing.expectEqual(Token.eof, s.scan());
+}
+
+test "text/scanner unclosed block comment and mode flags" {
+    const testing = std.testing;
+
+    // Unclosed /* comment must consume final byte
+    var s1 = Scanner.init("/* unclosed");
+    try testing.expectEqual(Token.eof, s1.scan());
+
+    // Mode flags disable token classes
+    var s2 = Scanner.init("abc //x");
+    s2.mode = 0;
+    try testing.expectEqual(Token.other, s2.scan());
+    try testing.expectEqual(@as(u8, 'a'), s2.character());
+    try testing.expectEqual(Token.other, s2.scan());
+    try testing.expectEqual(@as(u8, 'b'), s2.character());
+    try testing.expectEqual(Token.other, s2.scan());
+    try testing.expectEqual(@as(u8, 'c'), s2.character());
+    try testing.expectEqual(Token.other, s2.scan());
+    try testing.expectEqual(@as(u8, '/'), s2.character());
 }

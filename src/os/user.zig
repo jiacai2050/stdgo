@@ -56,7 +56,11 @@ pub const User = struct {
         }
 
         // 1. Primary gid is always included
-        try gids_list.append(allocator, try allocator.dupe(u8, self.gid));
+        {
+            const primary_gid = try allocator.dupe(u8, self.gid);
+            errdefer allocator.free(primary_gid);
+            try gids_list.append(allocator, primary_gid);
+        }
 
         // 2. Read group database to find additional groups
         const group_data = try readGroupData(allocator, options);
@@ -93,7 +97,9 @@ pub const User = struct {
                     }
                 }
                 if (!already_in) {
-                    try gids_list.append(allocator, try allocator.dupe(u8, gid_str));
+                    const duped_gid = try allocator.dupe(u8, gid_str);
+                    errdefer allocator.free(duped_gid);
+                    try gids_list.append(allocator, duped_gid);
                 }
             }
         }
@@ -210,6 +216,60 @@ fn currentGid() ?u32 {
     }
 }
 
+fn createUser(
+    allocator: Allocator,
+    uid: []const u8,
+    gid: []const u8,
+    username: []const u8,
+    name: []const u8,
+    home_dir: []const u8,
+) Allocator.Error!*User {
+    const user_ptr = try allocator.create(User);
+    errdefer allocator.destroy(user_ptr);
+
+    const owned_uid = try allocator.dupe(u8, uid);
+    errdefer allocator.free(owned_uid);
+    const owned_gid = try allocator.dupe(u8, gid);
+    errdefer allocator.free(owned_gid);
+    const owned_username = try allocator.dupe(u8, username);
+    errdefer allocator.free(owned_username);
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_home = try allocator.dupe(u8, home_dir);
+    errdefer allocator.free(owned_home);
+
+    user_ptr.* = .{
+        .uid = owned_uid,
+        .gid = owned_gid,
+        .username = owned_username,
+        .name = owned_name,
+        .home_dir = owned_home,
+        .allocator = allocator,
+    };
+    return user_ptr;
+}
+
+fn createGroup(
+    allocator: Allocator,
+    gid: []const u8,
+    name: []const u8,
+) Allocator.Error!*Group {
+    const grp_ptr = try allocator.create(Group);
+    errdefer allocator.destroy(grp_ptr);
+
+    const owned_gid = try allocator.dupe(u8, gid);
+    errdefer allocator.free(owned_gid);
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+
+    grp_ptr.* = .{
+        .gid = owned_gid,
+        .name = owned_name,
+        .allocator = allocator,
+    };
+    return grp_ptr;
+}
+
 /// Lookup looks up a user by username.
 /// If the user cannot be found, the returned error is UnknownUser.
 pub fn lookup(allocator: Allocator, username: []const u8, options: Options) Error!*User {
@@ -238,18 +298,7 @@ pub fn lookup(allocator: Allocator, username: []const u8, options: Options) Erro
         }
         if (name.len == 0) name = u;
 
-        const user_ptr = try allocator.create(User);
-        errdefer allocator.destroy(user_ptr);
-
-        user_ptr.* = .{
-            .uid = try allocator.dupe(u8, uid_str),
-            .gid = try allocator.dupe(u8, gid_str),
-            .username = try allocator.dupe(u8, u),
-            .name = try allocator.dupe(u8, name),
-            .home_dir = try allocator.dupe(u8, home),
-            .allocator = allocator,
-        };
-        return user_ptr;
+        return try createUser(allocator, uid_str, gid_str, u, name, home);
     }
 
     return error.UnknownUser;
@@ -282,18 +331,7 @@ pub fn lookupId(allocator: Allocator, uid: []const u8, options: Options) Error!*
         }
         if (name.len == 0) name = u;
 
-        const user_ptr = try allocator.create(User);
-        errdefer allocator.destroy(user_ptr);
-
-        user_ptr.* = .{
-            .uid = try allocator.dupe(u8, line_uid),
-            .gid = try allocator.dupe(u8, gid_str),
-            .username = try allocator.dupe(u8, u),
-            .name = try allocator.dupe(u8, name),
-            .home_dir = try allocator.dupe(u8, home),
-            .allocator = allocator,
-        };
-        return user_ptr;
+        return try createUser(allocator, line_uid, gid_str, u, name, home);
     }
 
     return error.UnknownUserId;
@@ -317,15 +355,7 @@ pub fn lookupGroup(allocator: Allocator, name: []const u8, options: Options) Err
         _ = part_it.next() orelse continue; // password
         const gid_str = part_it.next() orelse continue;
 
-        const grp_ptr = try allocator.create(Group);
-        errdefer allocator.destroy(grp_ptr);
-
-        grp_ptr.* = .{
-            .gid = try allocator.dupe(u8, gid_str),
-            .name = try allocator.dupe(u8, gname),
-            .allocator = allocator,
-        };
-        return grp_ptr;
+        return try createGroup(allocator, gid_str, gname);
     }
 
     return error.UnknownGroup;
@@ -348,15 +378,7 @@ pub fn lookupGroupId(allocator: Allocator, gid: []const u8, options: Options) Er
         const line_gid = part_it.next() orelse continue;
         if (!mem.eql(u8, line_gid, gid)) continue;
 
-        const grp_ptr = try allocator.create(Group);
-        errdefer allocator.destroy(grp_ptr);
-
-        grp_ptr.* = .{
-            .gid = try allocator.dupe(u8, line_gid),
-            .name = try allocator.dupe(u8, gname),
-            .allocator = allocator,
-        };
-        return grp_ptr;
+        return try createGroup(allocator, line_gid, gname);
     }
 
     return error.UnknownGroupId;
@@ -372,35 +394,29 @@ pub fn current(allocator: Allocator, options: Options) Error!*User {
 
         if (env_user) |u| {
             if (lookup(allocator, u, options)) |usr| {
+                errdefer usr.deinit();
                 if (env_home) |h| {
                     if (h.len > 0 and !mem.eql(u8, usr.home_dir, h)) {
+                        const new_home = try allocator.dupe(u8, h);
                         allocator.free(usr.home_dir);
-                        usr.home_dir = try allocator.dupe(u8, h);
+                        usr.home_dir = new_home;
                     }
                 }
                 return usr;
-            } else |_| {
-                // If not in passwd file, synthesize from environment
-                const uid_num = currentUid() orelse 1000;
-                const gid_num = currentGid() orelse 1000;
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    // If not in passwd file, synthesize from environment
+                    const uid_num = currentUid() orelse 1000;
+                    const gid_num = currentGid() orelse 1000;
 
-                var uid_buf: [16]u8 = undefined;
-                var gid_buf: [16]u8 = undefined;
-                const uid_s = std.fmt.bufPrint(&uid_buf, "{d}", .{uid_num}) catch "1000";
-                const gid_s = std.fmt.bufPrint(&gid_buf, "{d}", .{gid_num}) catch "1000";
+                    var uid_buf: [16]u8 = undefined;
+                    var gid_buf: [16]u8 = undefined;
+                    const uid_s = std.fmt.bufPrint(&uid_buf, "{d}", .{uid_num}) catch "1000";
+                    const gid_s = std.fmt.bufPrint(&gid_buf, "{d}", .{gid_num}) catch "1000";
 
-                const usr = try allocator.create(User);
-                errdefer allocator.destroy(usr);
-
-                usr.* = .{
-                    .uid = try allocator.dupe(u8, uid_s),
-                    .gid = try allocator.dupe(u8, gid_s),
-                    .username = try allocator.dupe(u8, u),
-                    .name = try allocator.dupe(u8, u),
-                    .home_dir = try allocator.dupe(u8, env_home orelse "/"),
-                    .allocator = allocator,
-                };
-                return usr;
+                    return try createUser(allocator, uid_s, gid_s, u, u, env_home orelse "/");
+                },
             }
         }
     }
@@ -561,11 +577,8 @@ test "os/user live system root lookup" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-
     const opts = Options{
-        .io = threaded.io(),
+        .io = testing.io,
     };
 
     if (builtin.os.tag == .windows) return;

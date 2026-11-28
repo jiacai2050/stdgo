@@ -8,6 +8,7 @@ pub const Reader = struct {
     r: *std.Io.Reader,
     curr_header: ?Header = null,
     curr_remaining: u64 = 0,
+    curr_pad: u64 = 0,
     name_scratch: [100]u8 = undefined,
     reader_inst: std.Io.Reader = undefined,
     reader_buffer: [512]u8 = undefined,
@@ -17,6 +18,7 @@ pub const Reader = struct {
             .r = r,
             .curr_header = null,
             .curr_remaining = 0,
+            .curr_pad = 0,
         };
     }
 
@@ -58,9 +60,11 @@ pub const Reader = struct {
     /// Next advances to the next entry in the tar archive.
     pub fn next(self: *Reader) anyerror!?Header {
         // Skip remaining bytes of previous file + padding to 512 block
-        if (self.curr_remaining > 0) {
-            try self.skipBytes(self.curr_remaining);
+        const to_skip = self.curr_remaining + self.curr_pad;
+        if (to_skip > 0) {
+            try self.skipBytes(to_skip);
             self.curr_remaining = 0;
+            self.curr_pad = 0;
         }
 
         while (true) {
@@ -72,6 +76,8 @@ pub const Reader = struct {
             if (Header.parseBlock(block[0..block_size], &self.name_scratch)) |hdr| {
                 self.curr_header = hdr;
                 self.curr_remaining = hdr.size;
+                const rem = hdr.size % block_size;
+                self.curr_pad = if (rem != 0) block_size - rem else 0;
                 return hdr;
             } else {
                 // All zeroes block (end of archive or trailer)
@@ -91,13 +97,10 @@ pub const Reader = struct {
         if (nr == 0) return io.Error.EndOfStream;
 
         self.curr_remaining -= nr;
-        if (self.curr_remaining == 0) {
-            // Need to skip block alignment pad on subsequent next()
-            const rem = self.curr_header.?.size % block_size;
-            if (rem != 0) {
-                const pad = block_size - rem;
-                try self.skipBytes(pad);
-            }
+        if (self.curr_remaining == 0 and self.curr_pad > 0) {
+            const pad = self.curr_pad;
+            self.curr_pad = 0;
+            try self.skipBytes(pad);
         }
         return nr;
     }
@@ -168,5 +171,56 @@ test "archive.tar write and read roundtrip" {
     try testing.expectEqualStrings(file2_content, content2_buf[0..n2]);
 
     // Trailer EOF
+    try testing.expectEqual(@as(?Header, null), try tar_r.next());
+}
+
+test "archive.tar next skips unread and partially read files with block padding" {
+    const testing = std.testing;
+    const bytes = @import("../../bytes.zig");
+    const writer_mod = @import("writer.zig");
+
+    var tar_buf = bytes.Buffer.init(testing.allocator);
+    defer tar_buf.deinit();
+
+    var tar_w = writer_mod.Writer.init(tar_buf.writer());
+
+    const f1 = "file one unread content";
+    var h1 = Header{ .name = "one.txt", .mode = 0o644, .size = f1.len, .typeflag = .reg };
+    try tar_w.writeHeader(&h1);
+    _ = try tar_w.write(f1);
+
+    const f2 = "file two partially read content";
+    var h2 = Header{ .name = "two.txt", .mode = 0o644, .size = f2.len, .typeflag = .reg };
+    try tar_w.writeHeader(&h2);
+    _ = try tar_w.write(f2);
+
+    const f3 = "file three final";
+    var h3 = Header{ .name = "three.txt", .mode = 0o644, .size = f3.len, .typeflag = .reg };
+    try tar_w.writeHeader(&h3);
+    _ = try tar_w.write(f3);
+
+    try tar_w.close();
+
+    var tar_reader = tar_buf.reader();
+    var tar_r = Reader.init(&tar_reader);
+
+    // Entry 1: skip completely without calling read()
+    const rh1 = (try tar_r.next()).?;
+    try testing.expectEqualStrings("one.txt", rh1.name);
+
+    // Entry 2: read only 4 bytes, then skip the rest + padding
+    const rh2 = (try tar_r.next()).?;
+    try testing.expectEqualStrings("two.txt", rh2.name);
+    var partial: [4]u8 = undefined;
+    const np = try tar_r.read(&partial);
+    try testing.expectEqualStrings("file", partial[0..np]);
+
+    // Entry 3: must land cleanly on header and read full content
+    const rh3 = (try tar_r.next()).?;
+    try testing.expectEqualStrings("three.txt", rh3.name);
+    var buf3: [64]u8 = undefined;
+    const n3 = try tar_r.read(&buf3);
+    try testing.expectEqualStrings(f3, buf3[0..n3]);
+
     try testing.expectEqual(@as(?Header, null), try tar_r.next());
 }

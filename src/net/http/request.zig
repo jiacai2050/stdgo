@@ -12,7 +12,8 @@ pub const ParsedTarget = struct {
     request_target: []const u8,
 };
 
-/// Parses target URL into scheme, host, port, path/query, and TLS flag.
+/// Parses target URL into scheme, bare host (IPv6 brackets stripped), port,
+/// path/query (fragment stripped), and TLS flag.
 /// Supports http, https, socks5, and socks5h:
 /// - `socks5://`: Standard SOCKS5 proxy protocol (historically local DNS).
 /// - `socks5h://`: SOCKS5 proxy with remote Host DNS resolution (prevents DNS leaks).
@@ -51,32 +52,35 @@ pub fn parseUrlTarget(raw_url: []const u8) !ParsedTarget {
         scheme = "http";
     }
 
+    // Strip any #fragment before parsing authority and request target.
+    if (std.mem.indexOfScalar(u8, rest, '#')) |hash_idx| {
+        rest = rest[0..hash_idx];
+    }
+
     const delim_idx = std.mem.indexOfAny(u8, rest, "/?");
     const authority = if (delim_idx) |idx| rest[0..idx] else rest;
     const req_target = if (delim_idx) |idx| rest[idx..] else "/";
 
     var host: []const u8 = authority;
 
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon_idx| {
-        if (std.mem.startsWith(u8, authority, "[")) {
-            if (std.mem.indexOfScalar(u8, authority, ']')) |rb| {
-                if (colon_idx > rb) {
-                    host = authority[0..colon_idx];
-                    port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch {
-                        return error.InvalidPort;
-                    };
-                }
-            }
-        } else {
-            host = authority[0..colon_idx];
-            port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch {
+    if (std.mem.startsWith(u8, authority, "[")) {
+        const rb = std.mem.indexOfScalar(u8, authority, ']') orelse return error.InvalidHost;
+        host = authority[1..rb];
+        if (rb + 1 < authority.len) {
+            if (authority[rb + 1] != ':') return error.InvalidPort;
+            port = std.fmt.parseInt(u16, authority[rb + 2 ..], 10) catch {
                 return error.InvalidPort;
             };
         }
+    } else if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon_idx| {
+        host = authority[0..colon_idx];
+        port = std.fmt.parseInt(u16, authority[colon_idx + 1 ..], 10) catch {
+            return error.InvalidPort;
+        };
     }
 
     return .{
-        .scheme = if (is_tls) "https" else "http",
+        .scheme = scheme,
         .is_tls = is_tls,
         .host = host,
         .port = port,
@@ -132,27 +136,23 @@ pub const Request = struct {
         try self.header.set(name, value);
     }
 
+    /// Sets an in-memory slice body for the request and updates `Content-Length`.
+    /// Leaves `body_reader` and `get_body` null so the slice can be reused directly
+    /// across redirects and stale-connection retries without self-referential pointers.
     pub fn setBody(self: *Request, body: []const u8) !void {
-        self.body = body;
-        self.content_length = body.len;
-        self.slice_reader = std.Io.Reader.fixed(body);
-        self.body_reader = &self.slice_reader;
-        self.get_body_ctx = self;
-        self.get_body = struct {
-            fn rewind(ctx_ptr: *anyopaque) anyerror!*io.Reader {
-                const s: *Request = @ptrCast(@alignCast(ctx_ptr));
-                s.slice_reader.seek = 0;
-                return &s.slice_reader;
-            }
-        }.rewind;
-
-        if (self.cl_str) |s| {
-            self.allocator.free(s);
-            self.cl_str = null;
-        }
         const s = try std.fmt.allocPrint(self.allocator, "{d}", .{body.len});
-        self.cl_str = s;
+        errdefer self.allocator.free(s);
         try self.header.set("Content-Length", s);
+
+        if (self.cl_str) |old| {
+            self.allocator.free(old);
+        }
+        self.cl_str = s;
+        self.body = body;
+        self.body_reader = null;
+        self.get_body = null;
+        self.get_body_ctx = null;
+        self.content_length = body.len;
     }
 
     pub fn userAgent(self: *const Request) ?[]const u8 {
@@ -213,49 +213,75 @@ pub const Request = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    /// clone returns a copy of the request with a fresh header copy.
+    /// clone returns a copy of the request with an independent header copy and
+    /// no dangling self-referential pointers.
     pub fn clone(self: *const Request, allocator: std.mem.Allocator) !Request {
         var copy = Request.init(allocator, self.method, self.url);
-        copy.header.deinit();
-        copy.header = try self.header.clone(allocator);
+        errdefer copy.deinit();
+
+        try copy.header.entries.ensureTotalCapacity(allocator, self.header.entries.items.len);
+        for (self.header.entries.items) |entry| {
+            const name_copy = try allocator.dupe(u8, entry.name);
+            var name_owned = false;
+            errdefer if (!name_owned) allocator.free(name_copy);
+            try copy.extra_strings.append(allocator, name_copy);
+            name_owned = true;
+
+            const val_copy = try allocator.dupe(u8, entry.value);
+            var val_owned = false;
+            errdefer if (!val_owned) allocator.free(val_copy);
+            try copy.extra_strings.append(allocator, val_copy);
+            val_owned = true;
+
+            try copy.header.add(name_copy, val_copy);
+        }
+
         copy.body = self.body;
-        copy.body_reader = self.body_reader;
+        copy.body_reader = if (self.body != null) null else self.body_reader;
         copy.content_length = self.content_length;
+        copy.get_body = if (self.body != null) null else self.get_body;
+        copy.get_body_ctx = if (self.body != null) null else self.get_body_ctx;
         return copy;
     }
 
+    /// Sets a streaming reader body for the request, configuring either
+    /// `Content-Length` or `Transfer-Encoding: chunked`.
     pub fn setBodyReader(self: *Request, r: *io.Reader, cl: ?u64) !void {
-        self.body = null;
-        self.body_reader = r;
-        self.content_length = cl;
-
         if (cl) |len| {
-            if (self.cl_str) |s| {
-                self.allocator.free(s);
-                self.cl_str = null;
-            }
             const s = try std.fmt.allocPrint(self.allocator, "{d}", .{len});
-            self.cl_str = s;
+            errdefer self.allocator.free(s);
             try self.header.set("Content-Length", s);
+            if (self.cl_str) |old| {
+                self.allocator.free(old);
+            }
+            self.cl_str = s;
         } else {
             try self.header.set("Transfer-Encoding", "chunked");
         }
+
+        self.body = null;
+        self.body_reader = r;
+        self.content_length = cl;
     }
 
+    /// Sets the `Authorization` header using HTTP Basic Authentication.
     pub fn setBasicAuth(self: *Request, username: []const u8, password: []const u8) !void {
         const raw = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ username, password });
         defer self.allocator.free(raw);
 
         const enc_len = std.base64.standard.Encoder.calcSize(raw.len);
         const encoded = try self.allocator.alloc(u8, enc_len + 6);
-        errdefer self.allocator.free(encoded);
+        var owned_by_extra = false;
+        errdefer if (!owned_by_extra) self.allocator.free(encoded);
 
         @memcpy(encoded[0..6], "Basic ");
         _ = std.base64.standard.Encoder.encode(encoded[6..], raw);
         try self.extra_strings.append(self.allocator, encoded);
+        owned_by_extra = true;
         try self.header.set("Authorization", encoded);
     }
 
+    /// Adds a cookie to the request's `Cookie` header.
     pub fn addCookie(self: *Request, cookie: @import("cookie.zig").Cookie) !void {
         if (self.header.get("Cookie")) |existing| {
             const combined = try std.fmt.allocPrint(
@@ -263,8 +289,10 @@ pub const Request = struct {
                 "{s}; {s}={s}",
                 .{ existing, cookie.name, cookie.value },
             );
-            errdefer self.allocator.free(combined);
+            var owned_by_extra = false;
+            errdefer if (!owned_by_extra) self.allocator.free(combined);
             try self.extra_strings.append(self.allocator, combined);
+            owned_by_extra = true;
             try self.header.set("Cookie", combined);
         } else {
             const s = try std.fmt.allocPrint(
@@ -272,8 +300,10 @@ pub const Request = struct {
                 "{s}={s}",
                 .{ cookie.name, cookie.value },
             );
-            errdefer self.allocator.free(s);
+            var owned_by_extra = false;
+            errdefer if (!owned_by_extra) self.allocator.free(s);
             try self.extra_strings.append(self.allocator, s);
+            owned_by_extra = true;
             try self.header.set("Cookie", s);
         }
     }
@@ -314,4 +344,38 @@ test "parseUrlTarget with query string without slash" {
     try std.testing.expectEqualStrings("?foo=bar&baz=1", target.request_target);
     try std.testing.expectEqual(@as(u16, 443), target.port);
     try std.testing.expect(target.is_tls);
+}
+
+test "parseUrlTarget strips fragment and unbrackets IPv6 hosts" {
+    const t1 = try parseUrlTarget("http://[::1]:8080/path?x=1#section");
+    try std.testing.expectEqualStrings("::1", t1.host);
+    try std.testing.expectEqual(@as(u16, 8080), t1.port);
+    try std.testing.expectEqualStrings("/path?x=1", t1.request_target);
+
+    const t2 = try parseUrlTarget("https://[2001:db8::1]/#frag");
+    try std.testing.expectEqualStrings("2001:db8::1", t2.host);
+    try std.testing.expectEqual(@as(u16, 443), t2.port);
+    try std.testing.expectEqualStrings("/", t2.request_target);
+    try std.testing.expect(t2.is_tls);
+
+    const t3 = try parseUrlTarget("http://example.com#only-frag");
+    try std.testing.expectEqualStrings("example.com", t3.host);
+    try std.testing.expectEqualStrings("/", t3.request_target);
+}
+
+test "Request.setBody and clone have no dangling self-pointers" {
+    const testing = std.testing;
+    var req = try newRequest(testing.allocator, .POST, "http://example.com/submit", "payload");
+    try testing.expect(req.body != null);
+    try testing.expect(req.body_reader == null);
+    try testing.expect(req.get_body == null);
+    try testing.expect(req.get_body_ctx == null);
+
+    var cloned = try req.clone(testing.allocator);
+    defer cloned.deinit();
+    req.deinit();
+
+    try testing.expectEqualStrings("payload", cloned.body.?);
+    try testing.expect(cloned.body_reader == null);
+    try testing.expectEqualStrings("7", cloned.header.get("Content-Length").?);
 }

@@ -82,7 +82,7 @@ pub const Writer = struct {
     pub fn write(self: *Writer, data: []const u8) anyerror!usize {
         if (data.len == 0) return 0;
         self.hasher.update(data);
-        self.uncompressed_size +%= @intCast(data.len);
+        self.uncompressed_size +%= @truncate(data.len);
         try self.flate_writer.writer().writeAll(data);
         return data.len;
     }
@@ -203,7 +203,7 @@ pub const Reader = struct {
         const n = try self.decompress.reader.readSliceShort(buf);
         if (n > 0) {
             self.hasher.update(buf[0..n]);
-            self.uncompressed_size +%= @intCast(n);
+            self.uncompressed_size +%= @truncate(n);
             return n;
         }
 

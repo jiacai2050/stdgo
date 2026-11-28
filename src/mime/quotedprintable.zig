@@ -107,17 +107,15 @@ pub const Reader = struct {
         };
     }
 
+    /// Reads all remaining quoted-printable input from the underlying reader and returns the decoded bytes.
+    /// Caller owns the returned slice.
     pub fn readAllDecoded(self: *Reader) ![]u8 {
         var raw_buf = std.ArrayList(u8).empty;
         defer raw_buf.deinit(self.allocator);
 
         var chunk: [512]u8 = undefined;
         while (true) {
-            var dst = std.Io.Writer.fixed(&chunk);
-            const n = self.src.stream(&dst, .unlimited) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => |e| return e,
-            };
+            const n = try self.src.readSliceShort(&chunk);
             if (n == 0) break;
             try raw_buf.appendSlice(self.allocator, chunk[0..n]);
         }
@@ -157,4 +155,22 @@ test "mime/quotedprintable encode and decode" {
     const dec_soft_lf = try decodeAlloc(allocator, soft_break_lf);
     defer allocator.free(dec_soft_lf);
     try testing.expectEqualStrings("Soft breaktest", dec_soft_lf);
+}
+
+test "mime/quotedprintable Reader.readAllDecoded handles >512B input" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const raw_arr: [1024]u8 = @splat('A');
+    const raw: []const u8 = &raw_arr;
+    const enc = try encodeAlloc(allocator, raw);
+    defer allocator.free(enc);
+    try testing.expect(enc.len > 512);
+
+    var src = std.Io.Reader.fixed(enc);
+    var qp_reader = Reader.init(allocator, &src);
+    const dec = try qp_reader.readAllDecoded();
+    defer allocator.free(dec);
+
+    try testing.expectEqualStrings(raw, dec);
 }
