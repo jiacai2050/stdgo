@@ -297,20 +297,13 @@ pub const Logger = struct {
     pub const max_attr_groups: usize = 32;
 
     h: Handler,
-    /// Optional std.Io clock source; when null, log timestamps default to 0.
-    io: ?std.Io = null,
+    /// Required `std.Io` clock source used to stamp each log record with wall-clock Unix seconds.
+    io: std.Io,
     attr_groups: [max_attr_groups][]const Attr = @splat(&.{}),
     attr_group_count: usize = 0,
 
-    /// Initializes a Logger with the given Handler and no clock source (timestamps default to 0).
-    pub fn init(h: Handler) Logger {
-        return .{
-            .h = h,
-        };
-    }
-
-    /// Initializes a Logger with the given Handler and std.Io clock source for real timestamps.
-    pub fn initWithIo(h: Handler, clock_io: std.Io) Logger {
+    /// Initializes a Logger with the given Handler and `std.Io` clock source.
+    pub fn init(h: Handler, clock_io: std.Io) Logger {
         return .{
             .h = h,
             .io = clock_io,
@@ -321,10 +314,10 @@ pub const Logger = struct {
     pub fn log(self: Logger, level: Level, msg: []const u8, attrs: []const Attr) !void {
         if (!self.h.enabled(level)) return;
 
-        const now_sec: i64 = if (self.io) |clock_io|
-            @intCast(@divFloor(std.Io.Clock.real.now(clock_io).nanoseconds, std.time.ns_per_s))
-        else
-            0;
+        const now_sec: i64 = @intCast(@divFloor(
+            std.Io.Clock.real.now(self.io).nanoseconds,
+            std.time.ns_per_s,
+        ));
 
         return self.h.handle(.{
             .time_unix_sec = now_sec,
@@ -335,18 +328,22 @@ pub const Logger = struct {
         });
     }
 
+    /// Logs a message at `.Debug` severity.
     pub fn debug(self: Logger, msg: []const u8, attrs: []const Attr) !void {
         return self.log(.Debug, msg, attrs);
     }
 
+    /// Logs a message at `.Info` severity.
     pub fn info(self: Logger, msg: []const u8, attrs: []const Attr) !void {
         return self.log(.Info, msg, attrs);
     }
 
+    /// Logs a message at `.Warn` severity.
     pub fn warn(self: Logger, msg: []const u8, attrs: []const Attr) !void {
         return self.log(.Warn, msg, attrs);
     }
 
+    /// Logs a message at `.Error` severity.
     pub fn errorLevel(self: Logger, msg: []const u8, attrs: []const Attr) !void {
         return self.log(.Error, msg, attrs);
     }
@@ -371,7 +368,7 @@ test "log.slog TextHandler formatting" {
     defer buf.deinit();
 
     var th = TextHandler.init(buf.writer(), .Info);
-    const logger = Logger.init(th.handler());
+    const logger = Logger.init(th.handler(), testing.io);
 
     const attrs = [_]Attr{
         Attr.string("user", "alice"),
@@ -398,7 +395,7 @@ test "log.slog JSONHandler formatting" {
     defer buf.deinit();
 
     var jh = JSONHandler.init(buf.writer(), .Warn);
-    const logger = Logger.init(jh.handler());
+    const logger = Logger.init(jh.handler(), testing.io);
 
     const attrs = [_]Attr{
         Attr.string("path", "/api/v1/resource"),
@@ -426,7 +423,7 @@ test "log.slog Logger.with child logger" {
     defer buf.deinit();
 
     var th = TextHandler.init(buf.writer(), .Debug);
-    const root_logger = Logger.init(th.handler());
+    const root_logger = Logger.init(th.handler(), testing.io);
 
     const common = [_]Attr{
         Attr.string("component", "auth_service"),
@@ -447,7 +444,7 @@ test "log.slog chained with, >32 attrs, long messages, quoting, and real clock" 
     defer buf.deinit();
 
     var th = TextHandler.init(buf.writer(), .Debug);
-    const root_logger = Logger.initWithIo(th.handler(), testing.io);
+    const root_logger = Logger.init(th.handler(), testing.io);
 
     var many_attrs: [40]Attr = undefined;
     for (&many_attrs, 0..) |*a, idx| {

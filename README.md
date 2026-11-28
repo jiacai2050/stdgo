@@ -5,7 +5,7 @@
 [![Zig Version](https://img.shields.io/badge/zig-0.17.0-blue.svg)](https://ziglang.org/download/0.17.0/release-notes.html)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Bring Go standard library ergonomics, unified streaming abstractions (`io.Reader` / `io.Writer`), and high-utility packages to **Zig 0.17** — with zero hidden global state, explicit dependency injection, and no C dependencies.
+Bring Go standard library ergonomics, unified streaming abstractions (`io.Reader` / `io.Writer`), and high-utility packages to **Zig 0.17** — with zero hidden global state, explicit dependency injection, and zero C dependencies by default (optional `-Dsqlite=true` for SQLite).
 
 - 📖 **API Documentation**: [https://jiacai2050.github.io/stdgo/](https://jiacai2050.github.io/stdgo/)
 - 🗺️ **Roadmap & Status**: [roadmap.md](roadmap.md)
@@ -19,7 +19,10 @@ Bring Go standard library ergonomics, unified streaming abstractions (`io.Reader
 Add `stdgo` to your project using `zig fetch`:
 
 ```bash
+# Latest version
 zig fetch --save git+https://github.com/jiacai2050/stdgo.git
+# Tagged version
+zig fetch --save git+https://github.com/jiacai2050/stdgo.git#v0.1.0
 ```
 
 In your `build.zig`:
@@ -78,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
     defer log_buf.deinit();
 
     var text_handler = stdgo.log.slog.TextHandler.init(log_buf.writer(), .Info);
-    var logger = stdgo.log.slog.Logger.init(text_handler.handler());
+    var logger = stdgo.log.slog.Logger.init(text_handler.handler(), io);
     try logger.info("server initialized", &.{
         stdgo.log.slog.Attr.int("port", port),
         stdgo.log.slog.Attr.string("host", host),

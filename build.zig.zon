@@ -1,6 +1,6 @@
 .{
     .name = .stdgo,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0x2462b89c8d349bf8,
     .dependencies = .{
@@ -13,6 +13,8 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "LICENSE",
+        "README.md",
         "src",
     },
 }

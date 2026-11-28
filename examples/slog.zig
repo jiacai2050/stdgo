@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
     defer text_buf.deinit();
 
     var text_handler = slog.TextHandler.init(text_buf.writer(), .Info);
-    var text_logger = slog.Logger.init(text_handler.handler());
+    var text_logger = slog.Logger.init(text_handler.handler(), init.io);
 
     try text_logger.info("server started", &.{
         slog.Attr.string("env", "production"),
@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     defer json_buf.deinit();
 
     var json_handler = slog.JSONHandler.init(json_buf.writer(), .Debug);
-    var json_logger = slog.Logger.init(json_handler.handler());
+    var json_logger = slog.Logger.init(json_handler.handler(), init.io);
 
     try json_logger.info("user signup completed", &.{
         slog.Attr.string("user_id", "usr_99182"),
@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     defer scoped_buf.deinit();
 
     var scoped_handler = slog.TextHandler.init(scoped_buf.writer(), .Info);
-    const base_logger = slog.Logger.init(scoped_handler.handler());
+    const base_logger = slog.Logger.init(scoped_handler.handler(), init.io);
 
     // Bind request_id and trace_id to all subsequent log lines
     const req_logger = base_logger.with(&.{
