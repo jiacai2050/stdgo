@@ -35,7 +35,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (have_sqlite) {
         std.debug.print("=== stdgo: database/sql Example (Engine: Real C SQLite3) ===\n\n", .{});
-        var sqlite_drv = sql.sqlite.SQLiteDriver.init(allocator);
+        var sqlite_drv = sql.sqlite.SQLiteDriver.init(allocator, .{
+            .busy_timeout_ms = 5000,
+            .foreign_keys = true,
+        });
 
         try runDatabaseDemo(
             allocator,
@@ -309,8 +312,8 @@ fn runDatabaseDemo(
     // 9. Engine-specific demonstrations
     if (is_sqlite) {
         std.debug.print("8. Native Detailed Error Reporting (conn.lastError):\n", .{});
-        const conn = try db.conn(.none);
-        defer conn.release();
+        var conn = try db.conn(.none);
+        defer conn.close();
 
         const exec_res = conn.exec("SELECT * FORM products", .{}, .none);
         if (exec_res) |_| {} else |err| {

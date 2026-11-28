@@ -11,7 +11,7 @@
 2. **栈上参数绑定（Zero-Allocation Bindings）**：
    - 参数绑定不走 Go 运行时的 `[]any` 装箱，而是在编译期根据元组或结构体类型在栈上分配固定长度缓冲区，没有堆分配开销。
 3. **编译期强类型扫描（Comptime Struct Scanning）**：
-   - 提供 `nextStruct` 和 `scanStruct`，在编译期按字段名称与顺序将列数据解码到目标结构体，不需要类似 Go 中 `sqlx` 的运行时反射库。
+   - 提供 `nextStruct` / `nextStructOwned` 和 `scanStruct` / `scanStructOwned`，在编译期严格按**区分大小写的列名**将结果解码到目标结构体（支持任意列顺序与 `SELECT *` 子集投影，零反射开销）。
 4. **统一超时控制（Monotonic Awake Deadline）**：
    - 涉及 I/O 和连接池等待的操作接收 `Deadline`。内部基于 `std.Io.Clock.awake` 单调时钟计算时间，系统休眠期间不消耗超时配额。
 
@@ -30,8 +30,13 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
 
-    // 1. 初始化驱动（以 SQLite 为例，亦可使用内置 MockDriver）
-    var sqlite_drv = sql.sqlite.SQLiteDriver.init(allocator);
+    // 1. 初始化驱动（与 std.mem.Allocator / std.Io 一致，驱动实例需比 DB 活得更久）
+    var sqlite_drv = sql.sqlite.SQLiteDriver.init(allocator, .{
+        .busy_timeout_ms = 5000,
+        .foreign_keys = true,
+        .journal_mode = .wal,
+        .synchronous = .normal,
+    });
 
     // 2. 打开连接池
     const db = try sql.DB.open(
@@ -116,6 +121,17 @@ const user = row.scanStruct(UserSummary, .none) catch |err| switch (err) {
 std.debug.print("User: {s}, Balance: {d:.2}\n", .{ user.name, user.balance });
 ```
 
+如果需要在 `row.close()` 后继续持有结构体中的 `[]const u8` / `Blob` 字段，可以使用 `scanStructOwned`（类似 `std.json.Parsed(T)`，返回 `sql.Owned(T)` 包装体，自动深拷贝切片并立即关闭 `row` 归还连接），通过 `defer owned.deinit()` 释放：
+
+```zig
+var owned_row = db.queryRow("SELECT name, balance FROM users WHERE id = ?", .{1}, .none);
+const owned = try owned_row.scanStructOwned(allocator, UserSummary, .none);
+defer owned.deinit();
+
+// 此时连接已自动归还连接池，owned.value.name 可安全跨作用域持有
+std.debug.print("Owned user: {s}\n", .{owned.value.name});
+```
+
 ### 2.5 查询多行结果集（Query & nextStruct）
 
 ```zig
@@ -150,8 +166,11 @@ if (rows.err()) |err| return err;
 ```
 
 > [!IMPORTANT]
-> **字符串与切片的内存借用生命周期**：
-> 扫描出的 `[]const u8`（字符串或 Blob 数据）直接借用驱动内部缓冲区。在调用 `rows.close()` 或 `row.close()` 后，这部分内存会被释放或复用；若需要在结果集关闭后继续持有该数据，调用方须使用 `allocator.dupe` 进行复制。
+> **字符串与切片的内存借用生命周期（以及 `scanStructOwned`）**：
+> - `scanStruct` / `scanStructOwned` / `nextStruct` / `nextStructOwned` 严格按**区分大小写的列名**映射字段（与 `SELECT` 列序无关，且忽略结构体未声明的多余列）；表达式列请用 `AS` 起别名，若字段缺失返回 `error.ColumnNotFound`，同名列冲突返回 `error.AmbiguousColumnName`。
+> - 扫描出的 `[]const u8`（字符串或 `Blob` 数据）直接借用驱动内部缓冲区。在调用 `rows.close()` 或 `row.close()` 后，这部分内存会被释放或复用；若需要在结果集关闭后继续持有该数据，单行可调用 `row.scanStructOwned(allocator, T, .none)`，多行迭代可调用 `rows.nextStructOwned(allocator, T, .none)`（均返回 `sql.Owned(T)`，自动深拷贝切片，通过 `defer owned.deinit()` 释放）。
+> - `rows.columnName(i)` 与 `rows.columnType(i)` 返回的列名/类型名切片同样借用自驱动内部内存，仅在 `rows.close()` 前有效。
+> - 对于不含切片/指针的纯值类型结构体（如 `struct { count: i64 }`），`row.scanStruct()` 成功后会自动关闭并归还连接；但仍建议配合 `defer row.close()`（幂等）。
 
 ### 2.6 事务管理（ACID Transactions）
 
@@ -160,7 +179,8 @@ var tx = try db.beginTx(.{
     .isolation = .serializable,
     .read_only = false,
 }, .none);
-// 退出作用域时若未提交则回滚
+// 用 defer 而非 errdefer：覆盖报错和正常提前 return 两种未提交路径，避免连接泄漏；
+// 若已成功 commit()，rollback() 会直接返回 error.TxDone（不触碰数据库），由 catch {} 安全忽略。
 defer tx.rollback(.none) catch {};
 
 _ = try tx.exec("UPDATE accounts SET balance = balance - 100 WHERE id = 1", .{}, .none);
@@ -190,10 +210,13 @@ for (batch) |item| {
 ```
 
 > [!NOTE]
-> **参数生命周期与多语句约定（SQLite 驱动）**：
+> **连接独占、参数生命周期与多语句约定**：
+> - **`DB.prepare()` 会独占一条连接池连接**直到调用 `stmt.close()`（与 Go `database/sql` 的连接池共享逻辑语句不同），因此请按作用域使用并及时 `defer stmt.close()`，不要跨请求长期缓存 `DB.prepare()` 返回的语句以免耗尽连接池。
 > - `exec()` 绑定切片参数采用零拷贝（`SQLITE_STATIC`），并在返回前自动复位语句与清空绑定；无参数调用（`.{}`）支持顺序执行多条 SQL（如建表/迁移脚本）。
 > - `query()` 绑定切片参数会由驱动拷贝（`SQLITE_TRANSIENT`），调用方的临时缓冲区无需存活到 `rows.close()`；`prepare()` 与带参数的 `exec()` 严格要求单条 SQL，尾部存在多余可执行语句时返回 `error.SQLiteMultipleStatements`。
 > - `Tx.commit()` / `Tx.rollback()` 或提前 `stmt.close()` 会自动关闭并失效关联的 `Rows` 与 `Stmt`，避免悬空游标与 use-after-free。
+> - `stdgo.time.Time` 默认按 Unix 秒（`i64`）绑定，扫描时支持 Unix 秒及 `RFC3339Nano` / `RFC3339` / `2006-01-02 15:04:05` / `2006-01-02` 字符串；若需写入亚秒精度，请显式格式化或实现自定义 `.bind()`。
+> - 如需获取 SQLite 详细错误文本（如约束冲突或语法错误细节），可通过 `var conn = try db.conn(.none); defer conn.close();` 借出独享连接后调用 `conn.lastError()`，或在 `Rows` 上调用 `rows.lastError()`。`conn.close()` 是幂等的，且会自动关闭并失效由该连接派生的未关闭 `Tx`、`Stmt`、`Rows`（返回 `error.ConnDone`）。
 
 ---
 
@@ -278,9 +301,19 @@ std.debug.print("Blob len: {d}\n", .{file.payload.data.len});
   SQL 中包含 `:name`、`@name` 等具名占位符，但执行时传入了位置元组（如 `.{ "val" }`）。请改为匿名结构体 `.{ .name = "val" }`。
 - **`error.SQLiteParameterCountMismatch`**：
   传入参数的数量与 SQL 语句中的占位符数量不一致。
+- **`error.ConnDone`**：
+  通过 `db.conn()` 借出的独享连接已调用 `conn.close()` 归还，不能继续在该连接或其尚未关闭的 `Tx`/`Stmt`/`Rows` 上执行操作。
+- **`error.StmtClosed`**：
+  预编译语句已调用 `stmt.close()` 关闭，不能继续在其上执行 `exec`/`query` 或读取其关联的 `Rows`。
+- **`error.IntegerOverflow`**：
+  绑定超过 `i64` 范围的无符号整数（如大 `u64`）或扫描整数溢出目标类型宽度时返回。
 - **`error.TxDone`**：
   事务已提交或已回滚，不能继续在该事务或事务内的 `TxStmt` 上执行操作。
 - **`error.ErrNoRows`**：
   `queryRow` 未匹配到任何数据行，对应 Go 的 `sql.ErrNoRows`。
+- **`error.ColumnNotFound`**：
+  `scanStruct` / `nextStruct` 中目标结构体的某个字段在结果集中找不到精确同名（区分大小写）的列。
+- **`error.AmbiguousColumnName`**：
+  结果集中存在多个与目标结构体字段同名的列（常见于 `JOIN`），请使用 `AS` 为列起唯一别名。
 - **`error.ColumnCountMismatch`**：
-  目标结构体的字段数量与 SQL 返回的列数不一致。
+  `scanValues` 或 `Rows.next` 传入的 `[]Value` 长度与 SQL 返回列数不一致。

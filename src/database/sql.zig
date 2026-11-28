@@ -9,7 +9,6 @@ const driver_pkg = @import("sql/driver.zig");
 pub const driver = driver_pkg;
 pub const sqlite = if (build_options.have_sqlite) @import("sql/sqlite.zig") else struct {};
 const Allocator = std.mem.Allocator;
-const Mutex = @import("../sync/mutex.zig").Mutex;
 const Deadline = @import("../io/deadline.zig").Deadline;
 const time_pkg = @import("../time/time.zig");
 pub const Time = time_pkg.Time;
@@ -18,14 +17,25 @@ pub const Value = driver.Value;
 pub const Result = driver.Result;
 pub const IsolationLevel = driver.IsolationLevel;
 pub const TxOptions = driver.TxOptions;
+/// Returned by drivers when a pooled connection is broken and should be discarded.
 pub const ErrBadConn = driver.ErrBadConn;
+/// Returned by `Row.scan` / `Row.scanStruct` when a query matches zero rows.
 pub const ErrNoRows = error.ErrNoRows;
+/// Returned when an operation is attempted on a committed or rolled-back `Tx`.
+pub const ErrTxDone = error.TxDone;
+/// Returned when an operation is attempted on a closed `Stmt`.
+pub const ErrStmtClosed = error.StmtClosed;
+/// Returned when an operation is attempted on a closed `Conn` or its invalidated children.
+pub const ErrConnDone = error.ConnDone;
 pub const ColumnType = driver.ColumnType;
+pub const DecimalSize = driver.DecimalSize;
 pub const NamedValue = driver.NamedValue;
+pub const MockDriver = @import("sql/mock.zig").MockDriver;
 
 pub const Blob = driver.Blob;
 pub const blob = driver.blob;
 
+/// DBStats contains database connection pool statistics.
 pub const DBStats = struct {
     max_open_connections: usize,
     open_connections: usize,
@@ -72,11 +82,11 @@ inline fn withNamedValues(
         var nv_buf: [s_info.field_names.len]NamedValue = undefined;
         if (s_info.is_tuple) {
             inline for (s_info.field_names, 0..) |name, i| {
-                nv_buf[i] = .{ .name = null, .value = Value.bind(@field(args, name)) };
+                nv_buf[i] = .{ .name = null, .value = try Value.bind(@field(args, name)) };
             }
         } else {
             inline for (s_info.field_names, 0..) |name, i| {
-                nv_buf[i] = .{ .name = name, .value = Value.bind(@field(args, name)) };
+                nv_buf[i] = .{ .name = name, .value = try Value.bind(@field(args, name)) };
             }
         }
         return @call(.auto, func, .{ ctx, &nv_buf });
@@ -86,6 +96,7 @@ inline fn withNamedValues(
 }
 
 /// Scans a slice of driver Values directly into a destination struct at compile time.
+/// Columns are mapped strictly by position: the i-th column populates the i-th struct field.
 pub fn scanValues(comptime T: type, values: []const Value) !T {
     const type_info = @typeInfo(T);
     if (type_info != .@"struct") {
@@ -100,6 +111,147 @@ pub fn scanValues(comptime T: type, values: []const Value) !T {
         @field(result, name) = try values[i].scan(FieldType);
     }
     return result;
+}
+
+const max_stack_scan_columns: usize = 128;
+
+fn resolveColumnMapping(
+    rows: *Rows,
+    comptime T: type,
+    col_count: usize,
+) ![(@typeInfo(T).@"struct").field_names.len]usize {
+    const s_info = @typeInfo(T).@"struct";
+    var mapping: [s_info.field_names.len]usize = undefined;
+    inline for (s_info.field_names, 0..) |field_name, field_idx| {
+        var found_col: ?usize = null;
+        for (0..col_count) |col_idx| {
+            if (std.mem.eql(u8, rows.columnName(col_idx), field_name)) {
+                if (found_col != null) {
+                    return error.AmbiguousColumnName;
+                }
+                found_col = col_idx;
+            }
+        }
+        mapping[field_idx] = found_col orelse return error.ColumnNotFound;
+    }
+    return mapping;
+}
+
+fn scanValuesByMapping(
+    comptime T: type,
+    values: []const Value,
+    mapping: *const [(@typeInfo(T).@"struct").field_names.len]usize,
+) !T {
+    const s_info = @typeInfo(T).@"struct";
+    var result: T = undefined;
+    inline for (s_info.field_names, s_info.field_types, 0..) |name, FieldType, i| {
+        @field(result, name) = try values[mapping[i]].scan(FieldType);
+    }
+    return result;
+}
+
+fn typeBorrowsDriverMemory(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (T == Blob) return true;
+    if (T == time_pkg.Time) return false;
+    if (T == Value) return true;
+    return switch (info) {
+        .optional => |opt| typeBorrowsDriverMemory(opt.child),
+        .pointer => true,
+        .@"struct" => |s| {
+            if (@hasDecl(T, "scan")) return true;
+            inline for (s.field_types) |FieldType| {
+                if (typeBorrowsDriverMemory(FieldType)) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
+}
+
+fn dupeOwnedField(allocator: Allocator, comptime FieldType: type, val: FieldType) !FieldType {
+    if (FieldType == []const u8) {
+        return try allocator.dupe(u8, val);
+    }
+    if (FieldType == Blob) {
+        return Blob.init(try allocator.dupe(u8, val.data));
+    }
+    if (FieldType == ?[]const u8) {
+        if (val) |s| return try allocator.dupe(u8, s);
+        return null;
+    }
+    if (FieldType == ?Blob) {
+        if (val) |b| return Blob.init(try allocator.dupe(u8, b.data));
+        return null;
+    }
+    if (comptime typeBorrowsDriverMemory(FieldType)) {
+        @compileError(
+            "Row.scanStructOwned cannot duplicate field type: " ++ @typeName(FieldType),
+        );
+    }
+    return val;
+}
+
+fn freeOwnedField(allocator: Allocator, comptime FieldType: type, val: FieldType) void {
+    if (FieldType == []const u8) {
+        allocator.free(val);
+        return;
+    }
+    if (FieldType == Blob) {
+        allocator.free(val.data);
+        return;
+    }
+    if (FieldType == ?[]const u8) {
+        if (val) |s| allocator.free(s);
+        return;
+    }
+    if (FieldType == ?Blob) {
+        if (val) |b| allocator.free(b.data);
+        return;
+    }
+}
+
+/// Owned wraps a scanned struct together with the allocator used to duplicate
+/// its `[]const u8` and `Blob` fields (analogous to `std.json.Parsed(T)`).
+/// Call `deinit()` when done to release all duplicated slice memory.
+pub fn Owned(comptime T: type) type {
+    const type_info = @typeInfo(T);
+    if (type_info != .@"struct") {
+        @compileError("expected a struct type, found " ++ @typeName(T));
+    }
+    return struct {
+        value: T,
+        allocator: Allocator,
+
+        /// Releases all `[]const u8` and `Blob` fields duplicated for `value`.
+        pub fn deinit(self: @This()) void {
+            const s_info = @typeInfo(T).@"struct";
+            inline for (s_info.field_names, s_info.field_types) |name, FieldType| {
+                freeOwnedField(self.allocator, FieldType, @field(self.value, name));
+            }
+        }
+    };
+}
+
+fn dupeOwnedStruct(allocator: Allocator, comptime T: type, value: T) !Owned(T) {
+    const s_info = @typeInfo(T).@"struct";
+    var result = value;
+    var duped_count: usize = 0;
+    errdefer {
+        inline for (s_info.field_names, s_info.field_types, 0..) |name, FieldType, i| {
+            if (i < duped_count) {
+                freeOwnedField(allocator, FieldType, @field(result, name));
+            }
+        }
+    }
+    inline for (s_info.field_names, s_info.field_types, 0..) |name, FieldType, i| {
+        @field(result, name) = try dupeOwnedField(allocator, FieldType, @field(result, name));
+        duped_count = i + 1;
+    }
+    return .{
+        .value = result,
+        .allocator = allocator,
+    };
 }
 
 /// Row is the result of calling QueryRow to select a single row.
@@ -130,19 +282,58 @@ pub const Row = struct {
     }
 
     /// ScanStruct copies the matched row's columns directly into a strongly-typed struct.
-    /// If more than one row matches the query, ScanStruct uses the first row and discards the rest.
-    /// If no rows match the query, ScanStruct returns error.ErrNoRows.
-    /// Note: Any string/bytes in the returned struct point into driver memory
-    /// while the row is open; use `defer row.close()` to release after use.
+    /// Columns are matched strictly by case-sensitive column name (independent of column order,
+    /// and extra columns in the query are ignored). For expressions, alias them with `AS`.
+    /// Returns `error.ColumnNotFound` if a struct field has no matching column,
+    /// `error.AmbiguousColumnName` if multiple columns share a field's name,
+    /// `error.TooManyColumns` if the result set exceeds 128 columns, or `error.ErrNoRows`
+    /// if no rows match.
+    ///
+    /// Lifetime:
+    /// - If `T` contains only value types (no slices, `Blob`, `Value`, or custom `.scan()` types),
+    ///   the row is automatically closed and its pooled connection is released before returning.
+    /// - If `T` contains `[]const u8` or `Blob`, those slices borrow driver memory while the row
+    ///   is open; use `defer row.close()` after use, or call `scanStructOwned()` instead.
     pub fn scanStruct(self: *Row, comptime T: type, deadline: Deadline) !T {
-        const type_info = @typeInfo(T);
-        if (type_info != .@"struct") {
-            @compileError("expected a struct type, found " ++ @typeName(T));
+        errdefer self.close();
+        if (self.err_state) |e| return e;
+        var r = &(self.rows orelse return error.ErrNoRows);
+        const maybe_result = r.nextStruct(T, deadline) catch |scan_err| {
+            self.err_state = scan_err;
+            return scan_err;
+        };
+        const result = maybe_result orelse return error.ErrNoRows;
+        if (comptime !typeBorrowsDriverMemory(T)) {
+            self.close();
         }
-        const field_count = comptime type_info.@"struct".field_names.len;
-        var dest: [field_count]Value = undefined;
-        try self.scan(&dest, deadline);
-        return scanValues(T, &dest);
+        return result;
+    }
+
+    /// ScanStructOwned copies the matched row's columns into a strongly-typed struct,
+    /// duplicates any `[]const u8` or `Blob` fields using `allocator`, and immediately
+    /// closes the underlying query so the pooled connection is returned to the pool.
+    /// Columns are matched strictly by case-sensitive column name (independent of column order,
+    /// and extra columns in the query are ignored). For expressions, alias them with `AS`.
+    /// Returns `error.ColumnNotFound` if a struct field has no matching column,
+    /// `error.AmbiguousColumnName` if multiple columns share a field's name, or
+    /// `error.ErrNoRows` if no rows match.
+    ///
+    /// Returns an `Owned(T)` wrapper; access the scanned struct via `.value` and call
+    /// `defer owned.deinit()` to release all duplicated slices.
+    pub fn scanStructOwned(
+        self: *Row,
+        allocator: Allocator,
+        comptime T: type,
+        deadline: Deadline,
+    ) !Owned(T) {
+        defer self.close();
+        if (self.err_state) |e| return e;
+        var r = &(self.rows orelse return error.ErrNoRows);
+        const maybe_owned = r.nextStructOwned(allocator, T, deadline) catch |scan_err| {
+            self.err_state = scan_err;
+            return scan_err;
+        };
+        return maybe_owned orelse return error.ErrNoRows;
     }
 
     /// Close closes the underlying query and releases the pooled connection back to the pool.
@@ -159,36 +350,39 @@ pub const Row = struct {
         if (self.rows) |*r| return r.err();
         return null;
     }
+
+    /// LastError returns the error message for the last operation on the underlying connection.
+    /// The returned slice borrows driver memory and is only valid until `row.close()`.
+    pub fn lastError(self: *Row) ?[]const u8 {
+        if (self.rows) |*r| return r.lastError();
+        return null;
+    }
 };
 
 /// Internal pooled connection tracked by DB.
-pub const PooledConn = struct {
+const PooledConn = struct {
     raw: driver.Conn,
     created_at_ns: i128,
     last_used_at_ns: i128,
     db: *DB,
     from_pool: bool = false,
+    bad: bool = false,
     prev: ?*PooledConn = null,
     next: ?*PooledConn = null,
 
-    pub fn release(self: *PooledConn) void {
+    fn release(self: *PooledConn) void {
         self.db.putConn(self);
     }
 
-    /// Interrupt aborts any in-progress query on this connection out-of-band.
-    /// Returns true if supported and signaled, false otherwise.
-    pub fn interrupt(self: *PooledConn) bool {
+    fn interrupt(self: *PooledConn) bool {
         return self.raw.interrupt();
     }
 
-    /// LastError returns the error message for the last operation on this connection.
-    pub fn lastError(self: *PooledConn) ?[]const u8 {
+    fn lastError(self: *PooledConn) ?[]const u8 {
         return self.raw.lastError();
     }
 
-    /// Exec executes a query on this specific connection.
-    /// Supports positional tuples `.{ ... }`, named structs `.{ .name = ... }`, or empty `.{}`.
-    pub fn exec(
+    fn exec(
         self: *PooledConn,
         query_str: []const u8,
         args: anytype,
@@ -211,8 +405,7 @@ pub const PooledConn = struct {
         );
     }
 
-    /// Query executes a query returning rows on this connection.
-    pub fn query(
+    fn query(
         self: *PooledConn,
         query_str: []const u8,
         args: anytype,
@@ -231,6 +424,7 @@ pub const PooledConn = struct {
                 const raw_rows = try stmt.query(io, nv, r.dl);
                 return Rows{
                     .pooled_conn = null,
+                    .error_conn = r.conn,
                     .stmt = stmt,
                     .raw_rows = raw_rows,
                     .io = io,
@@ -244,21 +438,13 @@ pub const PooledConn = struct {
         );
     }
 
-    /// QueryRow executes a query that is expected to return at most one row.
-    pub fn queryRow(
+    fn beginTxInternal(
         self: *PooledConn,
-        query_str: []const u8,
-        args: anytype,
+        opts: TxOptions,
         deadline: Deadline,
-    ) Row {
-        const r = self.query(query_str, args, deadline) catch |err| {
-            return Row{ .err_state = err };
-        };
-        return Row{ .rows = r };
-    }
-
-    /// BeginTx starts a transaction on this connection.
-    pub fn beginTx(self: *PooledConn, opts: TxOptions, deadline: Deadline) !Tx {
+        owns_conn: bool,
+        conn_state: ?*ConnState,
+    ) !Tx {
         try self.db.checkOperation(deadline);
         const state = try self.db.allocator.create(TxState);
         errdefer self.db.allocator.destroy(state);
@@ -266,11 +452,233 @@ pub const PooledConn = struct {
         state.* = .{
             .allocator = self.db.allocator,
             .pooled_conn = self,
+            .owns_conn = owns_conn,
+            .conn_state = conn_state,
             .raw_tx = raw_tx,
+            .ref_count = if (conn_state != null) 2 else 1,
         };
+        if (conn_state) |cs| {
+            cs.active_tx = state;
+        }
         return Tx{
             .state = state,
         };
+    }
+};
+
+/// Internal heap-allocated state for a user-borrowed `Conn`, tracking all child
+/// `Tx`, `Stmt`, and `Rows` handles so `Conn.close()` cleanly invalidates them before
+/// returning the underlying `PooledConn` to the pool.
+const ConnState = struct {
+    allocator: Allocator,
+    pooled_conn: ?*PooledConn,
+    closed: bool = false,
+    active_tx: ?*TxState = null,
+    stmts_head: ?*StmtState = null,
+    rows_head: ?*RowsState = null,
+
+    fn closeResources(self: *ConnState) void {
+        // 1. Close direct conn.query() rows first.
+        while (self.rows_head) |rows_state| {
+            rows_state.closeAndDetach(error.ConnDone);
+        }
+
+        // 2. Close all conn.prepare() statements (which also closes their active_rows).
+        var current_stmt = self.stmts_head;
+        self.stmts_head = null;
+        while (current_stmt) |stmt_state| {
+            const next = stmt_state.conn_next;
+            stmt_state.conn_next = null;
+            stmt_state.conn_prev = null;
+            stmt_state.conn_state = null;
+            if (!stmt_state.closed) {
+                stmt_state.closed = true;
+                stmt_state.invalidation_err = error.ConnDone;
+                if (stmt_state.active_rows) |rows_state| {
+                    rows_state.closeAndDetach(error.ConnDone);
+                }
+                std.debug.assert(stmt_state.active_rows == null);
+                stmt_state.raw_stmt.close();
+                stmt_state.pooled_conn = null;
+            }
+            stmt_state.release(); // release Conn's reference
+            current_stmt = next;
+        }
+
+        // 3. Force rollback any still-open transaction started on this Conn.
+        if (self.active_tx) |tx_state| {
+            self.active_tx = null;
+            tx_state.conn_state = null;
+            if (!tx_state.done) {
+                tx_state.done = true;
+                tx_state.invalidation_err = error.ConnDone;
+                tx_state.closeResources(error.ConnDone);
+                if (tx_state.pooled_conn) |pc| {
+                    tx_state.pooled_conn = null;
+                    tx_state.raw_tx.vtable.rollback(tx_state.raw_tx.ptr, pc.db.io, .none) catch {
+                        pc.bad = true;
+                    };
+                }
+            }
+            tx_state.release(); // release Conn's reference
+        }
+    }
+};
+
+/// Conn represents a single database connection borrowed exclusively from a `DB` pool.
+///
+/// All operations on a `Conn` run on the same underlying connection. It is not safe for
+/// concurrent use without caller-side synchronization.
+///
+/// Call `close()` (idempotent) to return the connection to the pool. Any still-open
+/// `Tx`, `Stmt`, or `Rows` derived from this `Conn` are automatically closed/rolled back
+/// and invalidated with `error.ConnDone` before the connection is returned to the pool.
+pub const Conn = struct {
+    state: ?*ConnState,
+
+    const Active = struct {
+        state: *ConnState,
+        pc: *PooledConn,
+    };
+
+    fn active(self: *Conn) !Active {
+        const state = self.state orelse return error.ConnDone;
+        if (state.closed) return error.ConnDone;
+        const pc = state.pooled_conn orelse return error.ConnDone;
+        return .{ .state = state, .pc = pc };
+    }
+
+    /// Close returns this connection to the DB pool (idempotent).
+    /// Any still-open child `Tx`, `Stmt`, or `Rows` are closed and invalidated with `error.ConnDone`.
+    pub fn close(self: *Conn) void {
+        const state = self.state orelse return;
+        self.state = null;
+        if (!state.closed) {
+            state.closed = true;
+            state.closeResources();
+            if (state.pooled_conn) |pc| {
+                state.pooled_conn = null;
+                pc.release();
+            }
+        }
+        state.allocator.destroy(state);
+    }
+
+    /// Ping verifies that this connection is still alive.
+    pub fn ping(self: *Conn, deadline: Deadline) !void {
+        const a = try self.active();
+        try a.pc.db.checkOperation(deadline);
+        return a.pc.raw.ping(a.pc.db.io, deadline);
+    }
+
+    /// Interrupt aborts any in-progress query on this connection out-of-band.
+    /// Returns true if supported and signaled, false otherwise.
+    pub fn interrupt(self: *Conn) bool {
+        const a = self.active() catch return false;
+        return a.pc.interrupt();
+    }
+
+    /// LastError returns the error message for the last operation on this connection.
+    /// The returned slice borrows driver memory and is only valid until the next operation
+    /// on this connection or `conn.close()`.
+    pub fn lastError(self: *Conn) ?[]const u8 {
+        const a = self.active() catch return null;
+        return a.pc.lastError();
+    }
+
+    /// Exec executes a query on this specific connection.
+    /// Supports positional tuples `.{ ... }`, named structs `.{ .name = ... }`, or empty `.{}`.
+    pub fn exec(self: *Conn, query_str: []const u8, args: anytype, deadline: Deadline) !Result {
+        const a = try self.active();
+        return a.pc.exec(query_str, args, deadline);
+    }
+
+    /// Query executes a query returning rows on this connection.
+    /// Closing this `Conn` before `rows.close()` automatically closes and invalidates `rows`
+    /// with `error.ConnDone`.
+    pub fn query(self: *Conn, query_str: []const u8, args: anytype, deadline: Deadline) !Rows {
+        const a = try self.active();
+        var rows = try a.pc.query(query_str, args, deadline);
+        errdefer rows.close();
+
+        const rows_state = try a.pc.db.allocator.create(RowsState);
+        rows_state.* = .{
+            .allocator = a.pc.db.allocator,
+            .raw_rows = rows.raw_rows,
+            .owned_stmt = rows.stmt,
+            .conn_state = a.state,
+            .ref_count = 2,
+            .conn_next = a.state.rows_head,
+            .conn_prev = null,
+        };
+        if (a.state.rows_head) |head| {
+            head.conn_prev = rows_state;
+        }
+        a.state.rows_head = rows_state;
+
+        rows.stmt = null;
+        rows.rows_state = rows_state;
+        rows.pooled_conn = null;
+        rows.error_conn = a.pc;
+        return rows;
+    }
+
+    /// QueryRow executes a query that is expected to return at most one row.
+    pub fn queryRow(self: *Conn, query_str: []const u8, args: anytype, deadline: Deadline) Row {
+        const r = self.query(query_str, args, deadline) catch |err| {
+            return Row{ .err_state = err };
+        };
+        return Row{ .rows = r };
+    }
+
+    /// Prepare creates a prepared statement on this specific connection.
+    /// Closing the returned `Stmt` does NOT close this `Conn`; closing this `Conn` early
+    /// automatically closes and invalidates the `Stmt` with `error.ConnDone`.
+    pub fn prepare(self: *Conn, query_str: []const u8, deadline: Deadline) !Stmt {
+        const a = try self.active();
+        try a.pc.db.checkOperation(deadline);
+        var raw_stmt = try a.pc.raw.prepare(a.pc.db.io, query_str, deadline);
+        errdefer raw_stmt.close();
+
+        const stmt_state = try a.pc.db.allocator.create(StmtState);
+        stmt_state.* = .{
+            .allocator = a.pc.db.allocator,
+            .raw_stmt = raw_stmt,
+            .pooled_conn = a.pc,
+            .owns_conn = false,
+            .conn_state = a.state,
+            .tx_state = null,
+            .from_tx = false,
+            .active_rows = null,
+            .ref_count = 2,
+            .conn_next = a.state.stmts_head,
+            .conn_prev = null,
+        };
+        if (a.state.stmts_head) |head| {
+            head.conn_prev = stmt_state;
+        }
+        a.state.stmts_head = stmt_state;
+
+        return Stmt{
+            .state = stmt_state,
+            .io = a.pc.db.io,
+            .from_tx = false,
+        };
+    }
+
+    /// BeginTx starts a transaction on this connection with the given options.
+    /// Committing or rolling back the transaction does NOT close this `Conn`; closing this
+    /// `Conn` while the transaction is still open automatically rolls it back and invalidates
+    /// the `Tx` with `error.ConnDone`.
+    pub fn beginTx(self: *Conn, opts: TxOptions, deadline: Deadline) !Tx {
+        const a = try self.active();
+        if (a.state.active_tx != null) return error.TxAlreadyActive;
+        return a.pc.beginTxInternal(opts, deadline, false, a.state);
+    }
+
+    /// Begin starts a transaction on this connection with default options.
+    pub fn begin(self: *Conn, deadline: Deadline) !Tx {
+        return self.beginTx(.{}, deadline);
     }
 };
 
@@ -381,8 +789,11 @@ pub const DB = struct {
         return listPop(&self.free_head, &self.free_tail, &self.free_count);
     }
 
-    /// Open creates a database handle using the supplied I/O implementation.
-    /// The I/O implementation must outlive the DB and its borrowed connections and rows.
+    /// Open creates a database handle using the supplied allocator, I/O, and driver.
+    ///
+    /// Lifetime:
+    /// `allocator`, `io`, and the underlying driver instance behind `drv` must all outlive
+    /// the `DB` and its derived handles (`Conn`, `Tx`, `Stmt`, `Rows`, `Row`).
     pub fn open(allocator: Allocator, io: std.Io, drv: driver.Driver, dsn: []const u8) !*DB {
         const dsn_copy = try allocator.dupe(u8, dsn);
         errdefer allocator.free(dsn_copy);
@@ -422,8 +833,12 @@ pub const DB = struct {
     }
 
     /// Close closes the database and prevents new queries from starting.
-    /// Close then waits for all queries that have started processing on the server
-    /// to finish and closes all idle connections.
+    /// Close interrupts active queries, closes all idle connections, and waits briefly
+    /// (up to 500ms) for in-flight connections to be returned.
+    ///
+    /// Callers should close all derived `Conn`, `Tx`, `Stmt`, `Rows`, and `Row` handles
+    /// before calling `db.close()` (standard LIFO `defer` order), or ensure `allocator`,
+    /// `io`, and any stateful driver remain valid until the last derived handle closes.
     pub fn close(self: *DB) void {
         self.mutex.lockUncancelable(self.io);
         if (self.closed) {
@@ -446,18 +861,14 @@ pub const DB = struct {
             self.num_open -= 1;
         }
 
-        // Optional grace period waiting for active queries to exit gracefully
-        const max_wait_attempts: usize = 1000;
-        var attempts: usize = 0;
-        while (self.active_count > 0 and attempts < max_wait_attempts) : (attempts += 1) {
-            self.mutex.unlock(self.io);
-            self.io.sleep(
-                std.Io.Duration.fromNanoseconds(500 * std.time.ns_per_us),
-                .awake,
-            ) catch {
-                std.Thread.yield() catch {};
-            };
-            self.mutex.lockUncancelable(self.io);
+        // Wait briefly (up to 500ms) for in-flight connections to be returned via pool_changed.
+        const grace_deadline = Deadline.after(self.io, .fromMilliseconds(500));
+        while (self.active_count > 0) {
+            self.pool_changed.waitTimeout(
+                self.io,
+                &self.mutex,
+                grace_deadline.timeout(),
+            ) catch break;
         }
         self.mutex.unlock(self.io);
 
@@ -465,26 +876,47 @@ pub const DB = struct {
     }
 
     /// SetMaxOpenConns sets the maximum number of open connections to the database.
-    /// If n <= 0, then there is no limit on the number of open connections.
+    /// If n == 0, then there is no limit on the number of open connections.
+    /// If n > 0 and max_idle_conns > n, max_idle_conns is reduced to n and excess idle
+    /// connections are closed immediately.
     pub fn setMaxOpenConns(self: *DB, n: usize) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.max_open_conns = n;
+        if (n > 0 and self.max_idle_conns > n) {
+            self.max_idle_conns = n;
+            while (self.free_count > self.max_idle_conns) {
+                const pc = self.popFree().?;
+                pc.raw.close();
+                self.allocator.destroy(pc);
+                self.num_open -= 1;
+                self.max_idle_closed += 1;
+            }
+        }
         self.pool_changed.broadcast(self.io);
     }
 
     /// SetMaxIdleConns sets the maximum number of connections in the idle
-    /// connection pool.
+    /// connection pool. If `max_open_conns > 0` and `n > max_open_conns`, the new
+    /// idle limit is reduced to `max_open_conns`.
     pub fn setMaxIdleConns(self: *DB, n: usize) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.max_idle_conns = n;
+        self.max_idle_conns = if (self.max_open_conns > 0 and n > self.max_open_conns)
+            self.max_open_conns
+        else
+            n;
+        var closed_any = false;
         while (self.free_count > self.max_idle_conns) {
             const pc = self.popFree().?;
             pc.raw.close();
             self.allocator.destroy(pc);
             self.num_open -= 1;
             self.max_idle_closed += 1;
+            closed_any = true;
+        }
+        if (closed_any) {
+            self.pool_changed.broadcast(self.io);
         }
     }
 
@@ -521,14 +953,19 @@ pub const DB = struct {
         };
     }
 
-    /// Ping verifies a connection to the database is still alive, establishing a
-    /// connection if necessary. If an idle connection fails with ErrBadConn, it is
-    /// discarded and retried once with a fresh connection.
-    pub fn ping(self: *DB, deadline: Deadline) !void {
+    /// Executes `func(ctx, pc)` on an acquired connection, discarding and retrying once
+    /// if a recycled idle connection fails with `error.ErrBadConn`.
+    inline fn runWithRetry(
+        self: *DB,
+        deadline: Deadline,
+        comptime release_on_success: bool,
+        ctx: anytype,
+        comptime func: anytype,
+    ) !@typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.payload {
         try self.checkOperation(deadline);
         for (0..2) |retry| {
-            const pc = try self.conn(deadline);
-            pc.raw.ping(self.io, deadline) catch |err| {
+            const pc = try self.acquireConn(deadline);
+            const result = func(ctx, pc) catch |err| {
                 if (err == error.ErrBadConn) {
                     const from_pool = pc.from_pool;
                     self.discardConn(pc);
@@ -540,15 +977,44 @@ pub const DB = struct {
                 pc.release();
                 return err;
             };
-            pc.release();
-            return;
+            if (release_on_success) {
+                pc.release();
+            }
+            return result;
         }
         return error.ErrBadConn;
     }
 
-    /// conn returns a single connection by either opening a new connection
+    /// Ping verifies a connection to the database is still alive, establishing a
+    /// connection if necessary. If an idle connection fails with ErrBadConn, it is
+    /// discarded and retried once with a fresh connection.
+    pub fn ping(self: *DB, deadline: Deadline) !void {
+        const Op = struct {
+            io: std.Io,
+            dl: Deadline,
+            fn run(op: @This(), pc: *PooledConn) !void {
+                return pc.raw.ping(op.io, op.dl);
+            }
+        };
+        return self.runWithRetry(deadline, true, Op{ .io = self.io, .dl = deadline }, Op.run);
+    }
+
+    /// Conn returns a single exclusive connection by either opening a new connection
     /// or returning an existing connection from the free pool.
-    pub fn conn(self: *DB, deadline: Deadline) !*PooledConn {
+    /// Call `conn.close()` (idempotent) when done to return it to the pool.
+    pub fn conn(self: *DB, deadline: Deadline) !Conn {
+        const pc = try self.acquireConn(deadline);
+        errdefer pc.release();
+
+        const state = try self.allocator.create(ConnState);
+        state.* = .{
+            .allocator = self.allocator,
+            .pooled_conn = pc,
+        };
+        return Conn{ .state = state };
+    }
+
+    fn acquireConn(self: *DB, deadline: Deadline) !*PooledConn {
         try self.checkOperation(deadline);
         _ = self.ref_count.fetchAdd(1, .acquire);
         defer self.decrementRef();
@@ -657,13 +1123,13 @@ pub const DB = struct {
         }
     }
 
-    pub fn putConn(self: *DB, pc: *PooledConn) void {
+    fn putConn(self: *DB, pc: *PooledConn) void {
         self.mutex.lockUncancelable(self.io);
         self.pool_changed.signal(self.io);
 
         self.removeActive(pc);
 
-        if (self.closed) {
+        if (self.closed or pc.bad) {
             pc.raw.close();
             self.allocator.destroy(pc);
             self.num_open -= 1;
@@ -739,25 +1205,20 @@ pub const DB = struct {
     /// Tuples are strictly mapped to positional bindings, and structs are strictly mapped
     /// to named bindings.
     pub fn exec(self: *DB, query_str: []const u8, args: anytype, deadline: Deadline) !Result {
-        try self.checkOperation(deadline);
-        for (0..2) |retry| {
-            const pc = try self.conn(deadline);
-            const res = pc.exec(query_str, args, deadline) catch |err| {
-                if (err == error.ErrBadConn) {
-                    const from_pool = pc.from_pool;
-                    self.discardConn(pc);
-                    if (from_pool) {
-                        if (retry == 0) continue;
-                    }
-                    return err;
-                }
-                pc.release();
-                return err;
-            };
-            pc.release();
-            return res;
-        }
-        return error.ErrBadConn;
+        const Op = struct {
+            q: []const u8,
+            a: @TypeOf(args),
+            dl: Deadline,
+            fn run(op: @This(), pc: *PooledConn) !Result {
+                return pc.exec(op.q, op.a, op.dl);
+            }
+        };
+        return self.runWithRetry(
+            deadline,
+            true,
+            Op{ .q = query_str, .a = args, .dl = deadline },
+            Op.run,
+        );
     }
 
     /// Query executes a query that returns rows, typically a SELECT. If an idle
@@ -769,25 +1230,23 @@ pub const DB = struct {
     /// so caller-owned temporary buffers do not need to remain live until `Rows.close()`.
     /// Use `exec()` instead when no rows are needed and zero-copy parameter binding is desired.
     pub fn query(self: *DB, query_str: []const u8, args: anytype, deadline: Deadline) !Rows {
-        try self.checkOperation(deadline);
-        for (0..2) |retry| {
-            const pc = try self.conn(deadline);
-            var rows = pc.query(query_str, args, deadline) catch |err| {
-                if (err == error.ErrBadConn) {
-                    const from_pool = pc.from_pool;
-                    self.discardConn(pc);
-                    if (from_pool) {
-                        if (retry == 0) continue;
-                    }
-                    return err;
-                }
-                pc.release();
-                return err;
-            };
-            rows.pooled_conn = pc;
-            return rows;
-        }
-        return error.ErrBadConn;
+        const Op = struct {
+            q: []const u8,
+            a: @TypeOf(args),
+            dl: Deadline,
+            fn run(op: @This(), pc: *PooledConn) !Rows {
+                var rows = try pc.query(op.q, op.a, op.dl);
+                rows.pooled_conn = pc;
+                rows.error_conn = pc;
+                return rows;
+            }
+        };
+        return self.runWithRetry(
+            deadline,
+            false,
+            Op{ .q = query_str, .a = args, .dl = deadline },
+            Op.run,
+        );
     }
 
     /// QueryRow executes a query that is expected to return at most one row.
@@ -819,24 +1278,14 @@ pub const DB = struct {
 
     /// BeginTx starts a transaction with options.
     pub fn beginTx(self: *DB, opts: TxOptions, deadline: Deadline) !Tx {
-        try self.checkOperation(deadline);
-        for (0..2) |retry| {
-            const pc = try self.conn(deadline);
-            const tx = pc.beginTx(opts, deadline) catch |err| {
-                if (err == error.ErrBadConn) {
-                    const from_pool = pc.from_pool;
-                    self.discardConn(pc);
-                    if (from_pool) {
-                        if (retry == 0) continue;
-                    }
-                    return err;
-                }
-                pc.release();
-                return err;
-            };
-            return tx;
-        }
-        return error.ErrBadConn;
+        const Op = struct {
+            o: TxOptions,
+            dl: Deadline,
+            fn run(op: @This(), pc: *PooledConn) !Tx {
+                return pc.beginTxInternal(op.o, op.dl, true, null);
+            }
+        };
+        return self.runWithRetry(deadline, false, Op{ .o = opts, .dl = deadline }, Op.run);
     }
 
     /// Begin starts a transaction with default options.
@@ -846,42 +1295,43 @@ pub const DB = struct {
 
     /// Prepare creates a prepared statement for later queries or executions.
     /// If an idle connection fails with ErrBadConn, it is discarded and retried once.
-    /// The caller must call stmt.close() when done.
+    ///
+    /// Note: Unlike Go's `database/sql.DB.Prepare`, the returned `Stmt` holds one
+    /// dedicated pooled connection until `stmt.close()` is called. Always close
+    /// statements promptly (do not cache `DB.prepare` statements across requests).
     pub fn prepare(self: *DB, query_str: []const u8, deadline: Deadline) !Stmt {
-        try self.checkOperation(deadline);
-        for (0..2) |retry| {
-            const pc = try self.conn(deadline);
-            var raw_stmt = pc.raw.prepare(self.io, query_str, deadline) catch |err| {
-                if (err == error.ErrBadConn) {
-                    const from_pool = pc.from_pool;
-                    self.discardConn(pc);
-                    if (from_pool) {
-                        if (retry == 0) continue;
-                    }
-                    return err;
-                }
-                pc.release();
-                return err;
-            };
-            errdefer raw_stmt.close();
-            errdefer pc.release();
+        const Op = struct {
+            db: *DB,
+            q: []const u8,
+            dl: Deadline,
+            fn run(op: @This(), pc: *PooledConn) !Stmt {
+                var raw_stmt = try pc.raw.prepare(op.db.io, op.q, op.dl);
+                errdefer raw_stmt.close();
 
-            const state = try self.allocator.create(StmtState);
-            state.* = .{
-                .allocator = self.allocator,
-                .raw_stmt = raw_stmt,
-                .pooled_conn = pc,
-                .tx_state = null,
-                .from_tx = false,
-                .active_rows = null,
-                .ref_count = 1,
-            };
-            return Stmt{
-                .state = state,
-                .io = self.io,
-            };
-        }
-        return error.ErrBadConn;
+                const state = try op.db.allocator.create(StmtState);
+                state.* = .{
+                    .allocator = op.db.allocator,
+                    .raw_stmt = raw_stmt,
+                    .pooled_conn = pc,
+                    .owns_conn = true,
+                    .tx_state = null,
+                    .from_tx = false,
+                    .active_rows = null,
+                    .ref_count = 1,
+                };
+                return Stmt{
+                    .state = state,
+                    .io = op.db.io,
+                    .from_tx = false,
+                };
+            }
+        };
+        return self.runWithRetry(
+            deadline,
+            false,
+            Op{ .db = self, .q = query_str, .dl = deadline },
+            Op.run,
+        );
     }
 };
 
@@ -889,6 +1339,7 @@ pub const DB = struct {
 /// Use Next to advance through the rows.
 pub const Rows = struct {
     pooled_conn: ?*PooledConn,
+    error_conn: ?*PooledConn = null,
     stmt: ?driver.Stmt = null,
     raw_rows: driver.Rows,
     io: std.Io,
@@ -921,6 +1372,7 @@ pub const Rows = struct {
     }
 
     /// ColumnName returns the name of the column at the given 0-based index.
+    /// Note: The returned slice borrows driver memory and is only valid until `Rows.close()`.
     pub fn columnName(self: *Rows, index: usize) []const u8 {
         if (self.syncInvalidation() != null) return "";
         if (self.closed) return "";
@@ -929,6 +1381,8 @@ pub const Rows = struct {
 
     /// ColumnType returns column metadata for the given 0-based column index.
     /// Returns error.ColumnIndexOutOfBounds if index >= columnCount().
+    /// Note: String fields in the returned `ColumnType` (such as `name()` and
+    /// `databaseTypeName()`) borrow driver memory and are only valid until `Rows.close()`.
     pub fn columnType(self: *Rows, index: usize) !ColumnType {
         if (self.syncInvalidation()) |e| return e;
         if (self.closed) return error.ColumnIndexOutOfBounds;
@@ -942,23 +1396,13 @@ pub const Rows = struct {
             ct.raw_type_name = f(self.raw_rows.ptr, index);
         }
         if (self.raw_rows.vtable.columnTypeNullable) |f| {
-            if (f(self.raw_rows.ptr, index)) |null_val| {
-                ct.has_nullable = true;
-                ct.nullable_val = null_val;
-            }
+            ct.nullable_val = f(self.raw_rows.ptr, index);
         }
         if (self.raw_rows.vtable.columnTypeLength) |f| {
-            if (f(self.raw_rows.ptr, index)) |len_val| {
-                ct.has_length = true;
-                ct.length_val = len_val;
-            }
+            ct.length_val = f(self.raw_rows.ptr, index);
         }
         if (self.raw_rows.vtable.columnTypePrecisionScale) |f| {
-            if (f(self.raw_rows.ptr, index)) |ps| {
-                ct.has_precision_scale = true;
-                ct.precision_val = ps.precision;
-                ct.scale_val = ps.scale;
-            }
+            ct.decimal_size = f(self.raw_rows.ptr, index);
         }
         return ct;
     }
@@ -986,20 +1430,77 @@ pub const Rows = struct {
         return has_more;
     }
 
-    /// NextStruct decodes the next row directly into a strongly-typed struct at compile time.
-    /// Returns null when iteration finishes cleanly.
-    /// Note: Any string or slice fields in the returned struct borrow memory from the
-    /// underlying statement and are only valid until the next call to Next, NextStruct, or Close.
-    pub fn nextStruct(self: *Rows, comptime T: type, deadline: Deadline) !?T {
+    fn nextStructInternal(
+        self: *Rows,
+        comptime T: type,
+        deadline: Deadline,
+        overflow_allocator: ?Allocator,
+    ) !?T {
         const type_info = @typeInfo(T);
         if (type_info != .@"struct") {
             @compileError("expected a struct type, found " ++ @typeName(T));
         }
-        const field_count = comptime type_info.@"struct".field_names.len;
-        var dest: [field_count]Value = undefined;
-        const has_row = try self.next(&dest, deadline);
+        if (self.syncInvalidation()) |e| return e;
+        if (self.closed) return null;
+        try driver_pkg.checkOperation(self.io, deadline);
+
+        const col_count = self.columnCount();
+        var stack_buf: [max_stack_scan_columns]Value = undefined;
+        var heap_buf: ?[]Value = null;
+        defer if (heap_buf) |buf| overflow_allocator.?.free(buf);
+
+        const dest = if (col_count > max_stack_scan_columns) blk: {
+            const alloc = overflow_allocator orelse {
+                self.last_err = error.TooManyColumns;
+                return error.TooManyColumns;
+            };
+            const buf = try alloc.alloc(Value, col_count);
+            heap_buf = buf;
+            break :blk buf;
+        } else stack_buf[0..col_count];
+
+        const mapping = resolveColumnMapping(self, T, col_count) catch |map_err| {
+            self.last_err = map_err;
+            return map_err;
+        };
+
+        const has_row = try self.next(dest, deadline);
         if (!has_row) return null;
-        return try scanValues(T, &dest);
+        return scanValuesByMapping(T, dest, &mapping) catch |scan_err| {
+            self.last_err = scan_err;
+            return scan_err;
+        };
+    }
+
+    /// NextStruct decodes the next row directly into a strongly-typed struct at compile time.
+    /// Columns are matched strictly by case-sensitive column name (independent of column order,
+    /// and extra columns in the query are ignored). For expressions, alias them with `AS`.
+    /// Returns `error.ColumnNotFound` if a struct field has no matching column,
+    /// `error.AmbiguousColumnName` if multiple columns share a field's name,
+    /// `error.TooManyColumns` if the result set exceeds 128 columns, or `null` when
+    /// iteration finishes cleanly.
+    /// Note: Any string or slice fields in the returned struct borrow memory from the
+    /// underlying statement and are only valid until the next call to Next, NextStruct, or Close.
+    pub fn nextStruct(self: *Rows, comptime T: type, deadline: Deadline) !?T {
+        return self.nextStructInternal(T, deadline, null);
+    }
+
+    /// NextStructOwned decodes the next row into an `Owned(T)` wrapper, duplicating any
+    /// `[]const u8` or `Blob` fields using `allocator` so the returned value can outlive
+    /// subsequent `next*` calls and `Rows.close()`.
+    /// Columns are matched strictly by case-sensitive column name (independent of column order,
+    /// and extra columns in the query are ignored). For expressions, alias them with `AS`.
+    /// Returns `error.ColumnNotFound` if a struct field has no matching column,
+    /// `error.AmbiguousColumnName` if multiple columns share a field's name, or `null` when
+    /// iteration finishes cleanly. Call `defer owned.deinit()` on each non-null item.
+    pub fn nextStructOwned(
+        self: *Rows,
+        allocator: Allocator,
+        comptime T: type,
+        deadline: Deadline,
+    ) !?Owned(T) {
+        const borrowed = (try self.nextStructInternal(T, deadline, allocator)) orelse return null;
+        return try dupeOwnedStruct(allocator, T, borrowed);
     }
 
     /// Err returns the error, if any, that was encountered during iteration.
@@ -1017,13 +1518,16 @@ pub const Rows = struct {
     pub fn lastError(self: *Rows) ?[]const u8 {
         if (self.syncInvalidation() != null) return null;
         if (self.closed) return null;
-        if (self.pooled_conn) |pc| return pc.lastError();
+        if (self.pooled_conn orelse self.error_conn) |pc| return pc.lastError();
         return null;
     }
 
+    /// Close closes the Rows iterator, preventing further enumeration and releasing
+    /// any underlying statement or pooled connection owned by this iterator.
     pub fn close(self: *Rows) void {
         if (self.closed) return;
         self.closed = true;
+        self.error_conn = null;
 
         if (self.rows_state) |rows_state| {
             self.rows_state = null;
@@ -1048,16 +1552,28 @@ pub const Rows = struct {
 const TxState = struct {
     allocator: Allocator,
     pooled_conn: ?*PooledConn,
+    owns_conn: bool = true,
+    conn_state: ?*ConnState = null,
     raw_tx: driver.Tx,
     done: bool = false,
+    invalidation_err: ?anyerror = null,
+    ref_count: usize = 1,
     stmts_head: ?*StmtState = null,
     rows_head: ?*RowsState = null,
 
-    fn closeResources(self: *TxState) void {
+    fn release(self: *TxState) void {
+        std.debug.assert(self.ref_count > 0);
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
+            self.allocator.destroy(self);
+        }
+    }
+
+    fn closeResources(self: *TxState, invalidation_err: anyerror) void {
         // Close open rows before finalizing prepared statements, since Stmt.query
         // cursors borrow the underlying driver.Stmt handle.
         while (self.rows_head) |rows_state| {
-            rows_state.closeAndDetach(error.TxDone);
+            rows_state.closeAndDetach(invalidation_err);
         }
 
         var current_stmt = self.stmts_head;
@@ -1069,6 +1585,7 @@ const TxState = struct {
             state.tx_state = null;
             if (!state.closed) {
                 state.closed = true;
+                state.invalidation_err = invalidation_err;
                 std.debug.assert(state.active_rows == null);
                 state.raw_stmt.close();
             }
@@ -1078,17 +1595,20 @@ const TxState = struct {
     }
 };
 
-/// Internal tracked state for query rows bound to a Tx or Stmt, ensuring result cursors
-/// are closed before their underlying statement or transaction connection is finalized.
+/// Internal tracked state for query rows bound to a Conn, Tx, or Stmt, ensuring result cursors
+/// are closed before their underlying statement, transaction, or connection is finalized.
 const RowsState = struct {
     allocator: Allocator,
     raw_rows: driver.Rows,
     owned_stmt: ?driver.Stmt = null,
+    conn_state: ?*ConnState = null,
     tx_state: ?*TxState = null,
     stmt_state: ?*StmtState = null,
     invalidation_err: ?anyerror = null,
     closed: bool = false,
     ref_count: usize = 1,
+    conn_next: ?*RowsState = null,
+    conn_prev: ?*RowsState = null,
     tx_next: ?*RowsState = null,
     tx_prev: ?*RowsState = null,
 
@@ -1105,6 +1625,22 @@ const RowsState = struct {
         self.closed = true;
         if (invalidation_err) |e| {
             self.invalidation_err = e;
+        }
+
+        var release_conn_ref = false;
+        if (self.conn_state) |conn_state| {
+            if (self.conn_prev) |prev| {
+                prev.conn_next = self.conn_next;
+            } else if (conn_state.rows_head == self) {
+                conn_state.rows_head = self.conn_next;
+            }
+            if (self.conn_next) |next_rows_state| {
+                next_rows_state.conn_prev = self.conn_prev;
+            }
+            self.conn_next = null;
+            self.conn_prev = null;
+            self.conn_state = null;
+            release_conn_ref = true;
         }
 
         var release_tx_ref = false;
@@ -1138,6 +1674,7 @@ const RowsState = struct {
             self.owned_stmt = null;
         }
 
+        if (release_conn_ref) self.release();
         if (release_tx_ref) self.release();
         if (release_stmt_ref) self.release();
         std.debug.assert(self.ref_count >= 1);
@@ -1145,16 +1682,21 @@ const RowsState = struct {
 };
 
 /// Internal tracked state for prepared statements, supporting automatic lifetime
-/// management and invalidation when bound to a transaction or owning active rows.
+/// management and invalidation when bound to a connection, transaction, or owning active rows.
 const StmtState = struct {
     allocator: Allocator,
     raw_stmt: driver.Stmt,
     pooled_conn: ?*PooledConn = null,
+    owns_conn: bool = true,
+    conn_state: ?*ConnState = null,
     tx_state: ?*TxState = null,
     from_tx: bool = false,
     active_rows: ?*RowsState = null,
+    invalidation_err: ?anyerror = null,
     closed: bool = false,
     ref_count: usize = 1,
+    conn_next: ?*StmtState = null,
+    conn_prev: ?*StmtState = null,
     next: ?*StmtState = null,
     prev: ?*StmtState = null,
 
@@ -1175,83 +1717,125 @@ const StmtState = struct {
 pub const Tx = struct {
     state: ?*TxState,
 
-    /// Commits the transaction and returns the connection to the pool.
-    pub fn commit(self: *Tx, deadline: Deadline) !void {
-        const state = self.state orelse return error.TxDone;
-        if (state.done) return error.TxDone;
-        const connection = state.pooled_conn orelse return error.TxDone;
-        const io = connection.db.io;
-        try driver_pkg.checkOperation(io, deadline);
-        state.done = true;
-        state.closeResources();
-        state.pooled_conn = null;
-        self.state = null;
-        defer state.allocator.destroy(state);
-        state.raw_tx.vtable.commit(state.raw_tx.ptr, io, deadline) catch |err| {
-            connection.db.discardConn(connection);
-            return err;
-        };
-        connection.release();
-    }
+    const FinishMode = enum { commit, rollback };
 
-    /// Aborts and rolls back the transaction, returning the connection to the pool.
-    pub fn rollback(self: *Tx, deadline: Deadline) !void {
+    fn finish(self: *Tx, comptime mode: FinishMode, deadline: Deadline) !void {
         const state = self.state orelse return error.TxDone;
-        if (state.done) return error.TxDone;
+        if (state.done) {
+            const invalidation_err = state.invalidation_err orelse error.TxDone;
+            self.state = null;
+            state.release();
+            return invalidation_err;
+        }
         const connection = state.pooled_conn orelse return error.TxDone;
+        const owns_conn = state.owns_conn;
         const io = connection.db.io;
-        try deadline.validate();
-        if (!deadline.isNone()) {
-            try driver_pkg.checkOperation(io, deadline);
+        switch (mode) {
+            .commit => try driver_pkg.checkOperation(io, deadline),
+            .rollback => {
+                try deadline.validate();
+                if (!deadline.isNone()) {
+                    try driver_pkg.checkOperation(io, deadline);
+                }
+            },
+        }
+        if (state.conn_state) |cs| {
+            if (cs.active_tx == state) {
+                cs.active_tx = null;
+            }
+            state.conn_state = null;
+            state.release(); // release Conn's reference
         }
         state.done = true;
-        state.closeResources();
+        state.closeResources(error.TxDone);
         state.pooled_conn = null;
         self.state = null;
-        defer state.allocator.destroy(state);
-        state.raw_tx.vtable.rollback(state.raw_tx.ptr, io, deadline) catch |err| {
-            connection.db.discardConn(connection);
+        defer state.release();
+        const op_res = switch (mode) {
+            .commit => state.raw_tx.vtable.commit(state.raw_tx.ptr, io, deadline),
+            .rollback => state.raw_tx.vtable.rollback(state.raw_tx.ptr, io, deadline),
+        };
+        op_res catch |err| {
+            if (owns_conn) {
+                connection.db.discardConn(connection);
+            } else {
+                connection.bad = true;
+            }
             return err;
         };
-        connection.release();
+        if (owns_conn) {
+            connection.release();
+        }
+    }
+
+    /// Commits the transaction and returns the connection to the pool (if owned by this Tx).
+    pub fn commit(self: *Tx, deadline: Deadline) !void {
+        return self.finish(.commit, deadline);
+    }
+
+    /// Aborts and rolls back the transaction, returning the connection to the pool (if owned).
+    ///
+    /// Idiomatic usage is `defer tx.rollback(.none) catch {};` right after `begin()`/`beginTx()`
+    /// (preferred over `errdefer`, so normal early returns also release the connection).
+    /// If `commit()` has already succeeded, `rollback()` immediately returns `error.TxDone`
+    /// without touching the underlying driver or database.
+    pub fn rollback(self: *Tx, deadline: Deadline) !void {
+        return self.finish(.rollback, deadline);
+    }
+
+    const Active = struct {
+        state: *TxState,
+        pc: *PooledConn,
+    };
+
+    fn active(self: *Tx) !Active {
+        const state = self.state orelse return error.TxDone;
+        if (state.done) return state.invalidation_err orelse error.TxDone;
+        const pc = state.pooled_conn orelse return error.TxDone;
+        return .{ .state = state, .pc = pc };
+    }
+
+    /// LastError returns the error message for the last operation on this transaction's connection.
+    /// The returned slice borrows driver memory and is only valid until the next operation
+    /// on this transaction or `commit()`/`rollback()`.
+    pub fn lastError(self: *Tx) ?[]const u8 {
+        const a = self.active() catch return null;
+        return a.pc.lastError();
     }
 
     /// Executes a query within the transaction that does not return rows (e.g. INSERT, UPDATE).
     /// Accepts positional tuples `.{ ... }`, named structs `.{ .name = ... }`, or empty `.{}`.
     pub fn exec(self: *Tx, query_str: []const u8, args: anytype, deadline: Deadline) !Result {
-        const state = self.state orelse return error.TxDone;
-        if (state.done) return error.TxDone;
-        const pc = state.pooled_conn orelse return error.TxDone;
-        return pc.exec(query_str, args, deadline);
+        const a = try self.active();
+        return a.pc.exec(query_str, args, deadline);
     }
 
     /// The transaction connection remains tied to this transaction until commit or rollback.
     pub fn query(self: *Tx, query_str: []const u8, args: anytype, deadline: Deadline) !Rows {
-        const state = self.state orelse return error.TxDone;
-        if (state.done) return error.TxDone;
-        const pc = state.pooled_conn orelse return error.TxDone;
-        var rows = try pc.query(query_str, args, deadline);
+        const a = try self.active();
+        var rows = try a.pc.query(query_str, args, deadline);
         errdefer rows.close();
 
-        const rows_state = try pc.db.allocator.create(RowsState);
+        const rows_state = try a.pc.db.allocator.create(RowsState);
         rows_state.* = .{
-            .allocator = pc.db.allocator,
+            .allocator = a.pc.db.allocator,
             .raw_rows = rows.raw_rows,
             .owned_stmt = rows.stmt,
-            .tx_state = state,
+            .tx_state = a.state,
             .stmt_state = null,
             .ref_count = 2,
-            .tx_next = state.rows_head,
+            .tx_next = a.state.rows_head,
             .tx_prev = null,
         };
-        if (state.rows_head) |head| {
+        if (a.state.rows_head) |head| {
             head.tx_prev = rows_state;
         }
-        state.rows_head = rows_state;
+        a.state.rows_head = rows_state;
 
         rows.stmt = null;
         rows.rows_state = rows_state;
         rows.pooled_conn = null; // Tx retains connection until commit/rollback
+        rows.error_conn = a.pc;
         return rows;
     }
 
@@ -1267,34 +1851,33 @@ pub const Tx = struct {
     /// The returned Stmt operates on the transaction's connection and will be
     /// closed when the transaction commits or rolls back, or when stmt.close() is called.
     pub fn prepare(self: *Tx, query_str: []const u8, deadline: Deadline) !Stmt {
-        const state = self.state orelse return error.TxDone;
-        if (state.done) return error.TxDone;
-        const pc = state.pooled_conn orelse return error.TxDone;
-        const io = pc.db.io;
-        try pc.db.checkOperation(deadline);
-        var raw_stmt = try pc.raw.prepare(io, query_str, deadline);
+        const a = try self.active();
+        const io = a.pc.db.io;
+        try a.pc.db.checkOperation(deadline);
+        var raw_stmt = try a.pc.raw.prepare(io, query_str, deadline);
         errdefer raw_stmt.close();
 
-        const stmt_state = try pc.db.allocator.create(StmtState);
+        const stmt_state = try a.pc.db.allocator.create(StmtState);
         stmt_state.* = .{
-            .allocator = pc.db.allocator,
+            .allocator = a.pc.db.allocator,
             .raw_stmt = raw_stmt,
             .pooled_conn = null,
-            .tx_state = state,
+            .tx_state = a.state,
             .from_tx = true,
             .active_rows = null,
             .ref_count = 2,
-            .next = state.stmts_head,
+            .next = a.state.stmts_head,
             .prev = null,
         };
-        if (state.stmts_head) |head| {
+        if (a.state.stmts_head) |head| {
             head.prev = stmt_state;
         }
-        state.stmts_head = stmt_state;
+        a.state.stmts_head = stmt_state;
 
         return Stmt{
             .state = stmt_state,
             .io = io,
+            .from_tx = true,
         };
     }
 };
@@ -1304,9 +1887,37 @@ pub const Tx = struct {
 /// concurrent executions on the same Stmt instance are not supported without caller-side
 /// synchronization. Callers must call close() when the statement is no longer needed.
 pub const Stmt = struct {
-    state: *StmtState,
+    state: ?*StmtState,
     io: std.Io,
+    from_tx: bool = false,
     closed: bool = false,
+
+    fn prepareExecution(self: *Stmt, deadline: Deadline) !*StmtState {
+        if (self.closed) {
+            if (self.from_tx) return error.TxDone;
+            return error.StmtClosed;
+        }
+        const state = self.state orelse {
+            if (self.from_tx) return error.TxDone;
+            return error.StmtClosed;
+        };
+        if (state.closed) {
+            if (state.invalidation_err) |e| return e;
+            if (self.from_tx) return error.TxDone;
+            return error.StmtClosed;
+        }
+        if (state.tx_state) |tx_state| {
+            if (tx_state.done) return tx_state.invalidation_err orelse error.TxDone;
+        }
+        if (state.pooled_conn) |pc| {
+            try pc.db.checkOperation(deadline);
+        }
+        try driver_pkg.checkOperation(self.io, deadline);
+        if (state.active_rows) |prev_rows_state| {
+            prev_rows_state.closeAndDetach(null);
+        }
+        return state;
+    }
 
     /// Exec executes a prepared statement with the given arguments and
     /// returns a Result summarizing the effect of the statement.
@@ -1314,30 +1925,18 @@ pub const Stmt = struct {
     /// Accepts positional tuples `.{ ... }`, named structs `.{ .name = ... }`,
     /// directly passed struct instances (batch execution), or empty tuples `.{}`.
     pub fn exec(self: *Stmt, args: anytype, deadline: Deadline) !Result {
-        if (self.closed or self.state.closed) {
-            if (self.state.from_tx) return error.TxDone;
-            return error.DBClosed;
-        }
-        if (self.state.tx_state) |tx_state| {
-            if (tx_state.done) return error.TxDone;
-        }
-        if (self.state.pooled_conn) |pc| {
-            try pc.db.checkOperation(deadline);
-        }
-        try driver_pkg.checkOperation(self.io, deadline);
-        if (self.state.active_rows) |prev_rows_state| {
-            prev_rows_state.closeAndDetach(null);
-        }
+        const state = try self.prepareExecution(deadline);
         const Runner = struct {
-            stmt: *Stmt,
+            state: *StmtState,
+            io: std.Io,
             dl: Deadline,
             fn invoke(r: @This(), nv: []const NamedValue) !Result {
-                return r.stmt.state.raw_stmt.exec(r.stmt.io, nv, r.dl);
+                return r.state.raw_stmt.exec(r.io, nv, r.dl);
             }
         };
         return withNamedValues(
             args,
-            Runner{ .stmt = self, .dl = deadline },
+            Runner{ .state = state, .io = self.io, .dl = deadline },
             Runner.invoke,
         );
     }
@@ -1348,61 +1947,53 @@ pub const Stmt = struct {
     /// so caller-owned temporary buffers do not need to remain live until `Rows.close()`.
     /// Use `exec()` instead when no rows are needed and zero-copy parameter binding is desired.
     pub fn query(self: *Stmt, args: anytype, deadline: Deadline) !Rows {
-        if (self.closed or self.state.closed) {
-            if (self.state.from_tx) return error.TxDone;
-            return error.DBClosed;
-        }
-        if (self.state.tx_state) |tx_state| {
-            if (tx_state.done) return error.TxDone;
-        }
-        if (self.state.pooled_conn) |pc| {
-            try pc.db.checkOperation(deadline);
-        }
-        try driver_pkg.checkOperation(self.io, deadline);
-        if (self.state.active_rows) |prev_rows_state| {
-            prev_rows_state.closeAndDetach(null);
-        }
+        const state = try self.prepareExecution(deadline);
         const Runner = struct {
-            stmt: *Stmt,
+            state: *StmtState,
+            io: std.Io,
             dl: Deadline,
             fn invoke(r: @This(), nv: []const NamedValue) !Rows {
-                var raw_rows = try r.stmt.state.raw_stmt.query(r.stmt.io, nv, r.dl);
+                var raw_rows = try r.state.raw_stmt.query(r.io, nv, r.dl);
                 errdefer raw_rows.close();
 
-                if (r.stmt.state.tx_state) |tx_state| {
-                    if (tx_state.done) return error.TxDone;
+                if (r.state.tx_state) |tx_state| {
+                    if (tx_state.done) return tx_state.invalidation_err orelse error.TxDone;
                 }
 
-                const rows_state = try r.stmt.state.allocator.create(RowsState);
+                const rows_state = try r.state.allocator.create(RowsState);
                 rows_state.* = .{
-                    .allocator = r.stmt.state.allocator,
+                    .allocator = r.state.allocator,
                     .raw_rows = raw_rows,
                     .owned_stmt = null,
-                    .tx_state = r.stmt.state.tx_state,
-                    .stmt_state = r.stmt.state,
-                    .ref_count = if (r.stmt.state.tx_state != null) 3 else 2,
+                    .tx_state = r.state.tx_state,
+                    .stmt_state = r.state,
+                    .ref_count = if (r.state.tx_state != null) 3 else 2,
                 };
-                if (r.stmt.state.tx_state) |tx_state| {
+                if (r.state.tx_state) |tx_state| {
                     rows_state.tx_next = tx_state.rows_head;
                     if (tx_state.rows_head) |head| {
                         head.tx_prev = rows_state;
                     }
                     tx_state.rows_head = rows_state;
                 }
-                r.stmt.state.active_rows = rows_state;
+                r.state.active_rows = rows_state;
+
+                const err_conn: ?*PooledConn = r.state.pooled_conn orelse
+                    if (r.state.tx_state) |ts| ts.pooled_conn else null;
 
                 return Rows{
                     .pooled_conn = null, // Connection remains held by Stmt or Tx
+                    .error_conn = err_conn,
                     .stmt = null,
                     .raw_rows = raw_rows,
-                    .io = r.stmt.io,
+                    .io = r.io,
                     .rows_state = rows_state,
                 };
             }
         };
         return withNamedValues(
             args,
-            Runner{ .stmt = self, .dl = deadline },
+            Runner{ .state = state, .io = self.io, .dl = deadline },
             Runner.invoke,
         );
     }
@@ -1415,25 +2006,58 @@ pub const Stmt = struct {
         return Row{ .rows = r };
     }
 
-    /// Close closes the statement and releases its connection back to the pool.
+    /// LastError returns the error message for the last operation on this statement's connection.
+    /// The returned slice borrows driver memory and is only valid until the next operation
+    /// on this statement/connection or `stmt.close()`.
+    pub fn lastError(self: *Stmt) ?[]const u8 {
+        if (self.closed) return null;
+        const state = self.state orelse return null;
+        if (state.closed) return null;
+        if (state.tx_state) |tx_state| {
+            if (tx_state.done) return null;
+            if (tx_state.pooled_conn) |pc| return pc.lastError();
+            return null;
+        }
+        if (state.pooled_conn) |pc| return pc.lastError();
+        return null;
+    }
+
+    /// Close closes the statement and releases its connection back to the pool (if owned).
     pub fn close(self: *Stmt) void {
         if (self.closed) return;
         self.closed = true;
-        const state = self.state;
+        const state = self.state orelse return;
+        self.state = null;
         if (!state.closed) {
             state.closed = true;
             if (state.active_rows) |rows_state| {
                 const invalidation_err: anyerror = if (state.from_tx)
                     error.TxDone
                 else
-                    error.DBClosed;
+                    error.StmtClosed;
                 rows_state.closeAndDetach(invalidation_err);
             }
             std.debug.assert(state.active_rows == null);
             state.raw_stmt.close();
             if (state.pooled_conn) |pc| {
-                pc.release();
+                if (state.owns_conn) {
+                    pc.release();
+                }
                 state.pooled_conn = null;
+            }
+            if (state.conn_state) |conn_state| {
+                if (state.conn_prev) |prev| {
+                    prev.conn_next = state.conn_next;
+                } else if (conn_state.stmts_head == state) {
+                    conn_state.stmts_head = state.conn_next;
+                }
+                if (state.conn_next) |next| {
+                    next.conn_prev = state.conn_prev;
+                }
+                state.conn_next = null;
+                state.conn_prev = null;
+                state.conn_state = null;
+                state.release(); // release Conn's reference
             }
             if (state.tx_state) |tx_state| {
                 if (state.prev) |prev| {
@@ -1452,330 +2076,6 @@ pub const Stmt = struct {
         }
         state.release(); // release Stmt's reference
     }
-};
-
-// -------------------------------------------------------------------------
-// Built-in In-Memory Mock Driver for Unit Testing & Demonstration
-// -------------------------------------------------------------------------
-
-pub const MockDriver = struct {
-    pub const RowData = struct {
-        cols: []const []const u8,
-        data: []const Value,
-    };
-
-    pub const State = struct {
-        allocator: Allocator,
-        mutex: Mutex = .{},
-        open_count: usize = 0,
-        close_count: usize = 0,
-        interrupt_count: usize = 0,
-        executed_queries: std.ArrayList([]const u8),
-        tx_commits: usize = 0,
-        tx_rollbacks: usize = 0,
-        fail_with_bad_conn_count: usize = 0,
-        last_tx_opts: ?driver_pkg.TxOptions = null,
-
-        pub fn init(allocator: Allocator) State {
-            return .{
-                .allocator = allocator,
-                .executed_queries = std.ArrayList([]const u8).empty,
-            };
-        }
-
-        pub fn deinit(self: *State) void {
-            for (self.executed_queries.items) |q| self.allocator.free(q);
-            self.executed_queries.deinit(self.allocator);
-        }
-    };
-
-    state: *State,
-
-    pub fn driver(self: *MockDriver) driver_pkg.Driver {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .open = MockDriver.open,
-            },
-        };
-    }
-
-    fn open(
-        ctx: *anyopaque,
-        io: std.Io,
-        _: []const u8,
-        deadline: Deadline,
-    ) anyerror!driver_pkg.Conn {
-        try driver_pkg.checkOperation(io, deadline);
-        const self: *MockDriver = @ptrCast(@alignCast(ctx));
-        {
-            self.state.mutex.lock();
-            defer self.state.mutex.unlock();
-            self.state.open_count += 1;
-        }
-
-        const conn_ctx = try self.state.allocator.create(MockConn);
-        conn_ctx.* = .{
-            .driver = self,
-            .state = self.state,
-        };
-
-        return driver_pkg.Conn{
-            .ptr = conn_ctx,
-            .vtable = &.{
-                .prepare = MockConn.prepare,
-                .close = MockConn.close,
-                .begin = MockConn.begin,
-                .beginTx = MockConn.beginTx,
-                .ping = MockConn.ping,
-                .execDirect = MockConn.execDirect,
-                .interrupt = MockConn.interrupt,
-            },
-        };
-    }
-
-    const MockConn = struct {
-        driver: *MockDriver,
-        state: *State,
-
-        fn execDirect(
-            ctx: *anyopaque,
-            io: std.Io,
-            _: []const u8,
-            _: []const NamedValue,
-            deadline: Deadline,
-        ) anyerror!Result {
-            try driver_pkg.checkOperation(io, deadline);
-            const self: *MockConn = @ptrCast(@alignCast(ctx));
-            {
-                self.state.mutex.lock();
-                defer self.state.mutex.unlock();
-                if (self.state.fail_with_bad_conn_count > 0) {
-                    self.state.fail_with_bad_conn_count -= 1;
-                    return error.ErrBadConn;
-                }
-            }
-            return Result{
-                .last_insert_id = 1001,
-                .rows_affected = 1,
-            };
-        }
-
-        fn prepare(
-            ctx: *anyopaque,
-            io: std.Io,
-            query_str: []const u8,
-            deadline: Deadline,
-        ) anyerror!driver_pkg.Stmt {
-            try driver_pkg.checkOperation(io, deadline);
-            const self: *MockConn = @ptrCast(@alignCast(ctx));
-            {
-                self.state.mutex.lock();
-                defer self.state.mutex.unlock();
-                if (self.state.fail_with_bad_conn_count > 0) {
-                    self.state.fail_with_bad_conn_count -= 1;
-                    return error.ErrBadConn;
-                }
-            }
-            const q_copy = try self.state.allocator.dupe(u8, query_str);
-            {
-                self.state.mutex.lock();
-                defer self.state.mutex.unlock();
-                try self.state.executed_queries.append(self.state.allocator, q_copy);
-            }
-
-            const stmt_ctx = try self.state.allocator.create(MockStmt);
-            stmt_ctx.* = .{ .conn = self };
-            return driver_pkg.Stmt{
-                .ptr = stmt_ctx,
-                .vtable = &.{
-                    .close = MockStmt.close,
-                    .numInput = MockStmt.numInput,
-                    .exec = MockStmt.exec,
-                    .query = MockStmt.query,
-                },
-            };
-        }
-
-        fn close(ctx: *anyopaque) void {
-            const self: *MockConn = @ptrCast(@alignCast(ctx));
-            {
-                self.state.mutex.lock();
-                defer self.state.mutex.unlock();
-                self.state.close_count += 1;
-            }
-            self.state.allocator.destroy(self);
-        }
-
-        fn begin(ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!driver_pkg.Tx {
-            return beginTx(ctx, io, .{}, deadline);
-        }
-
-        fn beginTx(
-            ctx: *anyopaque,
-            io: std.Io,
-            opts: driver_pkg.TxOptions,
-            deadline: Deadline,
-        ) anyerror!driver_pkg.Tx {
-            try driver_pkg.checkOperation(io, deadline);
-            const self: *MockConn = @ptrCast(@alignCast(ctx));
-            {
-                self.state.mutex.lock();
-                defer self.state.mutex.unlock();
-                if (self.state.fail_with_bad_conn_count > 0) {
-                    self.state.fail_with_bad_conn_count -= 1;
-                    return error.ErrBadConn;
-                }
-                self.state.last_tx_opts = opts;
-            }
-            const tx_ctx = try self.state.allocator.create(MockTx);
-            tx_ctx.* = .{ .conn = self };
-            return driver_pkg.Tx{
-                .ptr = tx_ctx,
-                .vtable = &.{
-                    .commit = MockTx.commit,
-                    .rollback = MockTx.rollback,
-                },
-            };
-        }
-
-        fn ping(ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void {
-            try driver_pkg.checkOperation(io, deadline);
-            const self: *MockConn = @ptrCast(@alignCast(ctx));
-            self.state.mutex.lock();
-            defer self.state.mutex.unlock();
-            if (self.state.fail_with_bad_conn_count > 0) {
-                self.state.fail_with_bad_conn_count -= 1;
-                return error.ErrBadConn;
-            }
-        }
-
-        fn interrupt(ctx: *anyopaque) void {
-            const self: *MockConn = @ptrCast(@alignCast(ctx));
-            self.state.mutex.lock();
-            defer self.state.mutex.unlock();
-            self.state.interrupt_count += 1;
-        }
-    };
-
-    const MockStmt = struct {
-        conn: *MockConn,
-
-        fn close(ctx: *anyopaque) void {
-            const self: *MockStmt = @ptrCast(@alignCast(ctx));
-            self.conn.state.allocator.destroy(self);
-        }
-
-        fn numInput(_: *anyopaque) i64 {
-            return 0;
-        }
-
-        fn exec(
-            _: *anyopaque,
-            io: std.Io,
-            _: []const NamedValue,
-            deadline: Deadline,
-        ) anyerror!Result {
-            try driver_pkg.checkOperation(io, deadline);
-            return Result{
-                .last_insert_id = 1001,
-                .rows_affected = 1,
-            };
-        }
-
-        fn query(
-            ctx: *anyopaque,
-            io: std.Io,
-            _: []const NamedValue,
-            deadline: Deadline,
-        ) anyerror!driver_pkg.Rows {
-            try driver_pkg.checkOperation(io, deadline);
-            const self: *MockStmt = @ptrCast(@alignCast(ctx));
-            const rows_ctx = try self.conn.state.allocator.create(MockRows);
-            rows_ctx.* = .{
-                .conn = self.conn,
-                .cursor = 0,
-            };
-            return driver_pkg.Rows{
-                .ptr = rows_ctx,
-                .vtable = &.{
-                    .columnCount = MockRows.columnCount,
-                    .columnName = MockRows.columnName,
-                    .next = MockRows.next,
-                    .close = MockRows.close,
-                    .columnTypeDatabaseTypeName = MockRows.columnTypeDatabaseTypeName,
-                    .columnTypeNullable = MockRows.columnTypeNullable,
-                },
-            };
-        }
-    };
-
-    const MockRows = struct {
-        conn: *MockConn,
-        cursor: usize = 0,
-
-        const cols = [_][]const u8{ "id", "name", "role" };
-        const col_types = [_][]const u8{ "BIGINT", "VARCHAR(255)", "VARCHAR(64)" };
-
-        fn columnCount(_: *anyopaque) usize {
-            return cols.len;
-        }
-
-        fn columnName(_: *anyopaque, index: usize) []const u8 {
-            if (index < cols.len) return cols[index];
-            return "";
-        }
-
-        fn columnTypeDatabaseTypeName(_: *anyopaque, index: usize) ?[]const u8 {
-            if (index < col_types.len) return col_types[index];
-            return null;
-        }
-
-        fn columnTypeNullable(_: *anyopaque, index: usize) ?bool {
-            if (index == 0) return false;
-            return true;
-        }
-
-        fn next(ctx: *anyopaque, io: std.Io, dest: []Value, deadline: Deadline) anyerror!bool {
-            try driver_pkg.checkOperation(io, deadline);
-            const self: *MockRows = @ptrCast(@alignCast(ctx));
-            if (self.cursor >= 2) return false;
-            if (dest.len != cols.len) return error.ColumnCountMismatch;
-
-            if (self.cursor == 0) {
-                dest[0] = Value{ .int = 1 };
-                dest[1] = Value{ .string = "alice" };
-                dest[2] = Value{ .string = "admin" };
-            } else if (self.cursor == 1) {
-                dest[0] = Value{ .int = 2 };
-                dest[1] = Value{ .string = "bob" };
-                dest[2] = Value{ .string = "dev" };
-            }
-            self.cursor += 1;
-            return true;
-        }
-
-        fn close(ctx: *anyopaque) void {
-            const self: *MockRows = @ptrCast(@alignCast(ctx));
-            self.conn.state.allocator.destroy(self);
-        }
-    };
-
-    const MockTx = struct {
-        conn: *MockConn,
-
-        fn commit(ctx: *anyopaque, _: std.Io, _: Deadline) anyerror!void {
-            const self: *MockTx = @ptrCast(@alignCast(ctx));
-            self.conn.state.tx_commits += 1;
-            self.conn.state.allocator.destroy(self);
-        }
-
-        fn rollback(ctx: *anyopaque, _: std.Io, _: Deadline) anyerror!void {
-            const self: *MockTx = @ptrCast(@alignCast(ctx));
-            self.conn.state.tx_rollbacks += 1;
-            self.conn.state.allocator.destroy(self);
-        }
-    };
 };
 
 // -------------------------------------------------------------------------
@@ -1877,8 +2177,8 @@ test "database.sql: max open and idle connections pool limit" {
     db.setMaxIdleConns(1);
 
     // Acquire 2 connections
-    const c1 = try db.conn(.none);
-    const c2 = try db.conn(.none);
+    var c1 = try db.conn(.none);
+    var c2 = try db.conn(.none);
 
     var s = db.stats();
     try testing.expectEqual(@as(usize, 2), s.open_connections);
@@ -1886,13 +2186,13 @@ test "database.sql: max open and idle connections pool limit" {
     try testing.expectEqual(@as(usize, 0), s.idle);
 
     // Release c1 -> goes to idle
-    c1.release();
+    c1.close();
     s = db.stats();
     try testing.expectEqual(@as(usize, 1), s.idle);
     try testing.expectEqual(@as(usize, 1), s.in_use);
 
     // Release c2 -> max_idle is 1, so c2 is closed!
-    c2.release();
+    c2.close();
     s = db.stats();
     try testing.expectEqual(@as(usize, 1), s.idle);
     try testing.expectEqual(@as(usize, 1), s.open_connections);
@@ -1918,12 +2218,12 @@ test "database.sql: concurrent connection pool contention" {
     const Worker = struct {
         fn run(db_ptr: *DB) void {
             for (0..20) |_| {
-                const pc = db_ptr.conn(.none) catch return;
-                defer pc.release();
+                var pc = db_ptr.conn(.none) catch return;
+                defer pc.close();
                 // Simulating query execution
-                var stmt = pc.raw.prepare(db_ptr.io, "SELECT 1", .none) catch continue;
+                var stmt = pc.prepare("SELECT 1", .none) catch continue;
                 defer stmt.close();
-                _ = stmt.exec(db_ptr.io, &.{}, .none) catch {};
+                _ = stmt.exec(.{}, .none) catch {};
             }
         }
     };
@@ -1955,14 +2255,14 @@ test "database.sql: blocked pool waiter is cancelable and release wakes another 
     const db = try DB.open(testing.allocator, io, mock.driver(), "mock");
     defer db.close();
     db.setMaxOpenConns(1);
-    const held = try db.conn(.none);
+    var held = try db.conn(.none);
     var held_released = false;
-    defer if (!held_released) held.release();
+    defer if (!held_released) held.close();
 
     const Worker = struct {
         fn run(database: *DB, _: std.Io) !void {
-            const connection = try database.conn(.none);
-            connection.release();
+            var connection = try database.conn(.none);
+            connection.close();
         }
 
         fn waitForCount(database: *DB, task_io: std.Io, count: u64) !void {
@@ -1990,7 +2290,7 @@ test "database.sql: blocked pool waiter is cancelable and release wakes another 
         second.cancel(io) catch {};
     };
     try Worker.waitForCount(db, io, 2);
-    held.release();
+    held.close();
     held_released = true;
     const second_result = second.await(io);
     second_pending = false;
@@ -2008,12 +2308,12 @@ test "database.sql: close wakes blocked pool waiter" {
     var closed = false;
     defer if (!closed) db.close();
     db.setMaxOpenConns(1);
-    const held = try db.conn(.none);
-    defer held.release();
+    var held = try db.conn(.none);
+    defer held.close();
     const Worker = struct {
         fn run(database: *DB, _: std.Io) !void {
-            const connection = try database.conn(.none);
-            connection.release();
+            var connection = try database.conn(.none);
+            connection.close();
         }
     };
     var future = try io.concurrent(Worker.run, .{ db, io });
@@ -2068,8 +2368,8 @@ test "database.sql: failed connection open wakes a pool waiter" {
     db.setMaxOpenConns(1);
     const Worker = struct {
         fn run(database: *DB, _: std.Io) !void {
-            const connection = try database.conn(.none);
-            connection.release();
+            var connection = try database.conn(.none);
+            connection.close();
         }
     };
     var first = try io.concurrent(Worker.run, .{ db, io });
@@ -2111,8 +2411,8 @@ test "database.sql: interrupt and unsupported deadline" {
 
     // 1. Single connection interrupt()
     {
-        const pc = try db.conn(.none);
-        defer pc.release();
+        var pc = try db.conn(.none);
+        defer pc.close();
 
         try testing.expect(pc.interrupt());
         try testing.expectEqual(@as(usize, 1), state.interrupt_count);
@@ -2120,10 +2420,10 @@ test "database.sql: interrupt and unsupported deadline" {
 
     // 2. DB.interruptAll() across active pool connections
     {
-        const pc1 = try db.conn(.none);
-        defer pc1.release();
-        const pc2 = try db.conn(.none);
-        defer pc2.release();
+        var pc1 = try db.conn(.none);
+        defer pc1.close();
+        var pc2 = try db.conn(.none);
+        defer pc2.close();
 
         const interrupted_count = db.interruptAll();
         try testing.expectEqual(@as(usize, 2), interrupted_count);
@@ -2600,7 +2900,7 @@ test "database.sql: Value.bind and val.scan with enum, time, custom valuer and s
             return .{ .int = self.raw };
         }
     };
-    const c_id = Value.bind(CustomId{ .raw = 999 });
+    const c_id = try Value.bind(CustomId{ .raw = 999 });
     try testing.expectEqual(@as(i64, 999), c_id.int);
 }
 
@@ -2618,8 +2918,8 @@ test "database.sql: SetConnMaxIdleTime idle connection eviction" {
     db.setConnMaxIdleTime(1); // 1 nanosecond idle timeout
 
     // Acquire and return connection
-    const c1 = try db.conn(.none);
-    c1.release();
+    var c1 = try db.conn(.none);
+    c1.close();
 
     try testing.expectEqual(@as(usize, 1), db.stats().idle);
 
@@ -2627,8 +2927,8 @@ test "database.sql: SetConnMaxIdleTime idle connection eviction" {
     try io.sleep(std.Io.Duration.fromNanoseconds(1000), .awake);
 
     // Acquiring again must evict the expired connection and open a fresh one
-    const c2 = try db.conn(.none);
-    defer c2.release();
+    var c2 = try db.conn(.none);
+    defer c2.close();
 
     const stats = db.stats();
     try testing.expect(stats.max_idle_time_closed >= 1);
@@ -2675,7 +2975,7 @@ test "database.sql: query and exec with struct and tuple arguments" {
 
     // 7. Verify Blob type and Value.bind / val.scan
     const b = blob("binary_payload\x00\xff");
-    const v1 = Value.bind(b);
+    const v1 = try Value.bind(b);
     try testing.expectEqual(Value{ .bytes = "binary_payload\x00\xff" }, v1);
     const decoded_blob = try v1.scan(Blob);
     try testing.expectEqualStrings("binary_payload\x00\xff", decoded_blob.data);
@@ -2818,11 +3118,11 @@ test "database.sql: early Stmt.close and reentrant Stmt.query/exec invalidate Ro
 
         try testing.expectEqual(@as(usize, 0), rows.columnCount());
         try testing.expectEqualStrings("", rows.columnName(0));
-        try testing.expectError(error.DBClosed, rows.columnType(0));
-        try testing.expectEqual(error.DBClosed, rows.err().?);
+        try testing.expectError(error.StmtClosed, rows.columnType(0));
+        try testing.expectEqual(error.StmtClosed, rows.err().?);
 
         var dest: [3]Value = undefined;
-        try testing.expectError(error.DBClosed, rows.next(&dest, .none));
+        try testing.expectError(error.StmtClosed, rows.next(&dest, .none));
     }
 
     // 3. Reentrant Stmt.query() and Stmt.exec() close prior active Rows cleanly
@@ -2920,6 +3220,354 @@ test "database.sql: Row.err records scan errors and closed Rows.lastError return
         try testing.expectError(error.ColumnCountMismatch, rows.next(&wrong_dest, .none));
         try testing.expect(rows.closed);
         try testing.expect(rows.lastError() == null);
+    }
+}
+
+test "database.sql: Conn owns connection across beginTx, prepare, ping, and early close" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+    db.setMaxOpenConns(1);
+
+    // 1. Normal lifecycle: beginTx / prepare / ping do NOT close Conn; Conn.close() is idempotent
+    {
+        var pc = try db.conn(.none);
+        defer pc.close();
+
+        try pc.ping(.none);
+
+        var tx1 = try pc.beginTx(.{}, .none);
+        _ = try tx1.exec("INSERT INTO users VALUES (1)", .{}, .none);
+        try tx1.commit(.none);
+        try testing.expectEqual(@as(usize, 1), db.stats().in_use);
+        try testing.expectEqual(@as(usize, 0), db.stats().idle);
+
+        var tx2 = try pc.begin(.none);
+        try tx2.rollback(.none);
+        try testing.expectEqual(@as(usize, 1), db.stats().in_use);
+
+        var stmt = try pc.prepare("INSERT INTO users VALUES (?)", .none);
+        _ = try stmt.exec(.{42}, .none);
+        stmt.close();
+        try testing.expectError(error.StmtClosed, stmt.exec(.{42}, .none));
+        try testing.expectError(error.StmtClosed, stmt.query(.{}, .none));
+        try testing.expectEqual(@as(usize, 1), db.stats().in_use);
+
+        try pc.ping(.none);
+
+        // Idempotent close: second close must be a no-op
+        pc.close();
+        pc.close();
+        try testing.expectEqual(@as(usize, 0), db.stats().in_use);
+        try testing.expectEqual(@as(usize, 1), db.stats().idle);
+        try testing.expectError(error.ConnDone, pc.ping(.none));
+        try testing.expect(pc.lastError() == null);
+        try testing.expect(!pc.interrupt());
+    }
+
+    // 2. Early Conn.close() invalidates still-open Rows, Stmt, and Tx with error.ConnDone
+    {
+        var pc = try db.conn(.none);
+        var rows = try pc.query("SELECT id, name, role FROM users", .{}, .none);
+        defer rows.close();
+        var stmt = try pc.prepare("SELECT id, name, role FROM users", .none);
+        defer stmt.close();
+        var stmt_rows = try stmt.query(.{}, .none);
+        defer stmt_rows.close();
+        var tx = try pc.begin(.none);
+        defer tx.rollback(.none) catch {};
+
+        // Duplicate begin on same Conn is rejected while tx is active
+        try testing.expectError(error.TxAlreadyActive, pc.begin(.none));
+
+        const rollbacks_before = state.tx_rollbacks;
+        pc.close();
+
+        try testing.expectEqual(rollbacks_before + 1, state.tx_rollbacks);
+        try testing.expectEqual(@as(usize, 0), db.stats().in_use);
+
+        var dest: [3]Value = undefined;
+        try testing.expectError(error.ConnDone, rows.next(&dest, .none));
+        try testing.expect(rows.lastError() == null);
+        try testing.expectError(error.ConnDone, stmt.exec(.{}, .none));
+        try testing.expectError(error.ConnDone, stmt_rows.next(&dest, .none));
+        try testing.expectError(error.ConnDone, tx.exec("SELECT 1", .{}, .none));
+        try testing.expectError(error.ConnDone, tx.commit(.none));
+    }
+}
+
+test "database.sql: Rows.lastError works across Conn, Tx, and Stmt queries" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+    state.last_error_msg = "mock diagnostic error";
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+
+    // 1. Conn.query
+    {
+        var pc = try db.conn(.none);
+        defer pc.close();
+        var rows = try pc.query("SELECT id, name, role FROM users", .{}, .none);
+        try testing.expectEqualStrings("mock diagnostic error", rows.lastError().?);
+        rows.close();
+        try testing.expect(rows.lastError() == null);
+    }
+
+    // 2. Tx.lastError, Tx.query, & Tx.prepare + Stmt.lastError / Stmt.query
+    {
+        var tx = try db.begin(.none);
+        defer tx.rollback(.none) catch {};
+
+        try testing.expectEqualStrings("mock diagnostic error", tx.lastError().?);
+
+        var tx_rows = try tx.query("SELECT id, name, role FROM users", .{}, .none);
+        try testing.expectEqualStrings("mock diagnostic error", tx_rows.lastError().?);
+        tx_rows.close();
+        try testing.expect(tx_rows.lastError() == null);
+
+        var tx_stmt = try tx.prepare("SELECT id, name, role FROM users", .none);
+        defer tx_stmt.close();
+        try testing.expectEqualStrings("mock diagnostic error", tx_stmt.lastError().?);
+        var stmt_rows = try tx_stmt.query(.{}, .none);
+        try testing.expectEqualStrings("mock diagnostic error", stmt_rows.lastError().?);
+        stmt_rows.close();
+        try testing.expect(stmt_rows.lastError() == null);
+    }
+
+    // 3. DB.prepare + Stmt.lastError / Stmt.query & Row.lastError
+    {
+        var stmt = try db.prepare("SELECT id, name, role FROM users", .none);
+        try testing.expectEqualStrings("mock diagnostic error", stmt.lastError().?);
+        var stmt_rows = try stmt.query(.{}, .none);
+        try testing.expectEqualStrings("mock diagnostic error", stmt_rows.lastError().?);
+        stmt_rows.close();
+        try testing.expect(stmt_rows.lastError() == null);
+        stmt.close();
+        try testing.expect(stmt.lastError() == null);
+
+        var row = db.queryRow("SELECT id, name, role FROM users", .{}, .none);
+        try testing.expectEqualStrings("mock diagnostic error", row.lastError().?);
+        row.close();
+        try testing.expect(row.lastError() == null);
+    }
+}
+
+test "database.sql: Row.scanStruct auto-closes pure values and scanStructOwned dupes slices" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+    db.setMaxOpenConns(1);
+
+    // 1. Pure value struct auto-closes Row and returns connection to pool immediately
+    {
+        const PureValueUser = struct {
+            id: i64,
+            name: enum { alice, bob },
+            role: enum { admin, dev },
+        };
+        var row = db.queryRow("SELECT id, name, role FROM users", .{}, .none);
+        const res = try row.scanStruct(PureValueUser, .none);
+        try testing.expectEqual(@as(i64, 1), res.id);
+        try testing.expectEqual(@as(@TypeOf(res.name), .alice), res.name);
+        try testing.expectEqual(@as(@TypeOf(res.role), .admin), res.role);
+        // Connection already returned without calling row.close()
+        try testing.expectEqual(@as(usize, 0), db.stats().in_use);
+        try testing.expectEqual(@as(usize, 1), db.stats().idle);
+        row.close(); // idempotent
+    }
+
+    // 2. scanStructOwned duplicates slices and closes Row immediately
+    {
+        const UserRow = struct { id: i64, name: []const u8, role: []const u8 };
+        var row = db.queryRow("SELECT id, name, role FROM users", .{}, .none);
+        const owned = try row.scanStructOwned(testing.allocator, UserRow, .none);
+        defer owned.deinit();
+
+        try testing.expectEqual(@as(i64, 1), owned.value.id);
+        try testing.expectEqualStrings("alice", owned.value.name);
+        try testing.expectEqualStrings("admin", owned.value.role);
+        try testing.expectEqual(@as(usize, 0), db.stats().in_use);
+    }
+
+    // 3. Rows.nextStructOwned duplicates slices across multiple rows and survives Rows.close()
+    {
+        const UserRow = struct { id: i64, name: []const u8, role: []const u8 };
+        var collected: std.ArrayList(Owned(UserRow)) = .empty;
+        defer {
+            for (collected.items) |item| item.deinit();
+            collected.deinit(testing.allocator);
+        }
+
+        {
+            var rows = try db.query("SELECT id, name, role FROM users", .{}, .none);
+            defer rows.close();
+            while (try rows.nextStructOwned(testing.allocator, UserRow, .none)) |item| {
+                try collected.append(testing.allocator, item);
+            }
+        }
+        try testing.expectEqual(@as(usize, 0), db.stats().in_use);
+        try testing.expectEqual(@as(usize, 2), collected.items.len);
+        try testing.expectEqualStrings("alice", collected.items[0].value.name);
+        try testing.expectEqualStrings("bob", collected.items[1].value.name);
+    }
+
+    // 4. Rows.nextStruct records scan errors in rows.err()
+    {
+        const BadUserRow = struct { id: i64, name: i64, role: []const u8 };
+        var rows = try db.query("SELECT id, name, role FROM users", .{}, .none);
+        defer rows.close();
+        try testing.expectError(error.ColumnTypeMismatch, rows.nextStruct(BadUserRow, .none));
+        try testing.expectEqual(error.ColumnTypeMismatch, rows.err().?);
+    }
+
+    // 5. Name-based mapping: reordered fields, subset projection, and case-sensitive errors
+    {
+        // Reordered fields (query returns id, name, role)
+        const Reordered = struct { role: []const u8, id: i64, name: []const u8 };
+        var row1 = db.queryRow("SELECT id, name, role FROM users", .{}, .none);
+        const r1 = try row1.scanStruct(Reordered, .none);
+        try testing.expectEqual(@as(i64, 1), r1.id);
+        try testing.expectEqualStrings("alice", r1.name);
+        try testing.expectEqualStrings("admin", r1.role);
+        row1.close();
+
+        // Subset projection (ignores id and role)
+        const NameOnly = struct { name: []const u8 };
+        var row2 = db.queryRow("SELECT id, name, role FROM users", .{}, .none);
+        const owned_name = try row2.scanStructOwned(testing.allocator, NameOnly, .none);
+        defer owned_name.deinit();
+        try testing.expectEqualStrings("alice", owned_name.value.name);
+
+        // Case-sensitive mismatch -> error.ColumnNotFound
+        const WrongCase = struct { Name: []const u8 };
+        var row3 = db.queryRow("SELECT id, name, role FROM users", .{}, .none);
+        defer row3.close();
+        try testing.expectError(error.ColumnNotFound, row3.scanStruct(WrongCase, .none));
+        try testing.expectEqual(error.ColumnNotFound, row3.err().?);
+    }
+}
+
+test "database.sql: u64 exceeding maxInt(i64) returns error.IntegerOverflow" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+
+    const too_big: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+    try testing.expectError(error.IntegerOverflow, Value.bind(too_big));
+    try testing.expectError(
+        error.IntegerOverflow,
+        db.exec("INSERT INTO t VALUES (?)", .{too_big}, .none),
+    );
+}
+
+test "database.sql: pool limit invariants, Value.scan(Value), deadline precedence, and close wakeup" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    // 1. Value.scan(Value) and Value.scan(?Value)
+    {
+        const v_int = Value{ .int = 7 };
+        try testing.expectEqual(v_int, try v_int.scan(Value));
+        try testing.expectEqual(v_int, (try v_int.scan(?Value)).?);
+        const v_null: Value = .null;
+        try testing.expectEqual(v_null, try v_null.scan(Value));
+        try testing.expect((try v_null.scan(?Value)) == null);
+    }
+
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/testdb");
+    defer db.close();
+
+    // 2. setMaxOpenConns trims excess idle conns and caps max_idle_conns;
+    //    setMaxIdleConns respects max_open_conns.
+    {
+        db.setMaxIdleConns(3);
+        var c1 = try db.conn(.none);
+        var c2 = try db.conn(.none);
+        var c3 = try db.conn(.none);
+        c1.close();
+        c2.close();
+        c3.close();
+        try testing.expectEqual(@as(usize, 3), db.stats().idle);
+
+        db.setMaxOpenConns(1);
+        try testing.expectEqual(@as(usize, 1), db.stats().idle);
+        try testing.expectEqual(@as(usize, 1), db.stats().open_connections);
+        try testing.expectEqual(@as(u64, 2), db.stats().max_idle_closed);
+
+        // Requesting max_idle > max_open is capped to max_open (1)
+        db.setMaxIdleConns(5);
+        try testing.expectEqual(@as(usize, 1), db.max_idle_conns);
+        db.setMaxOpenConns(0);
+    }
+
+    // 3. Expired deadline takes precedence over ColumnNotFound in nextStruct / nextStructOwned
+    {
+        const MissingCol = struct { does_not_exist: i64 };
+        var rows = try db.query("SELECT id, name, role FROM users", .{}, .none);
+        defer rows.close();
+        const expired = Deadline.after(io, .zero);
+        try testing.expectError(error.Timeout, rows.nextStruct(MissingCol, expired));
+        try testing.expectError(
+            error.Timeout,
+            rows.nextStructOwned(testing.allocator, MissingCol, expired),
+        );
+    }
+
+    // 4. DB.close() wakes promptly via pool_changed when an active Conn closes concurrently
+    {
+        var close_state = MockDriver.State.init(testing.allocator);
+        defer close_state.deinit();
+        var close_mock = MockDriver{ .state = &close_state };
+        const close_db = try DB.open(
+            testing.allocator,
+            io,
+            close_mock.driver(),
+            "mock://localhost/close_wakeup",
+        );
+        var held = try close_db.conn(.none);
+
+        const Releaser = struct {
+            fn run(c: *Conn, task_io: std.Io) void {
+                task_io.sleep(.fromMilliseconds(15), .awake) catch {};
+                c.close();
+            }
+        };
+        var future = try io.concurrent(Releaser.run, .{ &held, io });
+        const start_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        close_db.close();
+        const elapsed_ms = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds - start_ns,
+            std.time.ns_per_ms,
+        );
+        future.await(io);
+        // Should wake shortly after 15ms, well below the 500ms grace timeout
+        try testing.expect(elapsed_ms < 350);
     }
 }
 

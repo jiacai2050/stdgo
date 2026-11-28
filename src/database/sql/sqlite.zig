@@ -13,11 +13,64 @@ const Value = driver_pkg.Value;
 const NamedValue = driver_pkg.NamedValue;
 const Result = driver_pkg.Result;
 
+/// Journal mode applied to each newly opened SQLite connection via `PRAGMA journal_mode`.
+pub const JournalMode = enum {
+    delete,
+    truncate,
+    persist,
+    memory,
+    wal,
+    off,
+
+    fn pragmaSql(self: JournalMode) [*:0]const u8 {
+        return switch (self) {
+            .delete => "PRAGMA journal_mode = DELETE;",
+            .truncate => "PRAGMA journal_mode = TRUNCATE;",
+            .persist => "PRAGMA journal_mode = PERSIST;",
+            .memory => "PRAGMA journal_mode = MEMORY;",
+            .wal => "PRAGMA journal_mode = WAL;",
+            .off => "PRAGMA journal_mode = OFF;",
+        };
+    }
+};
+
+/// Synchronous mode applied to each newly opened SQLite connection via `PRAGMA synchronous`.
+pub const Synchronous = enum {
+    off,
+    normal,
+    full,
+    extra,
+
+    fn pragmaSql(self: Synchronous) [*:0]const u8 {
+        return switch (self) {
+            .off => "PRAGMA synchronous = OFF;",
+            .normal => "PRAGMA synchronous = NORMAL;",
+            .full => "PRAGMA synchronous = FULL;",
+            .extra => "PRAGMA synchronous = EXTRA;",
+        };
+    }
+};
+
+/// Config customizes how each SQLite connection is opened and initialized.
+pub const Config = struct {
+    /// Milliseconds SQLite waits when a table is locked (`sqlite3_busy_timeout`).
+    busy_timeout_ms: ?u31 = null,
+    /// Optional journal mode pragma applied on connection open.
+    journal_mode: ?JournalMode = null,
+    /// Optional synchronous mode pragma applied on connection open.
+    synchronous: ?Synchronous = null,
+    /// Optional foreign key enforcement (`PRAGMA foreign_keys = ON/OFF`).
+    foreign_keys: ?bool = null,
+    /// Opens connections in read-only mode (`SQLITE_OPEN_READONLY`) when true.
+    read_only: bool = false,
+};
+
 /// SQLiteDriver is the database/sql driver implementation for SQLite.
 /// When compiled with -Dsqlite=false, accessing or initializing this struct
 /// triggers a compile error explaining how to enable it.
 pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
-    pub fn init(_: Allocator) @This() {
+    /// Emits a compile error explaining how to enable SQLite support via `-Dsqlite=true`.
+    pub fn init(_: Allocator, _: Config) @This() {
         @compileError("SQLite driver is disabled. Build with -Dsqlite=true to enable it.");
     }
 } else struct {
@@ -25,6 +78,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
     const c = sqlite.c;
 
     allocator: Allocator,
+    config: Config = .{},
 
     const Progress = struct {
         io: std.Io,
@@ -49,12 +103,17 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         }
     };
 
-    /// Initializes a new SQLiteDriver instance with the given memory allocator.
-    pub fn init(allocator: Allocator) SQLiteDriver {
-        return .{ .allocator = allocator };
+    /// Initializes a new SQLiteDriver instance with the given allocator and configuration.
+    /// Pass `.{}` for default SQLite connection settings.
+    pub fn init(allocator: Allocator, config: Config) SQLiteDriver {
+        return .{
+            .allocator = allocator,
+            .config = config,
+        };
     }
 
-    /// Returns the generic database/sql Driver interface wrapping this driver.
+    /// Returns a non-owning `driver.Driver` interface pointing to this `SQLiteDriver`.
+    /// The caller must keep this `SQLiteDriver` alive until `DB` and all derived handles close.
     pub fn driver(self: *SQLiteDriver) driver_pkg.Driver {
         return .{
             .ptr = self,
@@ -64,7 +123,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         };
     }
 
-    /// Opens a new SQLite connection.
+    /// Opens a new SQLite connection and applies configured pragmas/options.
     ///
     /// Supported DSN formats:
     /// - Standard in-memory: `":memory:"`
@@ -98,8 +157,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         const null_terminated_dsn = try self.allocator.dupeSentinel(u8, clean_dsn, 0);
         defer self.allocator.free(null_terminated_dsn);
 
-        // Open database with READWRITE, CREATE, and URI support
-        const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_URI;
+        const flags: c_int = if (self.config.read_only)
+            c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_URI
+        else
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_URI;
         const rc = c.sqlite3_open_v2(null_terminated_dsn.ptr, &db, flags, null);
         if (rc != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close_v2(d);
@@ -107,6 +168,36 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
         }
         errdefer _ = c.sqlite3_close_v2(db);
         try driver_pkg.checkOperation(io, deadline);
+
+        if (self.config.read_only) {
+            if (c.sqlite3_exec(db.?, "PRAGMA query_only = ON;", null, null, null) != c.SQLITE_OK) {
+                return error.SQLiteOpenFailed;
+            }
+        }
+        if (self.config.busy_timeout_ms) |ms| {
+            if (c.sqlite3_busy_timeout(db.?, @intCast(ms)) != c.SQLITE_OK) {
+                return error.SQLiteOpenFailed;
+            }
+        }
+        if (self.config.foreign_keys) |enabled| {
+            const sql_str: [*:0]const u8 = if (enabled)
+                "PRAGMA foreign_keys = ON;"
+            else
+                "PRAGMA foreign_keys = OFF;";
+            if (c.sqlite3_exec(db.?, sql_str, null, null, null) != c.SQLITE_OK) {
+                return error.SQLiteOpenFailed;
+            }
+        }
+        if (self.config.journal_mode) |mode| {
+            if (c.sqlite3_exec(db.?, mode.pragmaSql(), null, null, null) != c.SQLITE_OK) {
+                return error.SQLiteOpenFailed;
+            }
+        }
+        if (self.config.synchronous) |sync_mode| {
+            if (c.sqlite3_exec(db.?, sync_mode.pragmaSql(), null, null, null) != c.SQLITE_OK) {
+                return error.SQLiteOpenFailed;
+            }
+        }
 
         const conn = try self.allocator.create(SQLiteConn);
         conn.* = .{
@@ -119,7 +210,6 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             .vtable = &.{
                 .prepare = SQLiteConn.prepare,
                 .close = SQLiteConn.close,
-                .begin = SQLiteConn.begin,
                 .beginTx = SQLiteConn.beginTx,
                 .ping = SQLiteConn.ping,
                 .execDirect = SQLiteConn.execDirect,
@@ -249,11 +339,6 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             self.allocator.destroy(self);
         }
 
-        /// Starts a new SQLite transaction ("BEGIN TRANSACTION").
-        fn begin(ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!driver_pkg.Tx {
-            return beginTx(ctx, io, .{}, deadline);
-        }
-
         /// Starts a new SQLite transaction observing TxOptions.
         /// Note: SQLite defaults to serializable transactions. Writable `.serializable`
         /// acquires the write lock eagerly via `BEGIN IMMEDIATE`; other levels and
@@ -283,10 +368,8 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                 .linearizable,
                 => "BEGIN DEFERRED",
             };
-            var errmsg: [*c]u8 = null;
-            const rc = c.sqlite3_exec(self.db, sql, null, null, &errmsg);
+            const rc = c.sqlite3_exec(self.db, sql, null, null, null);
             if (rc != c.SQLITE_OK) {
-                if (errmsg != null) c.sqlite3_free(errmsg);
                 return mapSQLiteError(rc, progress.failure, error.SQLiteTxBeginFailed);
             }
             tx.* = .{
@@ -466,10 +549,11 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             }
 
             var auto_pos: c_int = 1;
+            const slice_destructor = if (mode == .transient) SQLITE_TRANSIENT else c.SQLITE_STATIC;
 
             for (args) |arg| {
                 const idx: c_int = if (arg.name) |name| blk: {
-                    var buf: [64]u8 = undefined;
+                    var buf: [128]u8 = undefined;
                     // 1. Try :name
                     const colon_name = std.fmt.bufPrint(&buf, ":{s}\x00", .{name}) catch
                         return error.SQLiteParamNameTooLong;
@@ -527,49 +611,22 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                     .string => |s| {
                         // Empty slices may have undefined .ptr (e.g. ArrayList.empty.items);
                         // substitute a valid static pointer instead of null (which binds SQL NULL).
-                        var rc: c_int = c.SQLITE_OK;
-                        if (s.len == 0) {
-                            rc = c.sqlite3_bind_text64(
-                                stmt,
-                                idx,
-                                "",
-                                0,
-                                c.SQLITE_STATIC,
-                                @intCast(c.SQLITE_UTF8),
-                            );
-                        } else {
-                            const destructor = if (mode == .transient)
-                                SQLITE_TRANSIENT
-                            else
-                                c.SQLITE_STATIC;
-                            rc = c.sqlite3_bind_text64(
-                                stmt,
-                                idx,
-                                s.ptr,
-                                @intCast(s.len),
-                                destructor,
-                                @intCast(c.SQLITE_UTF8),
-                            );
-                        }
+                        const ptr: [*c]const u8 = if (s.len == 0) "" else s.ptr;
+                        const dtor = if (s.len == 0) c.SQLITE_STATIC else slice_destructor;
+                        const rc = c.sqlite3_bind_text64(
+                            stmt,
+                            idx,
+                            ptr,
+                            @intCast(s.len),
+                            dtor,
+                            @intCast(c.SQLITE_UTF8),
+                        );
                         if (rc != c.SQLITE_OK) return error.SQLiteBindFailed;
                     },
                     .bytes => |b| {
-                        var rc: c_int = c.SQLITE_OK;
-                        if (b.len == 0) {
-                            rc = c.sqlite3_bind_blob64(stmt, idx, "", 0, c.SQLITE_STATIC);
-                        } else {
-                            const destructor = if (mode == .transient)
-                                SQLITE_TRANSIENT
-                            else
-                                c.SQLITE_STATIC;
-                            rc = c.sqlite3_bind_blob64(
-                                stmt,
-                                idx,
-                                b.ptr,
-                                @intCast(b.len),
-                                destructor,
-                            );
-                        }
+                        const ptr: ?*const anyopaque = if (b.len == 0) "" else b.ptr;
+                        const dtor = if (b.len == 0) c.SQLITE_STATIC else slice_destructor;
+                        const rc = c.sqlite3_bind_blob64(stmt, idx, ptr, @intCast(b.len), dtor);
                         if (rc != c.SQLITE_OK) return error.SQLiteBindFailed;
                     },
                 }
@@ -694,6 +751,25 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             return null;
         }
 
+        fn readColumnBytes(
+            self: *SQLiteRows,
+            ptr: [*c]const u8,
+            bytes_len: c_int,
+        ) error{OutOfMemory}![]const u8 {
+            if (bytes_len == 0) {
+                if (ptr == null and c.sqlite3_errcode(self.db) == c.SQLITE_NOMEM) {
+                    self.last_step_err = error.OutOfMemory;
+                    return error.OutOfMemory;
+                }
+                return "";
+            }
+            if (ptr == null) {
+                self.last_step_err = error.OutOfMemory;
+                return error.OutOfMemory;
+            }
+            return ptr[0..@intCast(bytes_len)];
+        }
+
         /// Advances the cursor to the next row, decoding SQLite column types into dest.
         /// Returns true if a row was retrieved, false on completion.
         fn next(ctx: *anyopaque, io: std.Io, dest: []Value, deadline: Deadline) anyerror!bool {
@@ -720,42 +796,17 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                         c.SQLITE_FLOAT => Value{
                             .float = c.sqlite3_column_double(self.stmt, col_idx),
                         },
-                        c.SQLITE_TEXT => blk: {
-                            const text_ptr = c.sqlite3_column_text(self.stmt, col_idx);
-                            const bytes_len = c.sqlite3_column_bytes(self.stmt, col_idx);
-                            if (bytes_len == 0) {
-                                if (text_ptr == null) {
-                                    if (c.sqlite3_errcode(self.db) == c.SQLITE_NOMEM) {
-                                        self.last_step_err = error.OutOfMemory;
-                                        return error.OutOfMemory;
-                                    }
-                                }
-                                break :blk Value{ .string = "" };
-                            }
-                            if (text_ptr == null) {
-                                self.last_step_err = error.OutOfMemory;
-                                return error.OutOfMemory;
-                            }
-                            break :blk Value{ .string = text_ptr[0..@intCast(bytes_len)] };
+                        c.SQLITE_TEXT => Value{
+                            .string = try self.readColumnBytes(
+                                c.sqlite3_column_text(self.stmt, col_idx),
+                                c.sqlite3_column_bytes(self.stmt, col_idx),
+                            ),
                         },
-                        c.SQLITE_BLOB => blk: {
-                            const blob_raw = c.sqlite3_column_blob(self.stmt, col_idx);
-                            const blob_ptr: [*c]const u8 = @ptrCast(blob_raw);
-                            const bytes_len = c.sqlite3_column_bytes(self.stmt, col_idx);
-                            if (bytes_len == 0) {
-                                if (blob_ptr == null) {
-                                    if (c.sqlite3_errcode(self.db) == c.SQLITE_NOMEM) {
-                                        self.last_step_err = error.OutOfMemory;
-                                        return error.OutOfMemory;
-                                    }
-                                }
-                                break :blk Value{ .bytes = &.{} };
-                            }
-                            if (blob_ptr == null) {
-                                self.last_step_err = error.OutOfMemory;
-                                return error.OutOfMemory;
-                            }
-                            break :blk Value{ .bytes = blob_ptr[0..@intCast(bytes_len)] };
+                        c.SQLITE_BLOB => Value{
+                            .bytes = try self.readColumnBytes(
+                                @ptrCast(c.sqlite3_column_blob(self.stmt, col_idx)),
+                                c.sqlite3_column_bytes(self.stmt, col_idx),
+                            ),
                         },
                         c.SQLITE_NULL => Value.null,
                         else => Value.null,
@@ -803,10 +854,8 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
             var progress: Progress = .{ .io = io, .deadline = deadline };
             progress.start(self.db);
             defer progress.stop(self.db);
-            var errmsg: [*c]u8 = null;
-            const rc = c.sqlite3_exec(self.db, "COMMIT", null, null, &errmsg);
+            const rc = c.sqlite3_exec(self.db, "COMMIT", null, null, null);
             if (rc != c.SQLITE_OK) {
-                if (errmsg != null) c.sqlite3_free(errmsg);
                 return mapSQLiteError(rc, progress.failure, error.SQLiteCommitFailed);
             }
         }
@@ -821,10 +870,8 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
                 progress.start(self.db);
             }
             defer if (!deadline.isNone()) progress.stop(self.db);
-            var errmsg: [*c]u8 = null;
-            const rc = c.sqlite3_exec(self.db, "ROLLBACK", null, null, &errmsg);
+            const rc = c.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
             if (rc != c.SQLITE_OK) {
-                if (errmsg != null) c.sqlite3_free(errmsg);
                 return mapSQLiteError(rc, progress.failure, error.SQLiteRollbackFailed);
             }
         }
@@ -835,16 +882,16 @@ test "SQLite deadlines interrupt execution and connection pool waits" {
     if (!build_options.have_sqlite) return;
     const testing = std.testing;
     const io = testing.io;
-    var sqlite_driver = SQLiteDriver.init(testing.allocator);
+    var sqlite_driver = SQLiteDriver.init(testing.allocator, .{});
     const sql = @import("../sql.zig");
     const db = try sql.DB.open(testing.allocator, io, sqlite_driver.driver(), ":memory:");
     defer db.close();
     db.setMaxOpenConns(1);
 
     try db.ping(Deadline.after(io, .fromSeconds(1)));
-    const conn = try db.conn(.none);
+    var conn = try db.conn(.none);
     try testing.expectError(error.Timeout, db.ping(Deadline.after(io, .fromMilliseconds(30))));
-    conn.release();
+    conn.close();
 
     const slow_query =
         "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n " ++
@@ -884,7 +931,7 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
 
     const io = testing.io;
 
-    var sq_driver = SQLiteDriver.init(testing.allocator);
+    var sq_driver = SQLiteDriver.init(testing.allocator, .{});
     const sql_db = @import("../sql.zig");
     const dsn = "file:test_inmem_crud?mode=memory&cache=shared";
     const db = try sql_db.DB.open(testing.allocator, io, sq_driver.driver(), dsn);
@@ -997,8 +1044,8 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
 
     // Verify lastError on syntax error
     {
-        const conn = try db.conn(.none);
-        defer conn.release();
+        var conn = try db.conn(.none);
+        defer conn.close();
 
         const exec_res = conn.exec("SELECT * FORM users", &.{}, .none);
         try testing.expectError(error.SQLitePrepareFailed, exec_res);
@@ -1457,9 +1504,9 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         defer rows.close();
 
         try testing.expectEqual(@as(usize, 0), rows.columnCount());
-        try testing.expectError(error.DBClosed, rows.columnType(0));
+        try testing.expectError(error.StmtClosed, rows.columnType(0));
         var dest: [2]sql_db.Value = undefined;
-        try testing.expectError(error.DBClosed, rows.next(&dest, .none));
+        try testing.expectError(error.StmtClosed, rows.next(&dest, .none));
     }
 
     // Verify reentrant Stmt.query() and Stmt.exec() on SQLite without closing prior Rows
@@ -1603,5 +1650,73 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
         );
         defer bad_db.close();
         try testing.expectError(error.SQLiteOpenFailed, bad_db.ping(.none));
+    }
+
+    // Verify SQLiteDriver.init applies Config pragmas/timeouts on every connection.
+    {
+        var cfg_drv = SQLiteDriver.init(testing.allocator, .{
+            .busy_timeout_ms = 2500,
+            .foreign_keys = true,
+            .journal_mode = .memory,
+            .synchronous = .normal,
+        });
+        const cfg_db = try sql_db.DB.open(testing.allocator, io, cfg_drv.driver(), ":memory:");
+        defer cfg_db.close();
+
+        var fk_row = cfg_db.queryRow("PRAGMA foreign_keys", .{}, .none);
+        defer fk_row.close();
+        var pragma_dest: [1]sql_db.Value = undefined;
+        try fk_row.scan(&pragma_dest, .none);
+        try testing.expectEqual(@as(i64, 1), pragma_dest[0].int);
+
+        var bt_row = cfg_db.queryRow("PRAGMA busy_timeout", .{}, .none);
+        defer bt_row.close();
+        try bt_row.scan(&pragma_dest, .none);
+        try testing.expectEqual(@as(i64, 2500), pragma_dest[0].int);
+
+        var sync_row = cfg_db.queryRow("PRAGMA synchronous", .{}, .none);
+        defer sync_row.close();
+        try sync_row.scan(&pragma_dest, .none);
+        try testing.expectEqual(@as(i64, 1), pragma_dest[0].int);
+
+        // Verify name-based scanning on real SQLite: reordered columns, SELECT *, and ambiguity
+        _ = try cfg_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, qty INTEGER)", .{}, .none);
+        _ = try cfg_db.exec("INSERT INTO items VALUES (7, 'bolt', 10)", .{}, .none);
+        {
+            const ReorderedItem = struct { qty: i64, label: []const u8 };
+            var r = cfg_db.queryRow("SELECT * FROM items WHERE id = 7", .{}, .none);
+            const owned = try r.scanStructOwned(testing.allocator, ReorderedItem, .none);
+            defer owned.deinit();
+            try testing.expectEqual(@as(i64, 10), owned.value.qty);
+            try testing.expectEqualStrings("bolt", owned.value.label);
+
+            const DupId = struct { id: i64 };
+            var dup_row = cfg_db.queryRow(
+                "SELECT a.id, b.id FROM items a JOIN items b ON a.id = b.id",
+                .{},
+                .none,
+            );
+            defer dup_row.close();
+            try testing.expectError(error.AmbiguousColumnName, dup_row.scanStruct(DupId, .none));
+        }
+
+        // Verify Config.read_only opens connections in read-only mode
+        const ro_dsn = "file:test_ro_cfg_db?mode=memory&cache=shared";
+        var rw_drv = SQLiteDriver.init(testing.allocator, .{});
+        const rw_db = try sql_db.DB.open(testing.allocator, io, rw_drv.driver(), ro_dsn);
+        defer rw_db.close();
+        _ = try rw_db.exec("CREATE TABLE ro_items (id INTEGER PRIMARY KEY)", .{}, .none);
+        _ = try rw_db.exec("INSERT INTO ro_items VALUES (1)", .{}, .none);
+
+        var ro_drv = SQLiteDriver.init(testing.allocator, .{ .read_only = true });
+        const ro_db = try sql_db.DB.open(testing.allocator, io, ro_drv.driver(), ro_dsn);
+        defer ro_db.close();
+        const IdRow = struct { id: i64 };
+        var ro_row = ro_db.queryRow("SELECT id FROM ro_items", .{}, .none);
+        try testing.expectEqual(@as(i64, 1), (try ro_row.scanStruct(IdRow, .none)).id);
+        try testing.expectError(
+            error.SQLiteExecFailed,
+            ro_db.exec("INSERT INTO ro_items VALUES (2)", .{}, .none),
+        );
     }
 }

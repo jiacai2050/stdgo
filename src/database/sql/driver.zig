@@ -10,6 +10,7 @@ const time_pkg = @import("../../time/time.zig");
 pub const Blob = struct {
     data: []const u8,
 
+    /// Creates a Blob wrapping the given byte slice without copying.
     pub fn init(data: []const u8) Blob {
         return .{ .data = data };
     }
@@ -40,9 +41,13 @@ pub const Value = union(enum) {
     bytes: []const u8,
 
     /// Binds any supported scalar/struct Zig value into a driver Value at compile time.
-    /// Supports native scalars, enums, optional types, time.Time, Blob, and custom types
-    /// implementing .bind().
-    pub fn bind(val: anytype) Value {
+    /// Supports native scalars, enums, optional types, time.Time (encoded as Unix epoch
+    /// seconds; format explicitly or implement `.bind()` for sub-second precision), Blob,
+    /// and custom types implementing `.bind()`.
+    ///
+    /// Returns `error.IntegerOverflow` if a runtime integer cannot fit in `i64`
+    /// (e.g. `u64 > std.math.maxInt(i64)`).
+    pub fn bind(val: anytype) error{IntegerOverflow}!Value {
         const T = @TypeOf(val);
         if (T == Value) return val;
         if (T == NamedValue) return val.value;
@@ -57,7 +62,10 @@ pub const Value = union(enum) {
                 if (val) |v| return bind(v);
                 return .null;
             },
-            .int => return .{ .int = @intCast(val) },
+            .int => {
+                const v = std.math.cast(i64, val) orelse return error.IntegerOverflow;
+                return .{ .int = v };
+            },
             .comptime_int => return .{ .int = @intCast(val) },
             .float => return .{ .float = @floatCast(val) },
             .comptime_float => return .{ .float = @floatCast(val) },
@@ -87,6 +95,7 @@ pub const Value = union(enum) {
     /// Supports standard scalar types, enums, stdgo.time.Time, Blob, and custom types
     /// implementing .scan().
     pub fn scan(self: Value, comptime T: type) !T {
+        if (T == Value) return self;
         const info = @typeInfo(T);
         if (info == .optional) {
             if (self == .null) return null;
@@ -165,6 +174,7 @@ pub const Value = union(enum) {
         }
     }
 
+    /// Formats the Value in a human-readable SQL-like representation.
     pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .null => try writer.writeAll("NULL"),
@@ -225,18 +235,20 @@ pub const Result = struct {
     }
 };
 
+/// DecimalSize holds the precision and scale of a decimal/numeric column.
+pub const DecimalSize = struct {
+    precision: i64,
+    scale: i64,
+};
+
 /// ColumnType represents metadata about a column in a result set,
 /// corresponding to Go's database/sql.ColumnType.
 pub const ColumnType = struct {
     col_name: []const u8,
     raw_type_name: ?[]const u8 = null,
-    has_nullable: bool = false,
-    nullable_val: bool = false,
-    has_length: bool = false,
-    length_val: i64 = 0,
-    has_precision_scale: bool = false,
-    precision_val: i64 = 0,
-    scale_val: i64 = 0,
+    nullable_val: ?bool = null,
+    length_val: ?i64 = null,
+    decimal_size: ?DecimalSize = null,
 
     /// Name returns the name or alias of the column.
     pub fn name(self: ColumnType) []const u8 {
@@ -251,24 +263,19 @@ pub const ColumnType = struct {
 
     /// Nullable returns whether the column may be null, or null if unknown.
     pub fn nullable(self: ColumnType) ?bool {
-        if (self.has_nullable) return self.nullable_val;
-        return null;
+        return self.nullable_val;
     }
 
     /// Length returns the column type length for variable length column types,
     /// or null if unknown / not applicable.
     pub fn length(self: ColumnType) ?i64 {
-        if (self.has_length) return self.length_val;
-        return null;
+        return self.length_val;
     }
 
     /// DecimalSize returns the scale and precision of a decimal type,
     /// or null if unknown / not applicable.
-    pub fn decimalSize(self: ColumnType) ?struct { precision: i64, scale: i64 } {
-        if (self.has_precision_scale) {
-            return .{ .precision = self.precision_val, .scale = self.scale_val };
-        }
-        return null;
+    pub fn decimalSize(self: ColumnType) ?DecimalSize {
+        return self.decimal_size;
     }
 };
 
@@ -277,6 +284,7 @@ pub const Rows = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// VTable defines the driver callbacks for iterating over query result rows.
     pub const VTable = struct {
         /// Returns the number of columns in the result set.
         columnCount: *const fn (ctx: *anyopaque) usize,
@@ -307,7 +315,7 @@ pub const Rows = struct {
         columnTypePrecisionScale: ?*const fn (
             ctx: *anyopaque,
             index: usize,
-        ) ?struct { precision: i64, scale: i64 } = null,
+        ) ?DecimalSize = null,
     };
 
     /// ColumnCount returns the number of columns in the result set.
@@ -320,11 +328,13 @@ pub const Rows = struct {
         return self.vtable.columnName(self.ptr, index);
     }
 
+    /// Next populates `dest` with the next row's column values and returns false when exhausted.
     pub fn next(self: *Rows, io: std.Io, dest: []Value, deadline: Deadline) !bool {
         try checkOperation(io, deadline);
         return self.vtable.next(self.ptr, io, dest, deadline);
     }
 
+    /// Close closes the rows iterator and releases driver-side cursor resources.
     pub fn close(self: *Rows) void {
         self.vtable.close(self.ptr);
     }
@@ -344,6 +354,7 @@ pub const Stmt = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// VTable defines the driver callbacks for executing and closing a prepared statement.
     pub const VTable = struct {
         close: *const fn (ctx: *anyopaque) void,
         numInput: *const fn (ctx: *anyopaque) i64,
@@ -365,19 +376,23 @@ pub const Stmt = struct {
         ) anyerror!Rows,
     };
 
+    /// Close closes the prepared statement and frees driver-side resources.
     pub fn close(self: *Stmt) void {
         self.vtable.close(self.ptr);
     }
 
+    /// NumInput returns the number of placeholder parameters, or -1 if unknown.
     pub fn numInput(self: *Stmt) i64 {
         return self.vtable.numInput(self.ptr);
     }
 
+    /// Exec executes a prepared statement that does not return rows.
     pub fn exec(self: *Stmt, io: std.Io, args: []const NamedValue, deadline: Deadline) !Result {
         try checkOperation(io, deadline);
         return self.vtable.exec(self.ptr, io, args, deadline);
     }
 
+    /// Query executes a prepared statement that returns rows.
     pub fn query(self: *Stmt, io: std.Io, args: []const NamedValue, deadline: Deadline) !Rows {
         try checkOperation(io, deadline);
         return self.vtable.query(self.ptr, io, args, deadline);
@@ -389,17 +404,20 @@ pub const Tx = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// VTable defines the driver callbacks for committing or rolling back a transaction.
     pub const VTable = struct {
         /// Both callbacks consume the transaction even when the driver returns an error.
         commit: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
         rollback: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
     };
 
+    /// Commit commits the in-progress transaction.
     pub fn commit(self: *Tx, io: std.Io, deadline: Deadline) !void {
         try checkOperation(io, deadline);
         return self.vtable.commit(self.ptr, io, deadline);
     }
 
+    /// Rollback aborts and rolls back the in-progress transaction.
     pub fn rollback(self: *Tx, io: std.Io, deadline: Deadline) !void {
         try deadline.validate();
         if (!deadline.isNone()) {
@@ -414,6 +432,7 @@ pub const Conn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// VTable defines the driver callbacks for a single database connection.
     pub const VTable = struct {
         prepare: *const fn (
             ctx: *anyopaque,
@@ -422,15 +441,16 @@ pub const Conn = struct {
             deadline: Deadline,
         ) anyerror!Stmt,
         close: *const fn (ctx: *anyopaque) void,
-        begin: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!Tx,
-        ping: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
-        /// Optional: starts a transaction with specific options (isolation level, read-only).
-        beginTx: ?*const fn (
+        /// Starts a transaction with the given options (isolation level, read-only).
+        /// Drivers that do not support non-default options should return
+        /// `error.TxOptionsNotSupported`.
+        beginTx: *const fn (
             ctx: *anyopaque,
             io: std.Io,
             opts: TxOptions,
             deadline: Deadline,
-        ) anyerror!Tx = null,
+        ) anyerror!Tx,
+        ping: *const fn (ctx: *anyopaque, io: std.Io, deadline: Deadline) anyerror!void,
         /// Optional: executes a query directly without preparing a statement object.
         /// Drivers can optimize this to be zero-allocation (e.g. SQLite stack statement).
         execDirect: ?*const fn (
@@ -450,35 +470,29 @@ pub const Conn = struct {
         lastError: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     };
 
+    /// Prepare returns a prepared statement bound to this connection.
     pub fn prepare(self: *Conn, io: std.Io, query: []const u8, deadline: Deadline) !Stmt {
         try checkOperation(io, deadline);
         return self.vtable.prepare(self.ptr, io, query, deadline);
     }
 
+    /// Close closes the underlying database connection and frees driver resources.
     pub fn close(self: *Conn) void {
         self.vtable.close(self.ptr);
     }
 
+    /// Begin starts and returns a new transaction with default options.
     pub fn begin(self: *Conn, io: std.Io, deadline: Deadline) !Tx {
-        try checkOperation(io, deadline);
-        return self.vtable.begin(self.ptr, io, deadline);
+        return self.beginTx(io, .{}, deadline);
     }
 
     /// BeginTx starts a transaction with the given options.
-    /// If the driver does not implement beginTx and the options are default,
-    /// it falls back to begin(). If non-default options are requested and unsupported,
-    /// it returns error.TxOptionsNotSupported.
     pub fn beginTx(self: *Conn, io: std.Io, opts: TxOptions, deadline: Deadline) !Tx {
         try checkOperation(io, deadline);
-        if (self.vtable.beginTx) |f| {
-            return f(self.ptr, io, opts, deadline);
-        }
-        if (opts.isolation == .default and !opts.read_only) {
-            return self.vtable.begin(self.ptr, io, deadline);
-        }
-        return error.TxOptionsNotSupported;
+        return self.vtable.beginTx(self.ptr, io, opts, deadline);
     }
 
+    /// Ping verifies that the connection to the database is still alive.
     pub fn ping(self: *Conn, io: std.Io, deadline: Deadline) !void {
         try checkOperation(io, deadline);
         return self.vtable.ping(self.ptr, io, deadline);
@@ -523,11 +537,15 @@ pub const Conn = struct {
     }
 };
 
-/// Driver is the interface that must be implemented by a database driver.
+/// Driver is a non-owning interface implemented by database drivers (analogous to
+/// `std.mem.Allocator` and `std.Io`). The caller retains ownership of the underlying
+/// driver implementation pointed to by `ptr` and must keep it alive until `DB` and all
+/// derived handles are closed.
 pub const Driver = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// VTable defines the driver callback for opening new database connections.
     pub const VTable = struct {
         open: *const fn (
             ctx: *anyopaque,
@@ -537,7 +555,13 @@ pub const Driver = struct {
         ) anyerror!Conn,
     };
 
-    pub fn open(self: Driver, io: std.Io, dsn: []const u8, deadline: Deadline) !Conn {
+    /// Open returns a new connection to the database specified by `dsn`.
+    pub fn open(
+        self: Driver,
+        io: std.Io,
+        dsn: []const u8,
+        deadline: Deadline,
+    ) !Conn {
         try checkOperation(io, deadline);
         return self.vtable.open(self.ptr, io, dsn, deadline);
     }
