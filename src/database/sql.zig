@@ -473,6 +473,7 @@ const ConnState = struct {
     allocator: Allocator,
     pooled_conn: ?*PooledConn,
     closed: bool = false,
+    in_raw: bool = false,
     active_tx: ?*TxState = null,
     stmts_head: ?*StmtState = null,
     rows_head: ?*RowsState = null,
@@ -544,14 +545,17 @@ pub const Conn = struct {
     fn active(self: *Conn) !Active {
         const state = self.state orelse return error.ConnDone;
         if (state.closed) return error.ConnDone;
+        if (state.in_raw) return error.ConnBusy;
         const pc = state.pooled_conn orelse return error.ConnDone;
         return .{ .state = state, .pc = pc };
     }
 
     /// Close returns this connection to the DB pool (idempotent).
     /// Any still-open child `Tx`, `Stmt`, or `Rows` are closed and invalidated with `error.ConnDone`.
+    /// Calling `close()` from inside a `raw()` callback is ignored to prevent use-after-free.
     pub fn close(self: *Conn) void {
         const state = self.state orelse return;
+        if (state.in_raw) return;
         self.state = null;
         if (!state.closed) {
             state.closed = true;
@@ -679,6 +683,34 @@ pub const Conn = struct {
     /// Begin starts a transaction on this connection with default options.
     pub fn begin(self: *Conn, deadline: Deadline) !Tx {
         return self.beginTx(.{}, deadline);
+    }
+
+    /// Raw executes `f` with direct access to the underlying `driver.Conn` (similar to Go's `sql.Conn.Raw`).
+    ///
+    /// Drivers expose type-safe downcast helpers (such as `sqlite.SQLiteConn.fromDriverConn`)
+    /// that validate the vtable pointer before returning the concrete driver connection.
+    ///
+    /// Rules:
+    /// - The `driver.Conn` (and any concrete pointer obtained from it) must NOT be retained
+    ///   after `f` returns.
+    /// - Re-entering `self` (`exec`, `query`, `prepare`, `begin`, `raw`) from inside `f`
+    ///   returns `error.ConnBusy`; calling `self.close()` inside `f` is ignored.
+    /// - If `f` returns `error.ErrBadConn`, the underlying connection is marked bad and
+    ///   discarded when `self.close()` is called instead of being returned to the idle pool.
+    pub fn raw(
+        self: *Conn,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), driver.Conn) anyerror!void,
+    ) !void {
+        const a = try self.active();
+        a.state.in_raw = true;
+        defer a.state.in_raw = false;
+        f(ctx, a.pc.raw) catch |err| {
+            if (err == error.ErrBadConn) {
+                a.pc.bad = true;
+            }
+            return err;
+        };
     }
 };
 
@@ -3568,6 +3600,67 @@ test "database.sql: pool limit invariants, Value.scan(Value), deadline precedenc
         future.await(io);
         // Should wake shortly after 15ms, well below the 500ms grace timeout
         try testing.expect(elapsed_ms < 350);
+    }
+}
+
+test "Conn.raw: driver access, reentrancy guard, ErrBadConn, and ConnDone" {
+    const testing = std.testing;
+    const io = testing.io;
+    var state = MockDriver.State.init(testing.allocator);
+    defer state.deinit();
+
+    var mock = MockDriver{ .state = &state };
+    const db = try DB.open(testing.allocator, io, mock.driver(), "mock://localhost/raw");
+    defer db.close();
+
+    // 1. Normal raw access + reentrancy protection
+    {
+        var conn = try db.conn(.none);
+        defer conn.close();
+
+        const Ctx = struct {
+            conn: *Conn,
+            visited: bool = false,
+        };
+        var ctx = Ctx{ .conn = &conn };
+        try conn.raw(&ctx, struct {
+            fn call(c: *Ctx, raw_conn: driver.Conn) !void {
+                const mc = MockDriver.MockConn.fromDriverConn(raw_conn) orelse
+                    return error.UnexpectedDriver;
+                try testing.expectEqual(@as(usize, 1), mc.state.open_count);
+
+                // Re-entering Conn methods inside raw() returns error.ConnBusy
+                try testing.expectError(error.ConnBusy, c.conn.exec("SELECT 1", .{}, .none));
+                try testing.expectError(error.ConnBusy, c.conn.ping(.none));
+                // Calling close() inside raw() is safely ignored (no UAF)
+                c.conn.close();
+
+                c.visited = true;
+            }
+        }.call);
+        try testing.expect(ctx.visited);
+
+        // Connection remains usable after raw() returns
+        try conn.ping(.none);
+    }
+    try testing.expectEqual(@as(usize, 1), db.stats().idle);
+
+    // 2. Returning error.ErrBadConn marks the connection bad so close() discards it
+    {
+        var conn = try db.conn(.none);
+        try testing.expectError(error.ErrBadConn, conn.raw({}, struct {
+            fn call(_: void, _: driver.Conn) !void {
+                return error.ErrBadConn;
+            }
+        }.call));
+        conn.close();
+        try testing.expectEqual(@as(usize, 0), db.stats().idle);
+        try testing.expectEqual(@as(usize, 1), state.close_count);
+
+        // Calling raw() on a closed Conn returns error.ConnDone
+        try testing.expectError(error.ConnDone, conn.raw({}, struct {
+            fn call(_: void, _: driver.Conn) !void {}
+        }.call));
     }
 }
 

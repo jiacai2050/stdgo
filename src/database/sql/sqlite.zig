@@ -75,7 +75,8 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
     }
 } else struct {
     const sqlite = @import("sqlite");
-    const c = sqlite.c;
+    /// Re-exported SQLite C bindings for driver-specific calls inside `sql.Conn.raw`.
+    pub const c = sqlite.c;
 
     allocator: Allocator,
     config: Config = .{},
@@ -207,15 +208,7 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
 
         return driver_pkg.Conn{
             .ptr = conn,
-            .vtable = &.{
-                .prepare = SQLiteConn.prepare,
-                .close = SQLiteConn.close,
-                .beginTx = SQLiteConn.beginTx,
-                .ping = SQLiteConn.ping,
-                .execDirect = SQLiteConn.execDirect,
-                .interrupt = SQLiteConn.interrupt,
-                .lastError = SQLiteConn.lastError,
-            },
+            .vtable = &SQLiteConn.vtable,
         };
     }
 
@@ -292,9 +285,32 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
     }
 
     /// SQLiteConn wraps a live sqlite3 handle and implements driver_pkg.Conn.
-    const SQLiteConn = struct {
+    pub const SQLiteConn = struct {
         allocator: Allocator,
         db: *c.sqlite3,
+
+        const vtable: driver_pkg.Conn.VTable = .{
+            .prepare = SQLiteConn.prepare,
+            .close = SQLiteConn.close,
+            .beginTx = SQLiteConn.beginTx,
+            .ping = SQLiteConn.ping,
+            .execDirect = SQLiteConn.execDirect,
+            .interrupt = SQLiteConn.interrupt,
+            .lastError = SQLiteConn.lastError,
+        };
+
+        /// Safely downcasts a `driver.Conn` (e.g. inside `sql.Conn.raw`) to `*SQLiteConn`.
+        /// Returns `null` if `raw_conn` does not belong to `SQLiteDriver`.
+        pub fn fromDriverConn(raw_conn: driver_pkg.Conn) ?*SQLiteConn {
+            if (raw_conn.vtable != &vtable) return null;
+            return @ptrCast(@alignCast(raw_conn.ptr));
+        }
+
+        /// Returns the underlying native `*c.sqlite3` handle for driver-specific C API calls.
+        /// Must only be used while the owning `sql.Conn.raw` callback is executing.
+        pub fn handle(self: *SQLiteConn) *c.sqlite3 {
+            return self.db;
+        }
 
         /// Prepares a single SQL query statement for execution.
         /// Rejects empty statements and multi-statement SQL strings.
@@ -1718,5 +1734,32 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
             error.SQLiteExecFailed,
             ro_db.exec("INSERT INTO ro_items VALUES (2)", .{}, .none),
         );
+
+        // Verify Conn.raw + SQLiteConn.fromDriverConn + handle()
+        var raw_conn = try rw_db.conn(.none);
+        defer raw_conn.close();
+        var changes: c_int = -1;
+        try raw_conn.raw(&changes, struct {
+            fn call(out: *c_int, dc: driver_pkg.Conn) !void {
+                const sc = SQLiteDriver.SQLiteConn.fromDriverConn(dc) orelse
+                    return error.UnexpectedDriver;
+                out.* = SQLiteDriver.c.sqlite3_total_changes(sc.handle());
+            }
+        }.call);
+        try testing.expect(changes >= 1);
+
+        // Type-safety check: foreign vtable returns null instead of UB
+        var mock_state = sql_db.MockDriver.State.init(testing.allocator);
+        defer mock_state.deinit();
+        var mock_drv = sql_db.MockDriver{ .state = &mock_state };
+        const mock_db = try sql_db.DB.open(testing.allocator, io, mock_drv.driver(), "mock://raw_mismatch");
+        defer mock_db.close();
+        var mock_conn = try mock_db.conn(.none);
+        defer mock_conn.close();
+        try mock_conn.raw({}, struct {
+            fn call(_: void, dc: driver_pkg.Conn) !void {
+                try testing.expect(SQLiteDriver.SQLiteConn.fromDriverConn(dc) == null);
+            }
+        }.call);
     }
 }

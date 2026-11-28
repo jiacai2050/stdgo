@@ -217,6 +217,7 @@ for (batch) |item| {
 > - `Tx.commit()` / `Tx.rollback()` 或提前 `stmt.close()` 会自动关闭并失效关联的 `Rows` 与 `Stmt`，避免悬空游标与 use-after-free。
 > - `stdgo.time.Time` 默认按 Unix 秒（`i64`）绑定，扫描时支持 Unix 秒及 `RFC3339Nano` / `RFC3339` / `2006-01-02 15:04:05` / `2006-01-02` 字符串；若需写入亚秒精度，请显式格式化或实现自定义 `.bind()`。
 > - 如需获取 SQLite 详细错误文本（如约束冲突或语法错误细节），可通过 `var conn = try db.conn(.none); defer conn.close();` 借出独享连接后调用 `conn.lastError()`，或在 `Rows` 上调用 `rows.lastError()`。`conn.close()` 是幂等的，且会自动关闭并失效由该连接派生的未关闭 `Tx`、`Stmt`、`Rows`（返回 `error.ConnDone`）。
+> - 如需调用驱动特有的底层能力（如原生 SQLite C API），可在借出的 `Conn` 上使用 `conn.raw(ctx, callback)`，并通过 `SQLiteDriver.SQLiteConn.fromDriverConn(raw_conn)` 安全转换后访问 `sc.handle()`（内部校验 vtable 指针，类型不匹配返回 `null`；回调内禁止重入 `Conn` 方法，也不得将底层句柄带出回调外）。
 
 ---
 

@@ -74,21 +74,31 @@ pub const MockDriver = struct {
 
         return driver_pkg.Conn{
             .ptr = conn_ctx,
-            .vtable = &.{
-                .prepare = MockConn.prepare,
-                .close = MockConn.close,
-                .beginTx = MockConn.beginTx,
-                .ping = MockConn.ping,
-                .execDirect = MockConn.execDirect,
-                .interrupt = MockConn.interrupt,
-                .lastError = MockConn.lastError,
-            },
+            .vtable = &MockConn.vtable,
         };
     }
 
-    const MockConn = struct {
+    /// MockConn implements `driver.Conn` for unit testing.
+    pub const MockConn = struct {
         driver: *MockDriver,
         state: *State,
+
+        const vtable: driver_pkg.Conn.VTable = .{
+            .prepare = MockConn.prepare,
+            .close = MockConn.close,
+            .beginTx = MockConn.beginTx,
+            .ping = MockConn.ping,
+            .execDirect = MockConn.execDirect,
+            .interrupt = MockConn.interrupt,
+            .lastError = MockConn.lastError,
+        };
+
+        /// Safely downcasts a `driver.Conn` (e.g. inside `sql.Conn.raw`) to `*MockConn`.
+        /// Returns `null` if `raw_conn` does not belong to `MockDriver`.
+        pub fn fromDriverConn(raw_conn: driver_pkg.Conn) ?*MockConn {
+            if (raw_conn.vtable != &vtable) return null;
+            return @ptrCast(@alignCast(raw_conn.ptr));
+        }
 
         fn lastError(ctx: *anyopaque) ?[]const u8 {
             const self: *MockConn = @ptrCast(@alignCast(ctx));

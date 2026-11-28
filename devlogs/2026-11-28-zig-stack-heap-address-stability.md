@@ -346,7 +346,7 @@ const MyReader = struct {
 
 ## 4. 延伸原则与选型清单
 
-- **同时提供“借用”与“跨作用域持有”时，拆成两个类型**：像标准库的 [`std.json.Parsed(T)`](https://github.com/jiacai2050/zig/blob/0.17.0/lib/std/json/static.zig#L57) 或我们给 `Row` / `Rows` 设计的 `sql.Owned(T)` 那样，用返回类型明确区分生命周期，而不是塞进同一个接口的可选 `deinit`：
+- **同时提供“借用”与“跨作用域持有”时，拆成两个类型**：像标准库的[`std.json.Parsed(T)`](https://github.com/jiacai2050/zig/blob/0.17.0/lib/std/json/static.zig#L57) 或我们给 `Row` / `Rows` 设计的 `sql.Owned(T)` 那样，用返回类型明确区分生命周期，而不是塞进同一个接口的可选 `deinit`：
   ```zig
   const UserSummary = struct { name: []const u8, balance: f64 };
 
