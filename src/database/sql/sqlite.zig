@@ -15,11 +15,22 @@ const Result = driver_pkg.Result;
 
 /// Journal mode applied to each newly opened SQLite connection via `PRAGMA journal_mode`.
 pub const JournalMode = enum {
+    /// Default rollback journal mode: deletes the journal file at the end of each transaction.
     delete,
+    /// Commits transactions by truncating the rollback journal to zero length instead of deleting it;
+    /// often faster than `delete` on filesystems where unlinking is expensive.
     truncate,
+    /// Zeroes out the rollback journal header on commit rather than deleting the file,
+    /// avoiding directory metadata updates on every commit.
     persist,
+    /// Stores the rollback journal in RAM. Fast, but a crash or power loss mid-transaction
+    /// can corrupt the database file.
     memory,
+    /// Write-Ahead Logging: appends changes to a `-wal` file so readers do not block writers
+    /// and writers do not block readers. Recommended for concurrent workloads.
     wal,
+    /// Disables the rollback journal completely; transactions cannot be rolled back and a crash
+    /// mid-write will likely corrupt the database. Use only for disposable or rebuildable data.
     off,
 
     fn pragmaSql(self: JournalMode) [*:0]const u8 {
@@ -36,9 +47,17 @@ pub const JournalMode = enum {
 
 /// Synchronous mode applied to each newly opened SQLite connection via `PRAGMA synchronous`.
 pub const Synchronous = enum {
+    /// SQLite hands writes to the OS without calling `fsync`. Fastest, but an OS crash or
+    /// power failure can corrupt the database.
     off,
+    /// Syncs at critical moments, less often than `full`. Safe against corruption in `wal` mode
+    /// (at most the most recent transactions may roll back on power loss); recommended with `.wal`.
     normal,
+    /// Syncs before continuing after every critical disk write so committed transactions survive
+    /// power loss or OS crash. Default for rollback journal modes.
     full,
+    /// Like `full`, plus an extra directory sync when unlinking rollback journals in `delete` mode,
+    /// providing additional durability against power loss on some filesystems.
     extra,
 
     fn pragmaSql(self: Synchronous) [*:0]const u8 {
@@ -61,8 +80,11 @@ pub const Config = struct {
     synchronous: ?Synchronous = null,
     /// Optional foreign key enforcement (`PRAGMA foreign_keys = ON/OFF`).
     foreign_keys: ?bool = null,
-    /// Opens connections in read-only mode (`SQLITE_OPEN_READONLY`) when true.
+    /// Opens connections in read-only mode (`SQLITE_OPEN_READONLY` + `PRAGMA query_only = ON`) when true.
     read_only: bool = false,
+    /// When `read_only` is false, creates the database file if it does not exist (`SQLITE_OPEN_CREATE`).
+    /// Set to false to fail with `error.SQLiteOpenFailed` instead of creating an empty file on missing paths.
+    create: bool = true,
 };
 
 /// SQLiteDriver is the database/sql driver implementation for SQLite.
@@ -160,8 +182,10 @@ pub const SQLiteDriver = if (!build_options.have_sqlite) struct {
 
         const flags: c_int = if (self.config.read_only)
             c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_URI
+        else if (self.config.create)
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_URI
         else
-            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_URI;
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_URI;
         const rc = c.sqlite3_open_v2(null_terminated_dsn.ptr, &db, flags, null);
         if (rc != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close_v2(d);
@@ -1761,5 +1785,16 @@ test "stdgo.database.sql.sqlite: in-memory CRUD and transaction rollback/commit"
                 try testing.expect(SQLiteDriver.SQLiteConn.fromDriverConn(dc) == null);
             }
         }.call);
+
+        // Verify Config.create = false rejects missing database files without creating them
+        var no_create_drv = SQLiteDriver.init(testing.allocator, .{ .create = false });
+        const no_create_db = try sql_db.DB.open(
+            testing.allocator,
+            io,
+            no_create_drv.driver(),
+            ".zig-cache/stdgo_must_not_exist_create_false.db",
+        );
+        defer no_create_db.close();
+        try testing.expectError(error.SQLiteOpenFailed, no_create_db.ping(.none));
     }
 }

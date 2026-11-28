@@ -58,6 +58,22 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+`SQLiteDriver.Config` 常用选项说明：
+- `create`（默认 `true`）：读写模式下文件不存在时是否自动新建空库；设为 `false` 时缺失文件直接返回 `error.SQLiteOpenFailed`。
+- `read_only`（默认 `false`）：以只读模式打开（`SQLITE_OPEN_READONLY` + `PRAGMA query_only = ON`）。
+- `journal_mode`（`?JournalMode`）：
+  - `.delete`：默认回滚日志模式，每次事务提交后删除日志文件；
+  - `.truncate`：提交时将日志文件截断为 0 字节而非删除，在删除文件开销大的文件系统上更快；
+  - `.persist`：提交时清零日志头而不删除文件，避免每次提交更新目录元数据；
+  - `.memory`：回滚日志存内存，速度快，但事务中途崩溃/断电可能损坏库文件；
+  - `.wal`：预写日志（Write-Ahead Logging），读写互不阻塞，并发场景推荐；
+  - `.off`：完全关闭回滚日志，无法回滚且崩溃易损坏，仅适用于可重建的临时数据。
+- `synchronous`（`?Synchronous`）：
+  - `.off`：不做 `fsync`，最快但系统崩溃或断电可能损坏库；
+  - `.normal`：在关键节点刷盘，配合 `.wal` 不会损坏库文件（断电最多丢失最近几笔已提交事务），推荐与 `.wal` 搭配；
+  - `.full`：每次关键写入都刷盘，保证断电后已提交事务不丢，回滚日志模式默认值；
+  - `.extra`：在 `.full` 基础上对删除日志文件增加目录同步，进一步增强断电持久性。
+
 ### 2.2 参数绑定规范（Bind）
 
 `stdgo` 区分位置参数和具名参数，两类参数不能混用，参数数量或类型不匹配时会直接报错：
